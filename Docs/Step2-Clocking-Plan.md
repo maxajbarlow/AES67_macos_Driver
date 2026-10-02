@@ -32,7 +32,7 @@ One media clock for the whole device. Core Audio's sample clock, RX placement an
 - **Kernel receive timestamps are already in Core Audio's time base.** `SO_TIMESTAMP_MONOTONIC` returns `mach_absolute_time` ticks (verified on this Mac: each timestamp fell between `mach_absolute_time` reads taken before the send and after the receive, 10-20 us ahead of userspace). PTP event timestamps can therefore be used directly against Core Audio host time, with no clock translation.
 - **Host ticks are not nanoseconds.** `mach_timebase_info` is 125/3 on Apple Silicon. Nothing in the repo uses it today.
 - **Zero timestamps map sample time to `mach_absolute_time`** (AudioServerPlugIn.h). The period must be at least 10923 frames. Changing the seed tells the HAL the timeline restarted. `kAudioDeviceClockAlgorithmRaw` disables HAL filtering, appropriate when timestamps come from a servo model.
-- **Nothing on this Mac currently owns UDP 319/320.**
+- **Nothing on this Mac currently owns UDP 319/320, and the sandboxed driver host can use them** (spike S1).
 - **The existing PTP, PLL and resampler code is not a foundation** (separate assessment): `PTPSlave` deadlocks on every Follow_Up and Sync path, compares TAI to UTC so it can never lock, has no frequency estimate and no host-time mapping; `PhaseLockedLoop` is open-loop; the resampler resets phase every block. Only `PTPSlave`'s socket setup, packet field parsing and Delay_Req builder are worth carrying forward.
 
 ## Architecture
@@ -198,17 +198,12 @@ Each phase is a separate PR, test-first, and leaves the driver working.
 
 ## Spikes (do first)
 
-- **S1, PTP inside the sandbox.**
-  - **Risk:** the driver runs as `_coreaudiod` in Apple's driver host sandbox, and it is unverified whether it can bind UDP 319/320, join 224.0.1.129 and use `SO_TIMESTAMP_MONOTONIC` there.
-  - **Probe:** a flag-gated probe in the driver that logs the result.
-  - **If blocked:** run PTP in a small launchd daemon and share the MediaClock model through shared memory or an XPC service declared under `AudioServerPlugIn_MachServices`.
-  - This is the biggest architectural unknown.
+- **S1, PTP inside the sandbox: resolved, PTP runs in-process.** Inside the driver host (`_coreaudiod`, macOS 26.0.1) the probe bound UDP 319/320, joined 224.0.1.129, sent, and received with kernel monotonic timestamps, with or without `AudioServerPlugIn_Network`. Host threads were scheduled up to 31.7 ms late, so kernel timestamps are mandatory. Details: [Spikes/S1-PTP-Sandbox.md](Spikes/S1-PTP-Sandbox.md).
 - **S2, HAL acceptance.** Confirm the HAL accepts model-derived zero timestamps with the Raw algorithm and a custom period, and resynchronises cleanly on a seed change. Measure the actual rate and glitch-freedom with a capture app.
 - **S3, PTP accuracy.** Log offset and path-delay statistics against a real grandmaster to set link offset defaults and lock thresholds.
 
 ## Risks
 
-- **The sandbox blocks PTP ports (S1).** Mitigation: the separate-daemon design above.
 - **Software timestamp asymmetry biases phase.** Mitigation: minimum-delay filtering, a calibration offset, and a generous default link offset.
 - **Other PTP software on the same Mac** (another AoIP driver) contends for ports 319/320. Mitigation: `SO_REUSEPORT` and a documented limitation.
 - **Sample rate changes mid-stream.** Mitigation: rebase `mediaBase`, flush buffers, bump the seed.
@@ -218,6 +213,6 @@ Each phase is a separate PR, test-first, and leaves the driver working.
 
 1. **Default link offset.** Proposed 2 ms, configurable 0.25-20 ms. What does the Riedel setup use?
 2. **Stream-recovered mode (Phase 3).** Recommended, because it delivers drift-free RX from the Riedel before PTP lands.
-3. **PTP placement.** In-process (preferred) or a launchd daemon; decided by spike S1.
+3. **PTP placement.** Resolved by spike S1: in-process.
 4. **ASRC.** Defer to Phase 6, choose the library then.
 5. **Tracking.** Whether to track phases as GitHub issues under a milestone.
