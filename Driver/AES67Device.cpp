@@ -167,14 +167,8 @@ AES67Device::~AES67Device() {
     // declared after streamManager_ and so would be destroyed first
     streamManager_.reset();
 
-    // Deactivate streams directly rather than calling StopIO() (which requires
-    // framework context). This is safe in the destructor.
-    if (inputStream_) {
-        inputStream_->SetIsActive(false);
-    }
-    if (outputStream_) {
-        outputStream_->SetIsActive(false);
-    }
+    // Stream activity (kAudioStreamPropertyIsActive) belongs to the HAL, so it
+    // is not touched here: setting it would notify the HAL during teardown.
     ioRunning_.store(false);
 }
 
@@ -396,14 +390,9 @@ std::string AES67Device::GetDeviceUID() const {
 OSStatus AES67Device::StartIOImpl(UInt32 clientID, UInt32 startCount) {
     // startCount == 0 means first client starting IO (device transitions to running)
     if (startCount == 0) {
-        // Activate streams
-        if (inputStream_) {
-            inputStream_->SetIsActive(true);
-        }
-        if (outputStream_) {
-            outputStream_->SetIsActive(true);
-        }
-
+        // Stream activity is left to the HAL, which activates the streams its
+        // clients use. Setting it here would send a property-change
+        // notification affecting IO, which AudioServerPlugIn.h forbids.
         ioRunning_.store(true);
 
         // New timeline for this IO session (new seed for the HAL)
@@ -421,14 +410,6 @@ OSStatus AES67Device::StartIOImpl(UInt32 clientID, UInt32 startCount) {
 OSStatus AES67Device::StopIOImpl(UInt32 clientID, UInt32 startCount) {
     // startCount == 0 means last client stopped IO (device transitions to not running)
     if (startCount == 0) {
-        // Deactivate streams
-        if (inputStream_) {
-            inputStream_->SetIsActive(false);
-        }
-        if (outputStream_) {
-            outputStream_->SetIsActive(false);
-        }
-
         // Stop RTP network threads — no client needs audio anymore
         if (streamManager_) {
             streamManager_->setIOActive(false);

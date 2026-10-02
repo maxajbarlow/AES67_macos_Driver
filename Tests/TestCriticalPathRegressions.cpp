@@ -513,6 +513,31 @@ void testOutageKeepsTimeline() {
 }
 
 
+// ---------------------------------------------------------------------------
+// kAudioStreamPropertyIsActive belongs to the HAL: it activates the streams
+// its clients use. The device must not change it on IO start/stop, because
+// libASPL's Stream::SetIsActive() sends a property-change notification, and
+// AudioServerPlugIn.h forbids devices from notifying changes that affect IO.
+// ---------------------------------------------------------------------------
+void testIOStartStopLeavesStreamActivityToHAL() {
+    std::cout << "IO start/stop leaves stream activity to the HAL" << std::endl;
+    useEmptyConfig("streamactive");
+
+    auto context = std::make_shared<aspl::Context>();
+    auto device = std::make_shared<AES67Device>(context);
+    device->Initialize();
+
+    // The HAL deactivates a stream no client uses (here: the output)
+    device->GetOutputStream()->SetIsActive(false);
+
+    device->StartIO(device->GetID(), 0);
+    CHECK(!device->GetOutputStream()->GetIsActive(), "starting IO must not reactivate a stream the HAL deactivated");
+    CHECK(device->GetInputStream()->GetIsActive(), "starting IO must leave the input stream as the HAL set it");
+
+    device->StopIO(device->GetID(), 0);
+    CHECK(device->GetInputStream()->GetIsActive(), "stopping IO must not deactivate streams (the HAL owns that property)");
+}
+
 } // namespace
 
 int main() {
@@ -520,6 +545,7 @@ int main() {
     testInputReadsByDeviceTime();
     testDeviceSampleRate();
     testDeviceClockFromMediaClock();
+    testIOStartStopLeavesStreamActivityToHAL();
     testTxStreamSurvivesReload();
     testReceiverFollowsSenderRestart();
     testLostPacketKeepsTimeline();
