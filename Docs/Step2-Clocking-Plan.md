@@ -132,6 +132,15 @@ Selection is automatic with a configurable preference, and switching sources is 
 | Sync interval / delay request interval | 0 / 0 (1 per second) | These are the Riedel's own port settings; the grandmaster sets the real rates, which spike S3 must measure. If Sync really is 1 Hz, the servo gets one measurement per second and needs a longer averaging window than an 8 Hz network. |
 | Media 1 / Media 2 | Shared PTP settings | Suggests dual networks (SMPTE ST 2022-7). The driver uses one network; 2022-7 redundancy is out of scope for step 2. |
 
+From a SmartPanel's AES67 tab (RSP-1232HL):
+
+| Setting | Value | Implication |
+|---|---|---|
+| Packet time | 1.000 ms | 48 frames at 48 kHz, matching the Riedel SDP in `Docs/Examples/`. |
+| Receive buffer | 8.000 ms (8 x packet time) | The network's receive latency convention; basis for the default link offset (decision 1). Also the arrival window our TX packets must meet in phase 5. |
+| Play mode | synton | Unconfirmed reading: syntonised playout (frequency-locked, latency set by the buffer) rather than absolute time alignment. If so, TX interop needs the right rate more than PTP phase, which phase 3's recovered clock already provides. Check Riedel's documentation. |
+| Media 1 address | 10.46.70.211, port 6060 | Same address range as the development Mac, but during spike S1 that Mac heard no PTP on 224.0.1.129, so S3 needs a port on the PTP network. |
+
 The card also has an NMOS tab, so streams there may be managed through NMOS (IS-04/IS-05) rather than SAP or SDP files. That is a candidate for after step 2.
 
 - Reuse from `PTPSlave`: socket setup (plus `SO_TIMESTAMP_MONOTONIC`), header and Announce field parsing, Delay_Req builder, requesting-port matching.
@@ -233,7 +242,7 @@ Each phase is a separate PR, test-first, and leaves the driver working.
 
 ## Decisions needed
 
-1. **Default link offset.** Proposed 2 ms, configurable 0.25-20 ms. Still open: the Riedel's PTP tab does not show latency; its Media 1/Media 2 tabs should show the packet time and receive latency (link offset) in use.
+1. **Default link offset: decided, 8 x packet time (8 ms at 1 ms packets), configurable 0.25-20 ms.** Matches the target network's receive buffer convention, favouring robustness on a busy network; revisit after spike S3 measures jitter and PTP accuracy.
 2. **Stream-recovered mode (Phase 3).** Recommended, because it delivers drift-free RX from the Riedel before PTP lands.
 3. **PTP placement.** Resolved by spike S1: in-process.
 4. **ASRC.** Defer to Phase 6, choose the library then.
