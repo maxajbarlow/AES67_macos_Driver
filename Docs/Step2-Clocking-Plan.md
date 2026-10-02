@@ -152,9 +152,10 @@ Also removed: `PTPClock`, `PTPDInterface`, `PhaseLockedLoop`, `CustomSys`, `Netw
 
 Each phase is a separate PR, test-first, and leaves the driver working.
 
-### Phase 0: Foundations and spikes
+### Phase 0: Foundations and spikes (done)
 
-- `HostTime` (mach timebase conversions), `MediaClock` model with lock-free publication, `PlayoutBuffer`/`TxBuffer` (tagged slots).
+- `NetworkEngine/Clock/`: `HostTime.h` (mach timebase conversions), `MediaClock.h` (seqlock-published model, whole sample plus fraction for sub-sample precision at PTP-epoch scale), and `TimestampedAudioBuffer` (per-frame tags used as seqlocks). The PlayoutBuffer and TxBuffer in this plan are both instances of `TimestampedAudioBuffer`.
+- Covered by `Tests/TestClockFoundations.cpp`. Its stress tests fail against deliberately broken seqlocks (verified by mutation), and the suite is clean under ThreadSanitizer.
 - Deterministic unit tests with virtual time:
   - Mapping round-trips.
   - Wraparound.

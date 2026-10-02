@@ -194,8 +194,21 @@ target_link_libraries(TestCriticalPathRegressions PRIVATE
     "-framework AudioToolbox"
 )
 
+# Test: Step 2 clock foundations (HostTime, MediaClock, TimestampedAudioBuffer)
+add_executable(TestClockFoundations
+    TestClockFoundations.cpp
+    ../NetworkEngine/Clock/TimestampedAudioBuffer.cpp
+)
+
+target_include_directories(TestClockFoundations PRIVATE
+    ${CMAKE_SOURCE_DIR}
+)
+
+target_compile_features(TestClockFoundations PRIVATE cxx_std_17)
+
 # Add tests to CTest
 enable_testing()
+add_test(NAME ClockFoundations COMMAND TestClockFoundations)
 add_test(NAME CriticalPathRegressions COMMAND TestCriticalPathRegressions)
 add_test(NAME SDPParser COMMAND TestSDPParser)
 add_test(NAME ChannelMapper COMMAND TestChannelMapper)
