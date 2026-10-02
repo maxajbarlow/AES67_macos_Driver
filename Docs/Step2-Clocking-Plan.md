@@ -31,6 +31,7 @@ One media clock for the whole device. Core Audio's sample clock, RX placement an
 
 - **Kernel receive timestamps are already in Core Audio's time base.** `SO_TIMESTAMP_MONOTONIC` returns `mach_absolute_time` ticks (verified on this Mac: each timestamp fell between `mach_absolute_time` reads taken before the send and after the receive, 10-20 us ahead of userspace). PTP event timestamps can therefore be used directly against Core Audio host time, with no clock translation.
 - **Host ticks are not nanoseconds.** `mach_timebase_info` is 125/3 on Apple Silicon. Nothing in the repo uses it today.
+- **Core Audio follows a model-driven device clock exactly** (spike S2).
 - **Zero timestamps map sample time to `mach_absolute_time`** (AudioServerPlugIn.h). The period must be at least 10923 frames. Changing the seed tells the HAL the timeline restarted. `kAudioDeviceClockAlgorithmRaw` disables HAL filtering, appropriate when timestamps come from a servo model.
 - **Nothing on this Mac currently owns UDP 319/320, and the sandboxed driver host can use them** (spike S1).
 - **The existing PTP, PLL and resampler code is not a foundation** (separate assessment): `PTPSlave` deadlocks on every Follow_Up and Sync path, compares TAI to UTC so it can never lock, has no frequency estimate and no host-time mapping; `PhaseLockedLoop` is open-loop; the resampler resets phase every block. Only `PTPSlave`'s socket setup, packet field parsing and Delay_Req builder are worth carrying forward.
@@ -199,7 +200,7 @@ Each phase is a separate PR, test-first, and leaves the driver working.
 ## Spikes (do first)
 
 - **S1, PTP inside the sandbox: resolved, PTP runs in-process.** Inside the driver host (`_coreaudiod`, macOS 26.0.1) the probe bound UDP 319/320, joined 224.0.1.129, sent, and received with kernel monotonic timestamps, with or without `AudioServerPlugIn_Network`. Host threads were scheduled up to 31.7 ms late, so kernel timestamps are mandatory. Details: [Spikes/S1-PTP-Sandbox.md](Spikes/S1-PTP-Sandbox.md).
-- **S2, HAL acceptance.** Confirm the HAL accepts model-derived zero timestamps with the Raw algorithm and a custom period, and resynchronises cleanly on a seed change. Measure the actual rate and glitch-freedom with a capture app.
+- **S2, HAL acceptance: resolved, Core Audio follows the model exactly.** With the Raw algorithm and a 16384-frame period, the measured rate matched a +300 ppm model to 0.1 ppm, tracked a +300 to -300 ppm ramp within 3 ppm (re-anchoring every 100 ms), and a phase step with a new seed produced exactly one clean timeline jump with no overloads in 3284 IO cycles. Core Audio adds no smoothing under Raw, so the servo must publish a smooth rate and slew small phase errors rather than step. Details: [Spikes/S2-HAL-Clock.md](Spikes/S2-HAL-Clock.md).
 - **S3, PTP accuracy.** Log offset and path-delay statistics against a real grandmaster to set link offset defaults and lock thresholds.
 
 ## Risks
