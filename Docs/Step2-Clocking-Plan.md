@@ -121,6 +121,19 @@ Selection is automatic with a configurable preference, and switching sources is 
 
 ### PTP slave (new)
 
+#### Target network (from the Riedel Artist SIC AES67 card's PTP settings, October 2026)
+
+| Setting | Value | What the slave must do |
+|---|---|---|
+| PTP mode | Hybrid | Sync, Follow_Up and Announce arrive by multicast; **Delay_Req is sent unicast to the master's address** (the source of its Sync/Announce), and Delay_Resp arrives unicast on port 320. Keep multicast Delay_Req as an option for non-hybrid networks. |
+| Role | TimeReceiver (slave) | The Riedel is not the grandmaster; a separate device on the network is. |
+| Domain | 0 | The default. |
+| Announce interval / receipt timeout | 1 (2 s) / 3 | Derive the timeout from the received `logAnnounceInterval` (here 6 s), never a fixed value. |
+| Sync interval / delay request interval | 0 / 0 (1 per second) | These are the Riedel's own port settings; the grandmaster sets the real rates, which spike S3 must measure. If Sync really is 1 Hz, the servo gets one measurement per second and needs a longer averaging window than an 8 Hz network. |
+| Media 1 / Media 2 | Shared PTP settings | Suggests dual networks (SMPTE ST 2022-7). The driver uses one network; 2022-7 redundancy is out of scope for step 2. |
+
+The card also has an NMOS tab, so streams there may be managed through NMOS (IS-04/IS-05) rather than SAP or SDP files. That is a candidate for after step 2.
+
 - Reuse from `PTPSlave`: socket setup (plus `SO_TIMESTAMP_MONOTONIC`), header and Announce field parsing, Delay_Req builder, requesting-port matching.
 - Write fresh:
   - Delay_Resp on the general port.
@@ -196,7 +209,7 @@ Each phase is a separate PR, test-first, and leaves the driver working.
   - Servo simulation with jittered, skewed timestamps.
   - Loopback against a scripted PTP master.
   - Hardware run against the Riedel or a Dante device as grandmaster.
-- Exit: lock within 30 s; criterion 2.
+- Exit: frequency lock within about 30 s and phase settled within about 2 minutes at a 1 Hz Sync rate (faster on faster networks); hybrid-mode unicast Delay_Req verified against the target network; criterion 2.
 
 ### Phase 5: TX on the media clock
 
@@ -209,7 +222,7 @@ Each phase is a separate PR, test-first, and leaves the driver working.
 
 - **S1, PTP inside the sandbox: resolved, PTP runs in-process.** Inside the driver host (`_coreaudiod`, macOS 26.0.1) the probe bound UDP 319/320, joined 224.0.1.129, sent, and received with kernel monotonic timestamps, with or without `AudioServerPlugIn_Network`. Host threads were scheduled up to 31.7 ms late, so kernel timestamps are mandatory. Details: [Spikes/S1-PTP-Sandbox.md](Spikes/S1-PTP-Sandbox.md).
 - **S2, HAL acceptance: resolved, Core Audio follows the model exactly.** With the Raw algorithm and a 16384-frame period, the measured rate matched a +300 ppm model to 0.1 ppm, tracked a +300 to -300 ppm ramp within 3 ppm (re-anchoring every 100 ms), and a phase step with a new seed produced exactly one clean timeline jump with no overloads in 3284 IO cycles. Core Audio adds no smoothing under Raw, so the servo must publish a smooth rate and slew small phase errors rather than step. Details: [Spikes/S2-HAL-Clock.md](Spikes/S2-HAL-Clock.md).
-- **S3, PTP accuracy.** Log offset and path-delay statistics against a real grandmaster to set link offset defaults and lock thresholds.
+- **S3, PTP accuracy.** Log offset and path-delay statistics against a real grandmaster to set link offset defaults and lock thresholds. On the target network this means the network's grandmaster, not the Riedel (a TimeReceiver). Also measure the actual Sync, Announce and Delay_Resp rates, and confirm the master answers unicast Delay_Req (hybrid mode).
 
 ## Risks
 
@@ -220,7 +233,7 @@ Each phase is a separate PR, test-first, and leaves the driver working.
 
 ## Decisions needed
 
-1. **Default link offset.** Proposed 2 ms, configurable 0.25-20 ms. What does the Riedel setup use?
+1. **Default link offset.** Proposed 2 ms, configurable 0.25-20 ms. Still open: the Riedel's PTP tab does not show latency; its Media 1/Media 2 tabs should show the packet time and receive latency (link offset) in use.
 2. **Stream-recovered mode (Phase 3).** Recommended, because it delivers drift-free RX from the Riedel before PTP lands.
 3. **PTP placement.** Resolved by spike S1: in-process.
 4. **ASRC.** Defer to Phase 6, choose the library then.
