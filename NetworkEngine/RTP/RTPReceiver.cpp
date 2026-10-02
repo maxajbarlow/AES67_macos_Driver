@@ -121,6 +121,8 @@ bool RTPReceiver::start() {
     placementConfig.linkOffsetFrames = linkOffset;
     placementConfig.sourceSwitchFrames =
         static_cast<int64_t>(std::llround(sdp_.sampleRate * RtpPlacement::kSourceSwitchSeconds));
+    linkOffsetFrames_ = linkOffset;
+    lastNetworkOffset_ = NetworkTimeMapping::kUnset;
     placement_ = std::make_unique<RtpPlacement>(placementConfig, context_.networkTime);
     lastClockGeneration_ = 0;
     decodeBuffer_.assign(kMaxFramesPerPacket * sdp_.numChannels, 0.0f);
@@ -161,6 +163,10 @@ void RTPReceiver::stop() {
 
     // After this returns no IO read can still be using the buffer
     context_.routing.unpublish(buffer_.get());
+
+    if (context_.clockRecovery) {
+        context_.clockRecovery->streamStopped(this);
+    }
 
     rtpSocket_.close();
     connected_ = false;
@@ -298,22 +304,43 @@ void RTPReceiver::processPacket(const RTP::RTPPacket& packet, uint64_t arrivalHo
     if (!clock.valid()) {
         return;
     }
+    bool marginsJumped = false;
     if (clock.generation != lastClockGeneration_) {
         // The local timeline restarted: earlier placement no longer applies
         placement_->reset();
         lastClockGeneration_ = clock.generation;
+        marginsJumped = true;
     }
 
+    // Another stream re-anchoring the shared mapping moves this stream's
+    // positions too, without this stream's placement reporting it. Read before
+    // placing: a re-anchor in between is then seen (one packet late) rather
+    // than missed.
+    const int64_t networkOffset = context_.networkTime.offset();
+    marginsJumped = marginsJumped || networkOffset != lastNetworkOffset_;
+    lastNetworkOffset_ = networkOffset;
+
+    const MediaPosition arrival = clock.positionAt(arrivalHostTime);
     const RtpPlacement::Result placed = placement_->place(
-        packet.header.timestamp, packet.header.ssrc, static_cast<uint32_t>(frames), clock.sampleAt(arrivalHostTime));
+        packet.header.timestamp, packet.header.ssrc, static_cast<uint32_t>(frames), arrival.sample);
     publishPlacementStatistics();
 
     if (placed.reanchored) {
         AES67_LOGF("RTPReceiver: re-anchored timeline at ssrc=%08x ts=%u (stream=%s)",
                    packet.header.ssrc, packet.header.timestamp, sdp_.sessionName.c_str());
     }
+    if (context_.clockRecovery && (marginsJumped || placed.reanchored)) {
+        context_.clockRecovery->streamReanchored(this);
+    }
     if (placed.verdict != RtpPlacement::Verdict::Accepted) {
         return;
+    }
+
+    if (context_.clockRecovery) {
+        // How far ahead of the read point the packet's end landed (samples).
+        // The servo holds this constant, locking the device clock to the sender.
+        const int64_t wholeMargin = placed.position + static_cast<int64_t>(frames) - (arrival.sample - linkOffsetFrames_);
+        context_.clockRecovery->observe(this, arrivalHostTime, static_cast<double>(wholeMargin) - arrival.fraction);
     }
 
     if (decode(packet.payload, packet.payloadSize) == frames) {

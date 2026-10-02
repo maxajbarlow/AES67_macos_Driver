@@ -47,6 +47,7 @@ AES67Device::AES67Device(std::shared_ptr<aspl::Context> context)
     // so they never need resizing. Power-of-2 sizing: 384kHz @ 3ms = 1152 → 2048
     , outputBuffers_(MakeRingBufferArray(
           CalculateRingBufferSize(384000.0)))  // Max sample rate
+    , clockRecovery_(ClockServo::Config{}, [this](uint64_t, double ratio) { ApplyRecoveredRate(ratio); })
 {
     AES67_LOG("AES67Device constructor: Starting initialization");
     linkOffsetFrames_.store(LinkOffsetFramesFor(currentSampleRate_.load()));
@@ -97,7 +98,7 @@ void AES67Device::Initialize() {
     // Initialize Stream Manager (manages all AES67 network streams)
     AES67_LOG("AES67Device: Creating StreamManager");
     streamManager_ = std::make_unique<StreamManager>(
-        RxContext{mediaClock_, networkTime_, rxRouting_, linkOffsetFrames_}, outputBuffers_);
+        RxContext{mediaClock_, networkTime_, rxRouting_, linkOffsetFrames_, &clockRecovery_}, outputBuffers_);
     AES67_LOG("AES67Device: StreamManager created successfully");
 
     // Set device sample rate in StreamManager
@@ -303,12 +304,23 @@ OSStatus AES67Device::SetNominalSampleRateImpl(Float64 rate) {
 }
 
 void AES67Device::RestartTimeline(Float64 sampleRate) {
+    // First, so no rate steered against the old timeline lands on the new one
+    clockRecovery_.reset();
+
     std::lock_guard<std::mutex> lock(clockWriteMutex_);
     mediaClock_.reset(hostTimeNow(), 0,
                       MediaClock::samplesPerTick(sampleRate, 1.0, HostTimebase::current()));
     // Network time was anchored to the old timeline; receivers re-anchor on
     // their next packet (they also see the new clock generation)
     networkTime_.reset();
+}
+
+void AES67Device::ApplyRecoveredRate(double ratio) {
+    // From now on: rebasing at the packet's (earlier) arrival would move
+    // positions the HAL has already been given
+    std::lock_guard<std::mutex> lock(clockWriteMutex_);
+    mediaClock_.setRate(hostTimeNow(),
+                        MediaClock::samplesPerTick(currentSampleRate_.load(), ratio, HostTimebase::current()));
 }
 
 int64_t AES67Device::LinkOffsetFramesFor(Float64 sampleRate) {

@@ -6,6 +6,7 @@
 #include "RtpPlacement.h"
 #include "RxRouting.h"
 #include "../Clock/MediaClock.h"
+#include "../Clock/RecoveredClockSource.h"
 #include <atomic>
 #include <cstdint>
 
@@ -18,6 +19,7 @@ struct RxContext {
     NetworkTimeMapping& networkTime;              // network time -> local media position
     RxRouting& routing;                           // where the IO thread finds receive buffers
     const std::atomic<int64_t>& linkOffsetFrames; // read point = now - link offset
+    RecoveredClockSource* clockRecovery{nullptr}; // steers `clock` to a received stream (phase 3)
 };
 
 } // namespace AES67

@@ -118,6 +118,8 @@ private:
     // Receive thread state
     std::unique_ptr<RtpPlacement> placement_;
     uint32_t lastClockGeneration_{0};
+    int64_t lastNetworkOffset_{NetworkTimeMapping::kUnset};  // shared mapping seen by the last packet
+    int64_t linkOffsetFrames_{0};                            // fixed for this run (set by start)
     std::vector<float> decodeBuffer_;
     uint8_t receiveBuffer_[2048];
 

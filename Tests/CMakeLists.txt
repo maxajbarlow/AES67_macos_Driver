@@ -48,6 +48,7 @@ add_executable(TestRTPReceiver
     ../NetworkEngine/RTP/SimpleRTP.cpp
     ../NetworkEngine/RTP/RtpPlacement.cpp
     ../NetworkEngine/Clock/TimestampedAudioBuffer.cpp
+    ../NetworkEngine/Clock/RecoveredClockSource.cpp
     ../Driver/SDPParser.cpp
     ../Driver/AudioThreadPriority.cpp
     ../NetworkEngine/StreamChannelMapper.cpp
@@ -159,6 +160,7 @@ add_executable(TestIntegrationAudioPath
     ../NetworkEngine/RTP/SimpleRTP.cpp
     ../NetworkEngine/RTP/RtpPlacement.cpp
     ../NetworkEngine/Clock/TimestampedAudioBuffer.cpp
+    ../NetworkEngine/Clock/RecoveredClockSource.cpp
     ../Driver/SDPParser.cpp
     ../Driver/AudioThreadPriority.cpp
     ../NetworkEngine/StreamChannelMapper.cpp
@@ -220,8 +222,30 @@ target_include_directories(TestRxTimestamp PRIVATE
 
 target_compile_features(TestRxTimestamp PRIVATE cxx_std_17)
 
+# Test: Step 2 phase 3 clock recovery from a received stream
+add_executable(TestClockRecovery
+    TestClockRecovery.cpp
+    ../NetworkEngine/Clock/RecoveredClockSource.cpp
+    ../NetworkEngine/Clock/TimestampedAudioBuffer.cpp
+    ../NetworkEngine/RTP/RtpPlacement.cpp
+    ../NetworkEngine/RTP/RTPReceiver.cpp
+    ../NetworkEngine/RTP/SimpleRTP.cpp
+    ../Driver/SDPParser.cpp
+    ../Driver/AudioThreadPriority.cpp
+    ../NetworkEngine/StreamChannelMapper.cpp
+    ../NetworkEngine/NetworkInterfaceDetection.cpp
+    ../Shared/Types.cpp
+)
+
+target_include_directories(TestClockRecovery PRIVATE
+    ${CMAKE_SOURCE_DIR}
+)
+
+target_compile_features(TestClockRecovery PRIVATE cxx_std_17)
+
 # Add tests to CTest
 enable_testing()
+add_test(NAME ClockRecovery COMMAND TestClockRecovery)
 add_test(NAME RxTimestamp COMMAND TestRxTimestamp)
 add_test(NAME ClockFoundations COMMAND TestClockFoundations)
 add_test(NAME CriticalPathRegressions COMMAND TestCriticalPathRegressions)

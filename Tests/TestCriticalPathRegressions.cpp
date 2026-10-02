@@ -370,6 +370,45 @@ void testDeviceClockFromMediaClock() {
 }
 
 // ---------------------------------------------------------------------------
+// Step 2 phase 3: the device clock follows its received stream, and a
+// timeline restart returns it to the nominal rate.
+// ---------------------------------------------------------------------------
+void testDeviceClockFollowsReceivedStream() {
+    std::cout << "Device clock follows a received stream" << std::endl;
+    useEmptyConfig("recovered");
+
+    auto context = std::make_shared<aspl::Context>();
+    auto device = std::make_shared<AES67Device>(context);
+    device->Initialize();  // empty config: the built-in RX stream on 239.1.1.1:5004, 8 ch
+    CHECK(device->StartIO(device->GetID(), 0) == kAudioHardwareNoError, "IO should start");
+    const double nominal = MediaClock::samplesPerTick(48000.0, 1.0, HostTimebase::current());
+
+    // A sender 1500 ppm fast for 3 s: the device clock must speed up towards it
+    LoopbackSender sender("239.1.1.1", 5004);
+    AudioThreadPriority::configureForRealTime();
+    const auto period = std::chrono::nanoseconds(static_cast<int64_t>(1e6 / 1.0015));
+    auto next = std::chrono::steady_clock::now();
+    for (uint32_t i = 0; i < 3000; ++i) {
+        sender.sendL24(static_cast<uint16_t>(i), i * kFramesPerPacket, 8, 0.5f);
+        std::this_thread::sleep_until(next += period);
+    }
+    AudioThreadPriority::restoreNormalPriority();
+
+    const double steered = device->GetMediaClock().snapshot().samplesPerTick / nominal - 1.0;
+    CHECK(steered > 300e-6 && steered <= 2000e-6,
+          "the device clock should speed up towards a fast sender (" << steered * 1e6 << " ppm)");
+
+    // IO restart = new timeline at the nominal rate, recovery starts over
+    const uint32_t generation = device->GetMediaClock().snapshot().generation;
+    device->StopIO(device->GetID(), 0);
+    CHECK(device->StartIO(device->GetID(), 0) == kAudioHardwareNoError, "IO should restart");
+    const auto restarted = device->GetMediaClock().snapshot();
+    CHECK(restarted.generation != generation && restarted.samplesPerTick == nominal,
+          "a timeline restart should return the device clock to nominal");
+    device->StopIO(device->GetID(), 0);
+}
+
+// ---------------------------------------------------------------------------
 // TX streams must reload as transmitters.
 // ---------------------------------------------------------------------------
 void testTxStreamSurvivesReload() {
@@ -546,6 +585,7 @@ int main() {
     testDeviceSampleRate();
     testDeviceClockFromMediaClock();
     testIOStartStopLeavesStreamActivityToHAL();
+    testDeviceClockFollowsReceivedStream();
     testTxStreamSurvivesReload();
     testReceiverFollowsSenderRestart();
     testLostPacketKeepsTimeline();
