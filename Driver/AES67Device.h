@@ -11,12 +11,14 @@
 #include "../Shared/RingBuffer.hpp"
 #include "../NetworkEngine/StreamManager.h"
 #include "../NetworkEngine/RTSafeStreamInterface.h"
+#include "../NetworkEngine/Clock/MediaClock.h"
 #include <aspl/Device.hpp>
 #include <aspl/Stream.hpp>
 #include <aspl/Context.hpp>
 #include <memory>
 #include <array>
 #include <atomic>
+#include <mutex>
 
 namespace AES67 {
 
@@ -35,6 +37,9 @@ public:
     // Nominal rate at startup (AES67 baseline). Must be passed to libASPL via
     // DeviceParameters::SampleRate, whose own default is 44.1 kHz.
     static constexpr UInt32 kDefaultSampleRate = 48000;
+
+    // Frames between zero timestamps (HAL minimum 10923). See Docs/Spikes/S2-HAL-Clock.md.
+    static constexpr UInt32 kZeroTimeStampPeriod = 16384;
 
     // Supported sample rates
     static constexpr std::array<Float64, 8> kSupportedSampleRates = {
@@ -120,6 +125,14 @@ public:
     const StreamManager* GetStreamManager() const { return streamManager_.get(); }
 
     //
+    // Clock
+    //
+
+    // The device's media clock: Core Audio's zero timestamps are computed from
+    // it. Snapshots are real-time safe. Currently driven by the host clock.
+    const MediaClock& GetMediaClock() const { return mediaClock_; }
+
+    //
     // Control
     //
 
@@ -141,11 +154,19 @@ protected:
     // StreamManager and both streams' formats.
     OSStatus SetNominalSampleRateImpl(Float64 rate) override;
 
+    // Zero timestamps from the media clock (Raw algorithm: the HAL uses them as-is)
+    OSStatus GetZeroTimeStampImpl(UInt32 clientID, Float64* outSampleTime, UInt64* outHostTime,
+                                  UInt64* outSeed) override;
+
 private:
     // Internal handlers
     OSStatus OnSetBufferSize(UInt32 bufferSize);
 
     static bool IsSupportedSampleRate(Float64 sampleRate);
+
+    // Host clock source: start a new timeline at device time 0, running at the
+    // nominal rate on the host clock (new seed)
+    void RestartTimeline(Float64 sampleRate);
 
     // Lock a stream's physical and virtual formats to the given sample rate
     static void ApplyStreamSampleRate(aspl::Stream& stream, Float64 sampleRate);
@@ -185,6 +206,11 @@ private:
 
     // State
     std::atomic<bool> ioRunning_{false};
+
+    // Media clock. Writers (timeline restarts) are serialised by clockWriteMutex_;
+    // readers, including GetZeroTimeStampImpl on the IO thread, never lock.
+    MediaClock mediaClock_;
+    std::mutex clockWriteMutex_;
 
     // Statistics
     std::atomic<uint64_t> inputUnderruns_{0};

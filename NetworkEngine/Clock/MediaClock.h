@@ -35,6 +35,7 @@ public:
         int64_t anchorSample{0};
         double anchorFraction{0.0};
         double samplesPerTick{0.0};
+        int64_t origin{0};       // media position where this timeline started (set by reset)
         uint32_t generation{0};  // 0 = never set; changes on every discontinuity (HAL seed)
 
         bool valid() const noexcept { return generation != 0; }
@@ -78,6 +79,7 @@ public:
             s.anchorSample = anchorSample_.load(std::memory_order_relaxed);
             s.anchorFraction = anchorFraction_.load(std::memory_order_relaxed);
             s.samplesPerTick = samplesPerTick_.load(std::memory_order_relaxed);
+            s.origin = origin_.load(std::memory_order_relaxed);
             s.generation = generation_.load(std::memory_order_relaxed);
             std::atomic_thread_fence(std::memory_order_acquire);
             if ((before & 1u) == 0 && sequence_.load(std::memory_order_relaxed) == before) {
@@ -88,20 +90,21 @@ public:
 
     // Writer side: call from one thread only.
 
-    /// Start a new timeline at `sample` (new generation).
+    /// Start a new timeline at `sample`, which becomes its origin (new generation).
     void reset(uint64_t host, int64_t sample, double samplesPerTick) noexcept {
-        Snapshot next{host, sample, 0.0, samplesPerTick, nextGeneration()};
+        Snapshot next{host, sample, 0.0, samplesPerTick, sample, nextGeneration()};
         publish(next);
     }
 
-    /// Change rate from `host` onwards, keeping the position continuous.
+    /// Change rate from `host` onwards, keeping the position and origin continuous.
     void setRate(uint64_t host, double samplesPerTick) noexcept {
         Snapshot next = rebasedAt(host);
         next.samplesPerTick = samplesPerTick;
         publish(next);
     }
 
-    /// Jump the position by `deltaSamples` at `host` (new generation).
+    /// Jump the position by `deltaSamples` at `host` (new generation). The
+    /// origin is kept, so device time jumps by the same amount.
     void step(uint64_t host, int64_t deltaSamples) noexcept {
         Snapshot next = rebasedAt(host);
         next.anchorSample += deltaSamples;
@@ -132,6 +135,7 @@ private:
         anchorSample_.store(s.anchorSample, std::memory_order_relaxed);
         anchorFraction_.store(s.anchorFraction, std::memory_order_relaxed);
         samplesPerTick_.store(s.samplesPerTick, std::memory_order_relaxed);
+        origin_.store(s.origin, std::memory_order_relaxed);
         generation_.store(s.generation, std::memory_order_relaxed);
         sequence_.store(sequence + 2, std::memory_order_release);  // even: stable
     }
@@ -141,6 +145,7 @@ private:
     std::atomic<int64_t> anchorSample_{0};
     std::atomic<double> anchorFraction_{0.0};
     std::atomic<double> samplesPerTick_{0.0};
+    std::atomic<int64_t> origin_{0};
     std::atomic<uint32_t> generation_{0};
 };
 

@@ -8,6 +8,7 @@
 
 #include "../NetworkEngine/Clock/HostTime.h"
 #include "../NetworkEngine/Clock/MediaClock.h"
+#include "../NetworkEngine/Clock/DeviceTimeline.h"
 #include "../NetworkEngine/Clock/TimestampedAudioBuffer.h"
 #include <atomic>
 #include <chrono>
@@ -357,6 +358,79 @@ void testBufferConcurrentStress() {
     CHECK(mismatches.load() == 0, "no accepted frame may hold another position's data (got " << mismatches.load() << ")");
 }
 
+// ---------------------------------------------------------------------------
+// Timeline origin and device zero timestamps (phase 1)
+// ---------------------------------------------------------------------------
+void testTimelineOrigin() {
+    std::cout << "MediaClock timeline origin" << std::endl;
+
+    MediaClock clock;
+    clock.reset(1000, 9000, kSamplesPerTick48k);
+    CHECK(clock.snapshot().origin == 9000, "reset should set the origin to the start sample");
+
+    clock.setRate(1000 + 24000000, kSamplesPerTick48k * 1.0003);
+    CHECK(clock.snapshot().origin == 9000, "setRate should keep the origin (same timeline)");
+
+    clock.step(1000 + 48000000, 4800);
+    CHECK(clock.snapshot().origin == 9000, "step should keep the origin so device time jumps by the step");
+
+    clock.reset(5, 777, kSamplesPerTick48k);
+    CHECK(clock.snapshot().origin == 777, "a new reset should move the origin");
+}
+
+void testZeroTimeStamps() {
+    std::cout << "Device zero timestamps" << std::endl;
+
+    constexpr uint32_t kPeriod = 16384;
+    MediaClock clock;
+    const int64_t origin = int64_t{1} << 46;  // PTP-scale media position
+    clock.reset(1000, origin, kSamplesPerTick48k);
+    const auto snap = clock.snapshot();
+
+    bool aligned = true;
+    bool bracketsNow = true;
+    bool hostMatches = true;
+    bool monotonic = true;
+    ZeroTimeStamp previous{-1.0, 0, 0};
+    // Sweep 10 s of host time in steps that are not a multiple of anything
+    for (uint64_t host = 1000; host < 1000 + 240000000; host += 1234567) {
+        const ZeroTimeStamp zts = zeroTimeStampAt(snap, host, kPeriod);
+        const int64_t deviceNow = deviceSampleTimeAt(snap, host);
+        aligned = aligned && std::fmod(zts.sampleTime, kPeriod) == 0.0;
+        bracketsNow = bracketsNow && zts.sampleTime <= deviceNow && deviceNow < zts.sampleTime + kPeriod;
+        hostMatches = hostMatches && snap.sampleAt(zts.hostTime) - snap.origin == static_cast<int64_t>(zts.sampleTime) &&
+                      snap.sampleAt(zts.hostTime - 1) - snap.origin == static_cast<int64_t>(zts.sampleTime) - 1;
+        monotonic = monotonic && zts.sampleTime >= previous.sampleTime && zts.hostTime >= previous.hostTime;
+        previous = zts;
+    }
+    CHECK(deviceSampleTimeAt(snap, 1000) == 0, "device time should start at 0 at the origin");
+    CHECK(aligned, "zero timestamp sample times should be multiples of the period");
+    CHECK(bracketsNow, "the zero timestamp should be the latest period boundary at or before now");
+    CHECK(hostMatches, "a zero timestamp's host time should be exactly where its sample starts");
+    CHECK(monotonic, "zero timestamps should never go backwards");
+    CHECK(zeroTimeStampAt(snap, 5000, kPeriod).seed == snap.generation, "the seed should be the clock generation");
+
+    // Before the origin (negative device time) still lands on a period boundary below now
+    const ZeroTimeStamp early = zeroTimeStampAt(snap, 1000 - 500 * 5, kPeriod);
+    CHECK(early.sampleTime == -static_cast<double>(kPeriod), "negative device time should floor to the previous boundary");
+
+    // A faster clock reaches each boundary sooner in host time
+    clock.setRate(1000, kSamplesPerTick48k * 1.0003);
+    const auto fast = clock.snapshot();
+    const ZeroTimeStamp a = zeroTimeStampAt(fast, 1000 + 10 * 24000000ULL, kPeriod);
+    const ZeroTimeStamp b = zeroTimeStampAt(fast, fast.hostAt(fast.origin + static_cast<int64_t>(a.sampleTime) + kPeriod), kPeriod);
+    const double ticksPerPeriod = static_cast<double>(b.hostTime - a.hostTime);
+    CHECK(std::fabs(ticksPerPeriod - kPeriod / (kSamplesPerTick48k * 1.0003)) <= 1.0,
+          "boundary spacing should follow the clock rate (got " << ticksPerPeriod << " ticks)");
+
+    // A step starts a new seed and moves device time by the step
+    clock.step(1000 + 24000000ULL, 4800);
+    const auto stepped = clock.snapshot();
+    CHECK(stepped.generation != snap.generation, "a step should change the seed");
+    CHECK(deviceSampleTimeAt(stepped, 1000 + 24000000ULL) == deviceSampleTimeAt(fast, 1000 + 24000000ULL) + 4800,
+          "a step should move device time by the step size");
+}
+
 } // namespace
 
 int main() {
@@ -365,6 +439,8 @@ int main() {
     testMediaClockPrecisionAtPTPScale();
     testMediaClockUpdates();
     testMediaClockConcurrentReads();
+    testTimelineOrigin();
+    testZeroTimeStamps();
     testBufferReadWrite();
     testBufferWraparoundAndStaleLaps();
     testBufferStridedAccess();

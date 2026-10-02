@@ -22,6 +22,7 @@
 #include "../NetworkEngine/RTP/RTPReceiver.h"
 #include "../NetworkEngine/RTP/RateController.h"
 #include "../NetworkEngine/RTSafeStreamInterface.h"
+#include "../NetworkEngine/Clock/HostTime.h"
 #include "../Shared/RingBuffer.hpp"
 #include <aspl/Context.hpp>
 #include <arpa/inet.h>
@@ -650,12 +651,67 @@ void testOutageDoesNotAddLatency() {
               << silencePackets << " packets of silence for a " << kOutagePackets << "-packet outage)");
 }
 
+// ---------------------------------------------------------------------------
+// Phase 1: the device's Core Audio clock comes from its MediaClock.
+// ---------------------------------------------------------------------------
+void testDeviceClockFromMediaClock() {
+    std::cout << "Device clock driven by MediaClock" << std::endl;
+    useEmptyConfig("deviceclock");
+
+    auto context = std::make_shared<aspl::Context>();
+    auto device = std::make_shared<AES67Device>(context);
+    device->Initialize();
+
+    CHECK(device->GetClockAlgorithm() == kAudioDeviceClockAlgorithmRaw,
+          "clock algorithm should be Raw: timestamps come from the clock model, not HAL smoothing");
+    CHECK(device->GetZeroTimeStampPeriod() == 16384, "zero timestamp period should be 16384 frames");
+    CHECK(device->GetClockIsStable(), "the host-clock source should report a stable clock");
+
+    CHECK(device->StartIO(device->GetID(), 0) == kAudioHardwareNoError, "IO should start");
+    const double hostTicksPerSecond = HostTimebase::current().ticksPerSecond();
+    Float64 sampleTime = -1;
+    UInt64 hostTime = 0;
+    UInt64 seed = 0;
+    const uint64_t before = hostTimeNow();
+    CHECK(device->GetZeroTimeStamp(device->GetID(), 0, &sampleTime, &hostTime, &seed) == kAudioHardwareNoError,
+          "GetZeroTimeStamp should succeed while running");
+    CHECK(std::fmod(sampleTime, 16384.0) == 0.0, "zero timestamp should sit on a period boundary");
+    CHECK(hostTime <= before && static_cast<double>(before - hostTime) < 16384.0 / 48000.0 * hostTicksPerSecond,
+          "zero timestamp should be the latest boundary before now at 48 kHz");
+    CHECK(seed != 0, "seed should be set");
+
+    // The timestamp must come from the device's own MediaClock: its host time
+    // is exactly where that sample starts on the clock, and the seed is the
+    // clock's generation (libASPL's default clock would match neither)
+    const auto clock = device->GetMediaClock().snapshot();
+    CHECK(clock.sampleAt(hostTime) - clock.origin == static_cast<int64_t>(sampleTime) &&
+              clock.sampleAt(hostTime - 1) - clock.origin == static_cast<int64_t>(sampleTime) - 1,
+          "zero timestamp should land exactly on the device's MediaClock");
+    CHECK(seed == clock.generation, "seed should be the MediaClock generation");
+
+    // Rate change: new timeline (seed) at the new rate
+    device->StopIO(device->GetID(), 0);
+    device->GetStreamManager()->removeAllStreams();
+    device->SetNominalSampleRateAsync(96000.0);
+    device->StartIO(device->GetID(), 0);
+    Float64 sampleTime96 = -1;
+    UInt64 hostTime96 = 0;
+    UInt64 seed96 = 0;
+    const uint64_t before96 = hostTimeNow();
+    device->GetZeroTimeStamp(device->GetID(), 0, &sampleTime96, &hostTime96, &seed96);
+    CHECK(seed96 != seed, "a sample rate change should start a new timeline (seed)");
+    CHECK(static_cast<double>(before96 - hostTime96) < 16384.0 / 96000.0 * hostTicksPerSecond,
+          "after the change, boundaries should be spaced for 96 kHz");
+    device->StopIO(device->GetID(), 0);
+}
+
 } // namespace
 
 int main() {
     testMixedOutputReachesOutputBuffers();
     testLargeIOBuffersAreChunked();
     testDeviceSampleRate();
+    testDeviceClockFromMediaClock();
     testRateControllerTracksSender();
     testTxStreamSurvivesReload();
     testJitterBufferReplacesStaleSlot();

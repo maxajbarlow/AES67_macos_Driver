@@ -164,10 +164,17 @@ Each phase is a separate PR, test-first, and leaves the driver working.
 - Spikes S1-S3 below, before Phase 1 commits to an approach.
 - No behaviour change.
 
-### Phase 1: Device clock from MediaClock
+### Phase 1: Device clock from MediaClock (done)
 
 - `GetZeroTimeStampImpl` override with the Host source, Raw algorithm, seed handling and rate-change rebase.
 - Exit: zero timestamps monotonic and period-aligned in tests; in the real HAL, measured device rate equals nominal and audio is unchanged.
+- Implementation:
+  - The `mediaBase` idea became a timeline **origin** stored in the `MediaClock` snapshot, set by `reset` and kept by `setRate` and `step`. Device sample time is `T = M - origin`, published atomically with the rest of the clock, so it cannot race. `NetworkEngine/Clock/DeviceTimeline.h` computes zero timestamps as a pure function of a snapshot.
+  - The device restarts its timeline (new seed) at IO start and on sample rate changes.
+- Result:
+  - **Tests:** `TestClockFoundations` covers timestamp alignment, bracketing, exact host mapping and monotonicity across a 10 s sweep. `TestCriticalPathRegressions` checks the device's timestamps land exactly on its own MediaClock, which libASPL's default clock would not.
+  - **Real HAL:** with the installed driver, the client (`AES67ClockProbeClient --uid com.aes67.driver.device --constant 0 --no-ramp --expect-level 0.25`) measured the rate at +0.0 ppm (HAL actual rate 48000.000 Hz), with 0 timeline jumps and 0 overloads in 2345 callbacks.
+  - **Receive audio:** host-only test packets through a receive-only config arrived unbroken: 100.0% of 1,200,640 input samples were at the expected level.
 
 ### Phase 2: RX by timestamp
 
