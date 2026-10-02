@@ -6,6 +6,7 @@
 //
 
 #include "AES67IOHandler.h"
+#include <algorithm>
 #include <cstring>
 
 namespace AES67 {
@@ -56,7 +57,12 @@ void AES67IOHandler::OnReadClientInput(
 
     float* output = static_cast<float*>(bytes);
 
-    processInput(output, frameCount, channelCount);
+    // Process in chunks that fit processInput's stack scratch buffer
+    for (UInt32 done = 0; done < frameCount;) {
+        const UInt32 chunk = std::min(frameCount - done, kMaxFramesPerChunk);
+        processInput(output + static_cast<size_t>(done) * channelCount, chunk, channelCount);
+        done += chunk;
+    }
 
     (void)client;
     (void)stream;
@@ -64,31 +70,40 @@ void AES67IOHandler::OnReadClientInput(
     (void)timestamp;
 }
 
-void AES67IOHandler::OnWriteClientOutput(
-    const std::shared_ptr<aspl::Client>& client,
+void AES67IOHandler::OnWriteMixedOutput(
     const std::shared_ptr<aspl::Stream>& stream,
     Float64 zeroTimestamp,
     Float64 timestamp,
-    const Float32* frames,
-    UInt32 frameCount,
-    UInt32 channelCount
+    const void* bytes,
+    UInt32 bytesCount
 ) {
     // RT-SAFE: Write to ring buffers (Core Audio → Network)
-    // This receives OUTPUT audio from the client (DAW)
+    // This receives the mixed OUTPUT audio of all clients (DAWs, system audio)
     //
-    // libASPL provides Float32 interleaved frames in canonical format.
+    // libASPL provides raw bytes in the stream's native format, which is
+    // interleaved 32-bit float, so bytesCount = frameCount * channelCount * 4.
 
-    if (!frames) {
+    if (!bytes) {
         return;
     }
 
-    if (channelCount != kNumChannels) {
+    // RT-SAFE: Use cached format values instead of calling stream->GetPhysicalFormat()
+    const UInt32 channelCount = cachedChannelCount_;
+    const UInt32 bytesPerFrame = cachedBytesPerFrame_;
+    const UInt32 frameCount = (bytesPerFrame > 0) ? (bytesCount / bytesPerFrame) : 0;
+
+    if (frameCount == 0 || channelCount != kNumChannels) {
         return;
     }
 
-    processOutput(frames, frameCount, channelCount);
+    // Process in chunks that fit processOutput's stack scratch buffer
+    const float* input = static_cast<const float*>(bytes);
+    for (UInt32 done = 0; done < frameCount;) {
+        const UInt32 chunk = std::min(frameCount - done, kMaxFramesPerChunk);
+        processOutput(input + static_cast<size_t>(done) * channelCount, chunk, channelCount);
+        done += chunk;
+    }
 
-    (void)client;
     (void)stream;
     (void)zeroTimestamp;
     (void)timestamp;
@@ -102,11 +117,11 @@ void AES67IOHandler::processInput(float* outputData, UInt32 frameCount, UInt32 c
     // PERFORMANCE OPTIMIZED: Batch reads per channel instead of per-sample
     // This reduces ring buffer calls from (frameCount × channelCount) to (channelCount)
 
-    // Stack-allocated temporary buffer (RT-safe, no heap allocation)
-    constexpr UInt32 kMaxFramesPerBuffer = 4096;
-    float channelBuffer[kMaxFramesPerBuffer];
+    // Stack-allocated temporary buffer (RT-safe, no heap allocation).
+    // Callers split larger buffers into chunks of at most kMaxFramesPerChunk.
+    float channelBuffer[kMaxFramesPerChunk];
 
-    if (frameCount > kMaxFramesPerBuffer) {
+    if (frameCount > kMaxFramesPerChunk) {
         std::memset(outputData, 0, frameCount * channelCount * sizeof(float));
         return;
     }
@@ -138,10 +153,9 @@ void AES67IOHandler::processInput(float* outputData, UInt32 frameCount, UInt32 c
 void AES67IOHandler::processOutput(const float* inputData, UInt32 frameCount, UInt32 channelCount) noexcept {
     // RT-SAFE: Write to output ring buffers (Core Audio → Network)
 
-    constexpr UInt32 kMaxFramesPerBuffer = 4096;
-    float channelBuffer[kMaxFramesPerBuffer];
+    float channelBuffer[kMaxFramesPerChunk];
 
-    if (frameCount > kMaxFramesPerBuffer) {
+    if (frameCount > kMaxFramesPerChunk) {
         return;
     }
 

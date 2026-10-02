@@ -80,6 +80,12 @@ constexpr uint8_t PT_DYNAMIC = 96;  // Dynamic payload types start here
 //
 // AES67 uses dynamic payload types (96-127) for L16/L24
 //
+/// Signed distance from one 16-bit RTP sequence number to another, accounting
+/// for wraparound: positive if `to` is after `from`, in [-32768, 32767].
+inline int32_t sequenceDistance(uint16_t from, uint16_t to) {
+    return static_cast<int16_t>(static_cast<uint16_t>(to - from));
+}
+
 constexpr uint8_t PT_AES67_L16 = 96;
 constexpr uint8_t PT_AES67_L24 = 97;
 

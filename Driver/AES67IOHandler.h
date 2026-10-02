@@ -69,15 +69,14 @@ public:
     ) override;
 
     // Called when Core Audio has output data for device
-    // Writes Float32 frames to outputBuffers_
-    void OnWriteClientOutput(
-        const std::shared_ptr<aspl::Client>& client,
+    // Receives the mix of all clients (DeviceParameters::EnableMixing is true,
+    // so libASPL never calls OnWriteClientOutput) and writes it to outputBuffers_
+    void OnWriteMixedOutput(
         const std::shared_ptr<aspl::Stream>& stream,
         Float64 zeroTimestamp,
         Float64 timestamp,
-        const Float32* frames,
-        UInt32 frameCount,
-        UInt32 channelCount
+        const void* bytes,
+        UInt32 bytesCount
     ) override;
 
 private:
@@ -104,6 +103,9 @@ private:
 
     // Constants
     static constexpr size_t kNumChannels = 128;
+
+    // Largest block processInput/processOutput handle at once (stack scratch size)
+    static constexpr UInt32 kMaxFramesPerChunk = 4096;
 
     // Allow benchmark direct access to processInput/processOutput
     friend class ::IOHandlerBenchmark;

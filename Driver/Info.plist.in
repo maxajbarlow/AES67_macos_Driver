@@ -38,6 +38,10 @@
     <key>AudioServerPlugIn_ResourceBundle</key>
     <string>com.aes67driver.audiodevice</string>
 
+    <!-- Required by AudioServerPlugIn.h for any network use from the sandboxed host -->
+    <key>AudioServerPlugIn_Network</key>
+    <true/>
+
     <key>CFPlugInFactories</key>
     <dict>
         <key>E31B6C42-6B3D-4F3A-9A85-6D8F7E9B4C1D</key>

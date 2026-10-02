@@ -122,6 +122,9 @@ public:
     // Set current device sample rate (validates against streams)
     bool setDeviceSampleRate(double sampleRate);
 
+    /// True if every active stream runs at this rate (always true with no streams).
+    bool isSampleRateCompatible(double sampleRate) const;
+
     // Get current device sample rate
     double getDeviceSampleRate() const { return currentDeviceSampleRate_; }
 
@@ -178,6 +181,7 @@ private:
     bool validateSampleRate(const SDPSession& sdp, std::string* errorOut) const;
     bool validateChannelAvailability(uint16_t numChannels, std::string* errorOut) const;
     bool validateNetworkConfig(const SDPSession& sdp, std::string* errorOut) const;
+    bool streamsSupportSampleRate(double sampleRate) const;  // Caller must hold streamsMutex_
 
     // Stream creation helpers
     std::unique_ptr<RTPReceiver> createReceiver(
