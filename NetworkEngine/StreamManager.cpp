@@ -14,8 +14,8 @@
 
 namespace AES67 {
 
-StreamManager::StreamManager(DeviceChannelBuffers& inputChannels, DeviceChannelBuffers& outputChannels)
-    : inputChannels_(inputChannels)
+StreamManager::StreamManager(RxContext rxContext, DeviceChannelBuffers& outputChannels)
+    : rxContext_(rxContext)
     , outputChannels_(outputChannels)
     , configManager_(std::make_unique<StreamConfigManager>())
 {
@@ -630,8 +630,11 @@ std::unique_ptr<RTPReceiver> StreamManager::createReceiver(
     size_t jitterBufferDepth,
     const std::string& networkInterface
 ) {
-    // Receivers write decoded network audio to INPUT buffers (Network → Core Audio)
-    return std::make_unique<RTPReceiver>(sdp, mapping, inputChannels_, jitterBufferDepth, networkInterface);
+    // Receivers place decoded network audio by timestamp (Network → Core Audio).
+    // jitterBufferDepth is a legacy setting: the playout buffer is sized from
+    // the link offset instead.
+    (void)jitterBufferDepth;
+    return std::make_unique<RTPReceiver>(sdp, mapping, rxContext_, networkInterface);
 }
 
 std::unique_ptr<RTPTransmitter> StreamManager::createTransmitter(

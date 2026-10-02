@@ -8,10 +8,11 @@
 // ============================================================================
 //
 // This struct is the ONLY interface the Core Audio IO thread (AES67IOHandler)
-// should use to access shared audio data. It holds exclusively lock-free,
-// wait-free data structures:
+// should use to access shared audio data. It holds exclusively lock-free
+// data structures:
 //
-//   - Pointers to per-channel SPSC ring buffers (lock-free by design)
+//   - The receive routing table and media clock (input is read by timestamp)
+//   - Per-channel SPSC ring buffers for output (lock-free by design)
 //   - Atomic counters for underrun/overrun statistics
 //   - Atomic status flags
 //
@@ -21,16 +22,17 @@
 //   3. No method may allocate, lock, or perform blocking syscalls.
 //   4. AES67IOHandler must access audio data ONLY through this interface.
 //
-// StreamManager, RTPReceiver, and RTPTransmitter access the same underlying
-// ring buffers through their own (non-RT) paths. The buffers themselves are
-// SPSC lock-free and safe for concurrent access from one producer and one
-// consumer thread.
+// RTPReceivers write timestamped buffers published through RxRouting;
+// RTPTransmitters read the output ring buffers. Both are lock-free for the IO
+// thread.
 //
 // ============================================================================
 
 #pragma once
 
 #include "../Shared/RingBuffer.hpp"
+#include "Clock/MediaClock.h"
+#include "RTP/RxRouting.h"
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -61,13 +63,17 @@ struct RTSafeStreamInterface {
     // All parameters are non-owning references -- caller must ensure they
     // outlive this interface.
     RTSafeStreamInterface(
-        DeviceChannelBuffers& inputBuffers,
+        const RxRouting& rxRouting,
+        const MediaClock& mediaClock,
+        const std::atomic<int64_t>& linkOffsetFrames,
         DeviceChannelBuffers& outputBuffers,
         std::atomic<uint64_t>& inputUnderruns,
         std::atomic<uint64_t>& outputUnderruns,
         std::atomic<bool>& ioRunning
     ) noexcept
-        : inputBuffers_(inputBuffers)
+        : rxRouting_(rxRouting)
+        , mediaClock_(mediaClock)
+        , linkOffsetFrames_(linkOffsetFrames)
         , outputBuffers_(outputBuffers)
         , inputUnderruns_(inputUnderruns)
         , outputUnderruns_(outputUnderruns)
@@ -84,9 +90,11 @@ struct RTSafeStreamInterface {
     // Ring Buffer Access (RT-SAFE)
     // -----------------------------------------------------------------------
 
-    // Input buffers: Network writes, Core Audio reads.
-    // Each element is one channel's SPSC ring buffer.
-    DeviceChannelBuffers& inputBuffers() noexcept { return inputBuffers_; }
+    // Input: receive buffers by media position, the clock that maps device
+    // time to media position, and how far behind now playout reads.
+    const RxRouting& rxRouting() const noexcept { return rxRouting_; }
+    const MediaClock& mediaClock() const noexcept { return mediaClock_; }
+    int64_t linkOffsetFrames() const noexcept { return linkOffsetFrames_.load(std::memory_order_relaxed); }
 
     // Output buffers: Core Audio writes, Network reads.
     DeviceChannelBuffers& outputBuffers() noexcept { return outputBuffers_; }
@@ -128,7 +136,9 @@ struct RTSafeStreamInterface {
 private:
     // Non-owning references to device-owned data.
     // All are lock-free / wait-free and safe for RT access.
-    DeviceChannelBuffers& inputBuffers_;
+    const RxRouting& rxRouting_;
+    const MediaClock& mediaClock_;
+    const std::atomic<int64_t>& linkOffsetFrames_;
     DeviceChannelBuffers& outputBuffers_;
     std::atomic<uint64_t>& inputUnderruns_;
     std::atomic<uint64_t>& outputUnderruns_;

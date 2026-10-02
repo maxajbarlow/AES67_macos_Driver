@@ -9,6 +9,7 @@
 #include "StreamChannelMapper.h"
 #include "StreamConfig.h"
 #include "RTP/RTPReceiver.h"
+#include "RTP/RxContext.h"
 #include "RTP/RTPTransmitter.h"
 #include "PTP/PTPClock.h"
 #include <map>
@@ -30,7 +31,9 @@ public:
 
     /// @param inputChannels  Ring buffers written by RTP receivers (RX path).
     /// @param outputChannels Ring buffers read by RTP transmitters (TX path).
-    StreamManager(DeviceChannelBuffers& inputChannels, DeviceChannelBuffers& outputChannels);
+    /// @param rxContext Device state receivers place audio against (clock, routing, link offset).
+    /// @param outputChannels Ring buffers transmitters read (Core Audio → Network).
+    StreamManager(RxContext rxContext, DeviceChannelBuffers& outputChannels);
     ~StreamManager();
 
     // Prevent copy/move
@@ -207,7 +210,7 @@ private:
     bool saveAllStreamsInternal();  // Internal version without locking
 
     // Data members
-    DeviceChannelBuffers& inputChannels_;   // RTP receivers write here (Network → Core Audio)
+    RxContext rxContext_;                   // RTP receivers place audio here (Network → Core Audio)
     DeviceChannelBuffers& outputChannels_;  // RTP transmitters read here (Core Audio → Network)
     StreamChannelMapper mapper_;
     std::map<StreamID, ManagedStream> streams_;

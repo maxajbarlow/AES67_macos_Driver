@@ -198,11 +198,29 @@ Each phase is a separate PR, test-first, and leaves the driver working.
   - **Real HAL:** with the installed driver, the client (`AES67ClockProbeClient --uid com.aes67.driver.device --constant 0 --no-ramp --expect-level 0.25`) measured the rate at +0.0 ppm (HAL actual rate 48000.000 Hz), with 0 timeline jumps and 0 overloads in 2345 callbacks.
   - **Receive audio:** host-only test packets through a receive-only config arrived unbroken: 100.0% of 1,200,640 input samples were at the expected level.
 
-### Phase 2: RX by timestamp
+### Phase 2: RX by timestamp (implemented; final HAL confirmation pending)
 
 - Receive thread decodes into PlayoutBuffers; IO handler reads by sample time with link offset; consume thread and jitter buffer deleted; link offset reported as latency.
 - Add a tone-continuity analyser tool (extend `QuickCapture`) for long hardware captures.
 - Exit: simulated two-stream alignment exact; loss, restart, outage and second-sender tests pass against the new design; two-client reads identical.
+- Implementation:
+  - `RtpPlacement` maps RTP timestamps (minus the SDP mediaclk offset) to media positions through one device-wide `NetworkTimeMapping`, so streams on the same network timeline stay sample-aligned.
+  - `RxRouting` gives the IO thread a lock-free table of receive buffers, with reclamation so a buffer is never freed during a read.
+  - Arrival times are kernel timestamps (`SO_TIMESTAMP_MONOTONIC`).
+  - The consume thread, `LockFreeCircularJitterBuffer` family, `RateController` and `NetworkEngine/Resampling` were deleted.
+  - Driver logging moved to the unified log (`com.aes67driver`), because the sandbox blocks the old `/tmp` file log.
+  - The tone-continuity check became `AES67ClockProbeClient --sawtooth`.
+- Burst finding:
+  - **What the real HAL showed:** a sender stall followed by a catch-up burst re-anchored the timeline twice: late, then early.
+  - **Fix:** a re-anchor now needs a run of at least half a link offset whose margins agree to within a quarter of a link offset. A burst's margins grow by a packet each, so it fails that test. Transient stalls drop their late packets but no longer move the timeline.
+- Real HAL so far (installed driver, two host-only streams, two client processes):
+  - input latency reported as 384 frames (8 ms)
+  - +0.0 ppm, 0 timeline jumps, 0 overloads
+  - **identical input for two simultaneous clients in all 1876 shared IO cycles**
+  - streams sample-aligned except around the burst events above
+- Pending:
+  - **Final HAL rerun after the burst fix.** It was blocked when the development Mac became overloaded (load average 60-150, with coreaudiod spinning even without this driver installed).
+  - **Interface re-resolution.** The receive interface address is resolved once, so a DHCP renewal or Wi-Fi roam breaks receivers until coreaudiod restarts.
 
 ### Phase 3: Stream-recovered clock
 

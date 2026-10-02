@@ -58,7 +58,7 @@ public:
     //
 
     // Called when Core Audio needs input data from device
-    // Reads from inputBuffers_ and provides raw bytes to Core Audio
+    // Reads the routed receive buffers by timestamp and provides raw bytes to Core Audio
     void OnReadClientInput(
         const std::shared_ptr<aspl::Client>& client,
         const std::shared_ptr<aspl::Stream>& stream,
@@ -81,9 +81,9 @@ public:
 
 private:
     // Process input stream (Network → Core Audio)
-    // RT-SAFE: Reads from ring buffers, fills silence on underrun
-    // Uses batch processing for optimal performance
-    void processInput(float* outputData, UInt32 frameCount, UInt32 channelCount) noexcept;
+    // RT-SAFE: Reads every routed receive buffer at the media position for
+    // device time `sampleTime` minus the link offset; silence where none exists
+    void processInput(float* outputData, UInt32 frameCount, UInt32 channelCount, Float64 sampleTime) noexcept;
 
     // Process output stream (Core Audio → Network)
     // RT-SAFE: Writes to ring buffers, discards on overrun
@@ -104,7 +104,7 @@ private:
     // Constants
     static constexpr size_t kNumChannels = 128;
 
-    // Largest block processInput/processOutput handle at once (stack scratch size)
+    // Largest block processOutput handles at once (stack scratch size)
     static constexpr UInt32 kMaxFramesPerChunk = 4096;
 
     // Allow benchmark direct access to processInput/processOutput

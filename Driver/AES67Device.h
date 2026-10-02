@@ -12,6 +12,8 @@
 #include "../NetworkEngine/StreamManager.h"
 #include "../NetworkEngine/RTSafeStreamInterface.h"
 #include "../NetworkEngine/Clock/MediaClock.h"
+#include "../NetworkEngine/RTP/RtpPlacement.h"
+#include "../NetworkEngine/RTP/RxRouting.h"
 #include <aspl/Device.hpp>
 #include <aspl/Stream.hpp>
 #include <aspl/Context.hpp>
@@ -40,6 +42,11 @@ public:
 
     // Frames between zero timestamps (HAL minimum 10923). See Docs/Spikes/S2-HAL-Clock.md.
     static constexpr UInt32 kZeroTimeStampPeriod = 16384;
+
+    // Receive latency: playout reads this far behind now. 8 x the AES67 default
+    // 1 ms packet time, matching the target network's receive buffer
+    // (Docs/Step2-Clocking-Plan.md, decision 1).
+    static constexpr double kLinkOffsetSeconds = 0.008;
 
     // Supported sample rates
     static constexpr std::array<Float64, 8> kSupportedSampleRates = {
@@ -104,7 +111,6 @@ public:
 
     using DeviceChannelBuffers = std::array<SPSCRingBuffer<float>, kNumChannels>;
 
-    DeviceChannelBuffers& GetInputBuffers() { return inputBuffers_; }
     DeviceChannelBuffers& GetOutputBuffers() { return outputBuffers_; }
 
     //
@@ -180,10 +186,7 @@ private:
     // Result is rounded up to power of 2 for efficient modulo operations
     static size_t CalculateRingBufferSize(Float64 sampleRate, double latencyMs = 3.0);
 
-    // Ring buffers for audio data
-    // Network threads write to input buffers, read from output buffers
-    // Core Audio thread reads from input buffers, writes to output buffers
-    DeviceChannelBuffers inputBuffers_;   // Network → CoreAudio
+    // Output ring buffers: Core Audio writes, RTP transmitters read
     DeviceChannelBuffers outputBuffers_;  // CoreAudio → Network
 
     // Streams
@@ -197,7 +200,8 @@ private:
     std::unique_ptr<StreamManager> streamManager_;
 
     // RT-safe interface (compile-time boundary for IO handler)
-    // Created during Initialize(), references inputBuffers_/outputBuffers_/atomics
+    // Created during Initialize(), references the receive routing, media clock,
+    // link offset, outputBuffers_ and atomics
     std::unique_ptr<RTSafeStreamInterface> rtInterface_;
 
     // Current configuration
@@ -211,6 +215,14 @@ private:
     // readers, including GetZeroTimeStampImpl on the IO thread, never lock.
     MediaClock mediaClock_;
     std::mutex clockWriteMutex_;
+
+    // Receive path (step 2 phase 2): network time -> media position, where the
+    // IO thread finds each stream's buffer, and the playout delay in frames
+    NetworkTimeMapping networkTime_;
+    RxRouting rxRouting_;
+    std::atomic<int64_t> linkOffsetFrames_{0};
+
+    static int64_t LinkOffsetFramesFor(Float64 sampleRate);
 
     // Statistics
     std::atomic<uint64_t> inputUnderruns_{0};

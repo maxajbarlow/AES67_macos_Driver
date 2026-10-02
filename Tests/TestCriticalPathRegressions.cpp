@@ -1,28 +1,30 @@
 //
 // TestCriticalPathRegressions.cpp
 // AES67 macOS Driver
-// Regression tests for the critical-path defects found in review:
+// Regression tests for the critical-path defects found in review, kept
+// current with the step 2 receive path (placement by RTP timestamp):
 //   - Core Audio output never reaching the TX ring buffers (mixing mode)
 //   - Device nominal sample rate defaulting to 44.1 kHz / rate changes ignored
-//   - Receive rate controller regulating the wrong buffer and running to its clamp
 //   - TX streams reloading as RX streams
-//   - Stale jitter buffer slots blocking newer packets
-//   - Receiver not resyncing after a sender restart
-//   - Lost packets shifting the timeline instead of being replaced by silence
-//   - Late packets or a second sender on the group triggering spurious resyncs
-//   - A restart landing behind the playout point leaving the stream silent
-//   - Outages being replayed as silence on top of the underrun, adding latency
+//   - The device clock coming from the device's own MediaClock
+//   - Input read by device time minus the link offset, for any buffer size,
+//     identically for every client
+//   - Receiver following a sender restart (ahead of or behind playout)
+//   - Lost packets and outages keeping the stream's place on the timeline
+//   - Late packets or a second sender on the group being ignored
 //
 // Uses a non-aborting CHECK so every failure is reported, and works under NDEBUG.
 //
 
+#include "RxTestSupport.h"
 #include "../Driver/AES67Device.h"
 #include "../Driver/AES67IOHandler.h"
 #include "../NetworkEngine/StreamManager.h"
 #include "../NetworkEngine/RTP/RTPReceiver.h"
-#include "../NetworkEngine/RTP/RateController.h"
+#include "../Driver/AudioThreadPriority.h"
 #include "../NetworkEngine/RTSafeStreamInterface.h"
 #include "../NetworkEngine/Clock/HostTime.h"
+#include "../NetworkEngine/Clock/TimestampedAudioBuffer.h"
 #include "../Shared/RingBuffer.hpp"
 #include <aspl/Context.hpp>
 #include <arpa/inet.h>
@@ -41,6 +43,7 @@
 #include <vector>
 
 using namespace AES67;
+using namespace AES67::TestSupport;
 
 namespace {
 
@@ -60,8 +63,6 @@ int checksFailed = 0;
 
 constexpr size_t kNumChannels = 128;
 constexpr size_t kTestRingSize = 4096;
-constexpr uint8_t kPayloadTypeL24 = 97;
-constexpr uint32_t kFramesPerPacket = 48;
 
 template<size_t... Is>
 std::array<SPSCRingBuffer<float>, sizeof...(Is)> makeRingBuffers(size_t size, std::index_sequence<Is...>) {
@@ -80,45 +81,6 @@ std::string useEmptyConfig(const std::string& name) {
     setenv("AES67_CONFIG_PATH", path.c_str(), 1);
     return path;
 }
-
-// Multicast UDP socket that only delivers to this host (TTL 0).
-class LoopbackSender {
-public:
-    LoopbackSender(const char* group, uint16_t port) {
-        fd_ = socket(AF_INET, SOCK_DGRAM, 0);
-        unsigned char ttl = 0;
-        unsigned char loop = 1;
-        setsockopt(fd_, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
-        setsockopt(fd_, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop));
-        dest_.sin_family = AF_INET;
-        dest_.sin_port = htons(port);
-        dest_.sin_addr.s_addr = inet_addr(group);
-    }
-    ~LoopbackSender() { if (fd_ >= 0) close(fd_); }
-
-    // Send one L24 packet where every sample of every channel equals `value`.
-    void sendL24(uint16_t seq, uint32_t timestamp, uint16_t channels, float value,
-                 uint32_t ssrc = 0x12345678) {
-        std::vector<uint8_t> pkt(12 + kFramesPerPacket * channels * 3);
-        pkt[0] = 0x80;
-        pkt[1] = kPayloadTypeL24;
-        pkt[2] = seq >> 8;
-        pkt[3] = seq & 0xFF;
-        for (int i = 0; i < 4; ++i) pkt[4 + i] = (timestamp >> (24 - 8 * i)) & 0xFF;
-        for (int i = 0; i < 4; ++i) pkt[8 + i] = (ssrc >> (24 - 8 * i)) & 0xFF;
-        const int32_t pcm = static_cast<int32_t>(value * 8388607.0f);
-        for (size_t s = 0; s < kFramesPerPacket * channels; ++s) {
-            pkt[12 + s * 3 + 0] = (pcm >> 16) & 0xFF;
-            pkt[12 + s * 3 + 1] = (pcm >> 8) & 0xFF;
-            pkt[12 + s * 3 + 2] = pcm & 0xFF;
-        }
-        sendto(fd_, pkt.data(), pkt.size(), 0, reinterpret_cast<sockaddr*>(&dest_), sizeof(dest_));
-    }
-
-private:
-    int fd_{-1};
-    sockaddr_in dest_{};
-};
 
 // Multicast listener used to observe what a transmitter actually sends.
 class MulticastListener {
@@ -180,39 +142,54 @@ ChannelMapping makeMapping(uint16_t channels, uint16_t deviceStart) {
     return mapping;
 }
 
-// Drains one device channel on a background thread, like Core Audio would.
-class ChannelDrainer {
-public:
-    explicit ChannelDrainer(SPSCRingBuffer<float>& ring) : ring_(ring) {
-        thread_ = std::thread([this] {
-            float chunk[512];
-            while (running_) {
-                const size_t n = ring_.read(chunk, 512);
-                samples_.insert(samples_.end(), chunk, chunk + n);
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            }
-        });
-    }
-    std::vector<float> stop() {
-        running_ = false;
-        thread_.join();
-        float chunk[512];
-        size_t n;
-        while ((n = ring_.read(chunk, 512)) > 0) samples_.insert(samples_.end(), chunk, chunk + n);
-        return samples_;
-    }
+// Runs a receiver against a fresh device context, sends with `send`, and
+// returns what the IO thread would have heard on device channel 0.
+template<typename SendFn>
+std::vector<float> receiveAndListen(const char* group, uint16_t port, SendFn send, RTPReceiver::PlacementStatistics* stats = nullptr) {
+    RxHarness harness;
+    RTPReceiver receiver(makeRxSDP(group, port, 2), makeMapping(2, 0), harness.context());
+    CHECK(receiver.start(), "receiver should start");
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-private:
-    SPSCRingBuffer<float>& ring_;
-    std::atomic<bool> running_{true};
-    std::vector<float> samples_;
-    std::thread thread_;
-};
-
-size_t countNear(const std::vector<float>& samples, float value) {
-    return std::count_if(samples.begin(), samples.end(),
-                         [value](float s) { return std::fabs(s - value) < 1e-3f; });
+    PlayoutReader reader(harness, 0);
+    LoopbackSender sender(group, port);
+    // Pace like a hardware sender: a starved test thread would send packets
+    // after their timestamps, which the receiver rightly drops as late
+    AudioThreadPriority::configureForRealTime();
+    send(sender);
+    AudioThreadPriority::restoreNormalPriority();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));  // let playout pass the last packet
+    auto samples = reader.stop();
+    if (stats) *stats = receiver.getPlacementStatistics();
+    receiver.stop();
+    return samples;
 }
+
+// Sends `count` packets of `value` at 1 ms pacing, skipping indices for which skip(i) is true.
+template<typename SkipFn>
+void sendRun(LoopbackSender& sender, std::chrono::steady_clock::time_point& next, uint16_t firstSeq,
+             uint32_t firstTimestamp, uint16_t count, float value, uint32_t ssrc, SkipFn skip) {
+    for (uint16_t i = 0; i < count; ++i) {
+        if (!skip(i)) {
+            sender.sendL24(static_cast<uint16_t>(firstSeq + i), firstTimestamp + i * kFramesPerPacket, 2, value, ssrc);
+        }
+        std::this_thread::sleep_until(next += std::chrono::milliseconds(1));
+    }
+}
+
+const auto kNoSkip = [](uint16_t) { return false; };
+
+// RT-safe interface over a harness's receive context plus TX ring buffers
+struct IOFixture {
+    RxHarness harness;
+    std::array<SPSCRingBuffer<float>, kNumChannels> outputBuffers = makeRingBuffers(8192);
+    std::atomic<uint64_t> inputUnderruns{0};
+    std::atomic<uint64_t> outputOverruns{0};
+    std::atomic<bool> ioRunning{true};
+    RTSafeStreamInterface rt{harness.routing, harness.clock, harness.linkOffsetFrames, outputBuffers,
+                             inputUnderruns, outputOverruns, ioRunning};
+    AES67IOHandler handler{rt, kNumChannels, sizeof(float)};
+};
 
 // ---------------------------------------------------------------------------
 // C1: Core Audio output must reach the TX ring buffers.
@@ -222,14 +199,7 @@ size_t countNear(const std::vector<float>& samples, float value) {
 void testMixedOutputReachesOutputBuffers() {
     std::cout << "C1: mixed output reaches TX ring buffers" << std::endl;
 
-    auto inputBuffers = makeRingBuffers(kTestRingSize);
-    auto outputBuffers = makeRingBuffers(kTestRingSize);
-    std::atomic<uint64_t> inputUnderruns{0};
-    std::atomic<uint64_t> outputOverruns{0};
-    std::atomic<bool> ioRunning{true};
-    RTSafeStreamInterface rt(inputBuffers, outputBuffers, inputUnderruns, outputOverruns, ioRunning);
-    AES67IOHandler handler(rt, kNumChannels, sizeof(float));
-
+    IOFixture io;
     constexpr UInt32 kFrames = 64;
     std::vector<float> interleaved(kFrames * kNumChannels);
     for (UInt32 f = 0; f < kFrames; ++f) {
@@ -238,48 +208,78 @@ void testMixedOutputReachesOutputBuffers() {
         }
     }
 
-    aspl::IORequestHandler& base = handler;
+    aspl::IORequestHandler& base = io.handler;
     base.OnWriteMixedOutput(std::shared_ptr<aspl::Stream>(), 0.0, 0.0, interleaved.data(),
                             static_cast<UInt32>(interleaved.size() * sizeof(float)));
 
-    CHECK(outputBuffers[8].available() == kFrames, "channel 8 should receive every mixed frame");
+    CHECK(io.outputBuffers[8].available() == kFrames, "channel 8 should receive every mixed frame");
     float channel8[kFrames] = {};
-    outputBuffers[8].read(channel8, kFrames);
+    io.outputBuffers[8].read(channel8, kFrames);
     bool matches = true;
     for (UInt32 f = 0; f < kFrames; ++f) {
         matches = matches && std::fabs(channel8[f] - (8 * 0.001f + f * 1e-5f)) < 1e-7f;
     }
     CHECK(matches, "channel 8 samples should be de-interleaved from the mixed buffer");
+
+    // Output buffers larger than the handler's scratch buffer are processed in chunks
+    constexpr UInt32 kLarge = 5000;
+    io.outputBuffers[0].reset();
+    std::vector<float> large(kLarge * kNumChannels, 0.5f);
+    base.OnWriteMixedOutput(std::shared_ptr<aspl::Stream>(), 0.0, 0.0, large.data(),
+                            static_cast<UInt32>(large.size() * sizeof(float)));
+    CHECK(io.outputBuffers[0].available() == kLarge, "all 5000 output frames should reach the TX ring");
 }
 
-// IO buffers larger than the handler's 4096-frame scratch buffer must be
-// processed in chunks, not silently dropped (output) or zeroed (input).
-void testLargeIOBuffersAreChunked() {
-    std::cout << "IO handler chunks buffers over 4096 frames" << std::endl;
+// ---------------------------------------------------------------------------
+// Input is read by device time: Core Audio's sample time T maps to media
+// position origin + T, and the IO thread plays what was received for
+// (origin + T - link offset). Reads are non-destructive, so every client
+// hears the same audio.
+// ---------------------------------------------------------------------------
+void testInputReadsByDeviceTime() {
+    std::cout << "IO handler reads input by device time minus link offset" << std::endl;
 
-    constexpr UInt32 kFrames = 5000;
-    auto inputBuffers = makeRingBuffers(8192);
-    auto outputBuffers = makeRingBuffers(8192);
-    std::atomic<uint64_t> inputUnderruns{0};
-    std::atomic<uint64_t> outputOverruns{0};
-    std::atomic<bool> ioRunning{true};
-    RTSafeStreamInterface rt(inputBuffers, outputBuffers, inputUnderruns, outputOverruns, ioRunning);
-    AES67IOHandler handler(rt, kNumChannels, sizeof(float));
-    aspl::IORequestHandler& base = handler;
+    IOFixture io;
+    aspl::IORequestHandler& base = io.handler;
+    constexpr UInt32 kFrames = 5000;  // larger than the old 4096-frame limit
+    constexpr int64_t kDeviceTime = 100000;
+    const int64_t readPosition = io.harness.clock.snapshot().origin + kDeviceTime - kTestLinkOffset;
 
-    std::vector<float> interleaved(kFrames * kNumChannels, 0.5f);
-    base.OnWriteMixedOutput(std::shared_ptr<aspl::Stream>(), 0.0, 0.0, interleaved.data(),
-                            static_cast<UInt32>(interleaved.size() * sizeof(float)));
-    CHECK(outputBuffers[0].available() == kFrames, "all 5000 output frames should reach the TX ring");
+    TimestampedAudioBuffer stream(2, 8192);
+    std::vector<float> ramp(kFrames * 2);
+    for (UInt32 f = 0; f < kFrames; ++f) {
+        ramp[f * 2] = static_cast<float>(f) * 1e-4f;
+        ramp[f * 2 + 1] = -static_cast<float>(f) * 1e-4f;
+    }
+    stream.write(readPosition, kFrames, ramp.data(), 2, 0);
+    CHECK(io.harness.routing.publish(&stream, 6), "route should publish");
 
-    std::vector<float> ramp(kFrames);
-    for (UInt32 f = 0; f < kFrames; ++f) ramp[f] = f * 1e-4f;
-    inputBuffers[3].write(ramp.data(), kFrames);
-    std::vector<float> clientBuffer(kFrames * kNumChannels, -1.0f);
-    base.OnReadClientInput(std::shared_ptr<aspl::Client>(), std::shared_ptr<aspl::Stream>(), 0.0, 0.0,
-                           clientBuffer.data(), static_cast<UInt32>(clientBuffer.size() * sizeof(float)));
-    CHECK(clientBuffer[(kFrames - 1) * kNumChannels + 3] == ramp[kFrames - 1],
-          "the last of 5000 input frames should be delivered, not zeroed");
+    std::vector<float> clientA(kFrames * kNumChannels, -1.0f);
+    std::vector<float> clientB(kFrames * kNumChannels, -2.0f);
+    const auto bytes = static_cast<UInt32>(clientA.size() * sizeof(float));
+    base.OnReadClientInput(std::shared_ptr<aspl::Client>(), std::shared_ptr<aspl::Stream>(), 0.0, kDeviceTime,
+                           clientA.data(), bytes);
+    base.OnReadClientInput(std::shared_ptr<aspl::Client>(), std::shared_ptr<aspl::Stream>(), 0.0, kDeviceTime,
+                           clientB.data(), bytes);
+
+    bool placed = true;
+    bool othersSilent = true;
+    for (UInt32 f = 0; f < kFrames; ++f) {
+        placed = placed && clientA[f * kNumChannels + 6] == ramp[f * 2] && clientA[f * kNumChannels + 7] == ramp[f * 2 + 1];
+        othersSilent = othersSilent && clientA[f * kNumChannels + 5] == 0.0f && clientA[f * kNumChannels + 8] == 0.0f &&
+                       clientA[f * kNumChannels] == 0.0f;
+    }
+    CHECK(placed, "the stream should land on device channels 6-7 at device time minus link offset, all 5000 frames");
+    CHECK(othersSilent, "channels no stream feeds should be silent");
+    CHECK(clientA == clientB, "a second client in the same cycle should read identical input");
+    CHECK(io.inputUnderruns.load() == 0, "fully covered reads should not count as underruns");
+
+    std::vector<float> later(512 * kNumChannels, -1.0f);
+    base.OnReadClientInput(std::shared_ptr<aspl::Client>(), std::shared_ptr<aspl::Stream>(), 0.0, kDeviceTime + 50000,
+                           later.data(), static_cast<UInt32>(later.size() * sizeof(float)));
+    CHECK(std::all_of(later.begin(), later.end(), [](float v) { return v == 0.0f; }), "missing audio should read as silence");
+    CHECK(io.inputUnderruns.load() == 1, "a read the stream does not cover should count one underrun");
+    io.harness.routing.unpublish(&stream);
 }
 
 // ---------------------------------------------------------------------------
@@ -313,342 +313,6 @@ void testDeviceSampleRate() {
     CHECK(device->GetInputStream()->GetPhysicalFormat().mSampleRate == 96000.0, "input physical format should follow");
     CHECK(device->GetOutputStream()->GetPhysicalFormat().mSampleRate == 96000.0, "output physical format should follow");
     CHECK(device->GetOutputStream()->GetVirtualFormat().mSampleRate == 96000.0, "output virtual format should follow");
-}
-
-// ---------------------------------------------------------------------------
-// C3: the consume thread must lock to the sender's packet rate, holding the
-// jitter buffer at its prefill depth whatever the sender's clock offset.
-// (The original loop measured the device ring buffer instead, which the
-// consume thread cannot regulate, and ran itself to the clamp.)
-// Event simulation: packets arrive at 1 kHz * (1 + drift); the consumer ticks
-// at controller-paced intervals taking one packet if one is buffered.
-// ---------------------------------------------------------------------------
-void simulateRateController(double senderDrift) {
-    constexpr double kDuration = 180.0;
-    constexpr double kSettleTime = 120.0;
-    constexpr size_t kTargetDepth = 6;
-    const std::chrono::microseconds kTick(1000);
-
-    RateController controller(kTick, kTargetDepth);
-    double depth = kTargetDepth;  // consumption starts once prefill completes
-    double nextArrival = 0.0;
-    double nextTick = 0.0;
-    const double arrivalPeriod = 0.001 / (1.0 + senderDrift);
-    size_t emptyTicksAfterSettle = 0;
-    double minDepth = 1e9;
-    double maxDepth = 0.0;
-
-    while (std::min(nextArrival, nextTick) < kDuration) {
-        if (nextArrival <= nextTick) {
-            depth += 1.0;
-            nextArrival += arrivalPeriod;
-            continue;
-        }
-        if (depth >= 1.0) {
-            depth -= 1.0;
-        } else if (nextTick > kSettleTime) {
-            ++emptyTicksAfterSettle;
-        }
-        controller.addDepthSample(depth);
-        if (nextTick > kSettleTime) {
-            minDepth = std::min(minDepth, depth);
-            maxDepth = std::max(maxDepth, depth);
-        }
-        nextTick += std::chrono::duration<double>(controller.nextInterval(kTick)).count();
-    }
-
-    std::ostringstream label;
-    label << "sender drift " << senderDrift * 1e6 << " ppm";
-    CHECK(emptyTicksAfterSettle == 0, label.str() << ": consumer should never find the jitter buffer empty once settled (got "
-                                                  << emptyTicksAfterSettle << ")");
-    CHECK(minDepth >= 2.0 && maxDepth <= 12.0,
-          label.str() << ": jitter buffer depth should stay near " << kTargetDepth
-                      << " (range " << minDepth << ".." << maxDepth << ")");
-}
-
-void testRateControllerTracksSender() {
-    std::cout << "C3: rate controller tracks the sender's packet rate" << std::endl;
-    simulateRateController(0.0);
-    simulateRateController(+100e-6);
-    simulateRateController(-100e-6);
-    simulateRateController(+1000e-6);
-}
-
-// ---------------------------------------------------------------------------
-// TX streams must reload as transmitters.
-// ---------------------------------------------------------------------------
-void testTxStreamSurvivesReload() {
-    std::cout << "TX stream survives save/reload" << std::endl;
-    useEmptyConfig("txreload");
-
-    constexpr const char* kGroup = "239.69.99.2";
-    constexpr uint16_t kPort = 55010;
-    auto inputBuffers = makeRingBuffers(kTestRingSize);
-    auto outputBuffers = makeRingBuffers(kTestRingSize);
-
-    StreamID txID;
-    {
-        StreamManager manager(inputBuffers, outputBuffers);
-        txID = manager.createTxStream("Regression TX", kGroup, kPort, 8, makeMapping(8, 8));
-        CHECK(!txID.isNull(), "TX stream should be created");
-    }
-
-    StreamManager reloaded(inputBuffers, outputBuffers);
-    CHECK(reloaded.loadSavedStreams(), "saved TX stream should load");
-
-    MulticastListener listener(kGroup, kPort);
-    reloaded.setIOActive(true);
-    const size_t packets = listener.countPackets(std::chrono::milliseconds(200));
-    reloaded.setIOActive(false);
-    CHECK(packets > 50, "reloaded TX stream should transmit (saw " << packets << " packets in 200 ms)");
-}
-
-// ---------------------------------------------------------------------------
-// A stale packet left in a jitter buffer slot must not block a newer packet
-// that maps to the same slot, but a late packet must not evict a newer one.
-// ---------------------------------------------------------------------------
-void testJitterBufferReplacesStaleSlot() {
-    std::cout << "Jitter buffer replaces stale slots" << std::endl;
-
-    LockFreeCircularJitterBuffer buffer(256);
-    const uint8_t oldPayload[4] = {1, 1, 1, 1};
-    const uint8_t newPayload[4] = {2, 2, 2, 2};
-    uint8_t out[16];
-    size_t outLength = 0;
-    uint64_t presentation = 0;
-
-    CHECK(buffer.addPacket(oldPayload, 4, 10, 0), "first packet should be stored");
-    CHECK(buffer.addPacket(newPayload, 4, 266, 0), "newer packet in the same slot should replace the stale one");
-    CHECK(buffer.getBufferedPacketCount() == 1, "replacement should not change the buffered count");
-    CHECK(buffer.getNextPacket(out, sizeof(out), outLength, presentation, 266) && out[0] == 2,
-          "the newer packet should be readable");
-
-    CHECK(buffer.addPacket(newPayload, 4, 65535, 0), "packet before wraparound should be stored");
-    CHECK(!buffer.addPacket(oldPayload, 4, 65535 - 256, 0), "a late packet must not evict a newer one");
-    CHECK(buffer.addPacket(oldPayload, 4, 255, 0), "packet after 16-bit wraparound counts as newer");
-    CHECK(buffer.getNextPacket(out, sizeof(out), outLength, presentation, 255) && out[0] == 1,
-          "the post-wraparound packet should be readable");
-
-    CHECK(RTP::sequenceDistance(65535, 1) == 2, "distance should be forward across wraparound");
-    CHECK(RTP::sequenceDistance(1, 65535) == -2, "distance should be backward across wraparound");
-}
-
-// ---------------------------------------------------------------------------
-// Receiver must resync when the sender restarts with a new sequence base.
-// ---------------------------------------------------------------------------
-void testReceiverResyncsAfterSenderRestart() {
-    std::cout << "RX resyncs after sender restart" << std::endl;
-
-    constexpr const char* kGroup = "239.69.99.3";
-    constexpr uint16_t kPort = 55012;
-    auto deviceBuffers = makeRingBuffers(kTestRingSize);
-    RTPReceiver receiver(makeRxSDP(kGroup, kPort, 2), makeMapping(2, 0), deviceBuffers);
-    CHECK(receiver.start(), "receiver should start");
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-    ChannelDrainer drainer(deviceBuffers[0]);
-    LoopbackSender sender(kGroup, kPort);
-    auto next = std::chrono::steady_clock::now();
-    for (uint16_t i = 0; i < 40; ++i) {
-        sender.sendL24(static_cast<uint16_t>(1000 + i), i * kFramesPerPacket, 2, 0.25f);
-        std::this_thread::sleep_until(next += std::chrono::milliseconds(1));
-    }
-    // Sender restarts with a new random sequence and timestamp base.
-    for (uint16_t i = 0; i < 200; ++i) {
-        sender.sendL24(static_cast<uint16_t>(40000 + i), 900000 + i * kFramesPerPacket, 2, -0.5f, 0x0BADF00D);
-        std::this_thread::sleep_until(next += std::chrono::milliseconds(1));
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    receiver.stop();
-    const auto samples = drainer.stop();
-
-    const size_t restarted = countNear(samples, -0.5f);
-    CHECK(restarted >= 150 * kFramesPerPacket,
-          "audio from the restarted sender should play promptly (got " << restarted / kFramesPerPacket << " packets)");
-}
-
-// ---------------------------------------------------------------------------
-// A lost packet must be replaced with one packet of silence so the stream
-// keeps its position on the timeline.
-// ---------------------------------------------------------------------------
-void testLostPacketBecomesSilence() {
-    std::cout << "RX lost packet becomes silence" << std::endl;
-
-    constexpr const char* kGroup = "239.69.99.4";
-    constexpr uint16_t kPort = 55014;
-    auto deviceBuffers = makeRingBuffers(kTestRingSize);
-    RTPReceiver receiver(makeRxSDP(kGroup, kPort, 2), makeMapping(2, 0), deviceBuffers);
-    CHECK(receiver.start(), "receiver should start");
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-    ChannelDrainer drainer(deviceBuffers[0]);
-    LoopbackSender sender(kGroup, kPort);
-    constexpr uint16_t kPackets = 30;
-    constexpr uint16_t kDropped = 15;
-    auto next = std::chrono::steady_clock::now();
-    for (uint16_t i = 0; i < kPackets; ++i) {
-        if (i != kDropped) {
-            sender.sendL24(static_cast<uint16_t>(2000 + i), i * kFramesPerPacket, 2, 0.25f);
-        }
-        std::this_thread::sleep_until(next += std::chrono::milliseconds(1));
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    receiver.stop();
-    const auto samples = drainer.stop();
-
-    CHECK(countNear(samples, 0.25f) == (kPackets - 1) * kFramesPerPacket, "every received packet should be played");
-    CHECK(samples.size() == kPackets * kFramesPerPacket,
-          "the lost packet should be filled so the stream keeps its length (got "
-              << samples.size() << " samples, want " << kPackets * kFramesPerPacket << ")");
-    CHECK(countNear(samples, 0.0f) == kFramesPerPacket, "the filler should be exactly one packet of silence");
-}
-
-// ---------------------------------------------------------------------------
-// A single packet far behind the playout point (very late or duplicated) must
-// be ignored, not treated as a sender restart.
-// ---------------------------------------------------------------------------
-void testLatePacketDoesNotResync() {
-    std::cout << "RX ignores a single very late packet" << std::endl;
-
-    constexpr const char* kGroup = "239.69.99.5";
-    constexpr uint16_t kPort = 55016;
-    auto deviceBuffers = makeRingBuffers(kTestRingSize);
-    RTPReceiver receiver(makeRxSDP(kGroup, kPort, 2), makeMapping(2, 0), deviceBuffers);
-    CHECK(receiver.start(), "receiver should start");
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-    ChannelDrainer drainer(deviceBuffers[0]);
-    LoopbackSender sender(kGroup, kPort);
-    constexpr uint16_t kPackets = 60;
-    auto next = std::chrono::steady_clock::now();
-    for (uint16_t i = 0; i < kPackets; ++i) {
-        sender.sendL24(static_cast<uint16_t>(3000 + i), i * kFramesPerPacket, 2, 0.25f);
-        if (i == 30) {
-            sender.sendL24(static_cast<uint16_t>(3000 - 400), 0, 2, 0.9f);  // 400 packets late
-        }
-        std::this_thread::sleep_until(next += std::chrono::milliseconds(1));
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    receiver.stop();
-    const auto samples = drainer.stop();
-
-    CHECK(countNear(samples, 0.9f) == 0, "the late packet should not be played");
-    CHECK(countNear(samples, 0.25f) == kPackets * kFramesPerPacket,
-          "every in-order packet should still be played (got " << countNear(samples, 0.25f) / kFramesPerPacket
-                                                               << " of " << kPackets << ")");
-    CHECK(countNear(samples, 0.0f) == 0, "a late packet should not cause silence");
-}
-
-// ---------------------------------------------------------------------------
-// A second sender on the same group and port (different SSRC and sequence
-// base) must not take over or disrupt the stream being played.
-// ---------------------------------------------------------------------------
-void testInterleavedSecondSourceIsIgnored() {
-    std::cout << "RX ignores an interleaved second source" << std::endl;
-
-    constexpr const char* kGroup = "239.69.99.6";
-    constexpr uint16_t kPort = 55018;
-    auto deviceBuffers = makeRingBuffers(kTestRingSize);
-    RTPReceiver receiver(makeRxSDP(kGroup, kPort, 2), makeMapping(2, 0), deviceBuffers);
-    CHECK(receiver.start(), "receiver should start");
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-    ChannelDrainer drainer(deviceBuffers[0]);
-    LoopbackSender sender(kGroup, kPort);
-    constexpr uint16_t kPackets = 100;
-    auto next = std::chrono::steady_clock::now();
-    for (uint16_t i = 0; i < kPackets; ++i) {
-        sender.sendL24(static_cast<uint16_t>(5000 + i), i * kFramesPerPacket, 2, 0.25f, 0xAAAA0001);
-        sender.sendL24(static_cast<uint16_t>(20000 + i), 777 + i * kFramesPerPacket, 2, 0.9f, 0xBBBB0002);
-        std::this_thread::sleep_until(next += std::chrono::milliseconds(1));
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    receiver.stop();
-    const auto samples = drainer.stop();
-
-    CHECK(countNear(samples, 0.9f) == 0, "the second source should never be played");
-    CHECK(countNear(samples, 0.25f) == kPackets * kFramesPerPacket,
-          "the first source should play uninterrupted (got " << countNear(samples, 0.25f) / kFramesPerPacket
-                                                             << " of " << kPackets << " packets)");
-}
-
-// ---------------------------------------------------------------------------
-// A sender restart whose new sequence base lands just BEHIND the playout point
-// (within the jitter window) must still be followed. Packets behind the
-// consumer can never be played, so without a resync the stream stays silent.
-// ---------------------------------------------------------------------------
-void runRestartBehindPlayout(const char* group, uint16_t port, uint32_t restartSsrc, const char* label) {
-    auto deviceBuffers = makeRingBuffers(kTestRingSize);
-    RTPReceiver receiver(makeRxSDP(group, port, 2), makeMapping(2, 0), deviceBuffers);
-    CHECK(receiver.start(), label << ": receiver should start");
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-    ChannelDrainer drainer(deviceBuffers[0]);
-    LoopbackSender sender(group, port);
-    auto next = std::chrono::steady_clock::now();
-    for (uint16_t i = 0; i < 60; ++i) {
-        sender.sendL24(static_cast<uint16_t>(6000 + i), i * kFramesPerPacket, 2, 0.25f);
-        std::this_thread::sleep_until(next += std::chrono::milliseconds(1));
-    }
-    // Restart about 150 packets behind where playout has reached
-    for (uint16_t i = 0; i < 150; ++i) {
-        sender.sendL24(static_cast<uint16_t>(5900 + i), 500000 + i * kFramesPerPacket, 2, -0.5f, restartSsrc);
-        std::this_thread::sleep_until(next += std::chrono::milliseconds(1));
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    receiver.stop();
-    const auto samples = drainer.stop();
-
-    CHECK(countNear(samples, -0.5f) >= 100 * kFramesPerPacket,
-          label << ": the restarted stream should play (got " << countNear(samples, -0.5f) / kFramesPerPacket
-                << " of 150 packets)");
-}
-
-void testRestartBehindPlayoutIsFollowed() {
-    std::cout << "RX follows a restart that lands behind playout" << std::endl;
-    runRestartBehindPlayout("239.69.99.7", 55020, 0x12345678, "same SSRC");
-    runRestartBehindPlayout("239.69.99.8", 55022, 0x0BADF00D, "new SSRC");
-}
-
-// ---------------------------------------------------------------------------
-// After an outage the consumer has already underrun for most of the gap, and
-// Core Audio has played that time as zeros. The missing packets must not then
-// be played as silence again, or every outage adds its length to the latency.
-// ---------------------------------------------------------------------------
-void testOutageDoesNotAddLatency() {
-    std::cout << "RX outage does not add latency" << std::endl;
-
-    constexpr const char* kGroup = "239.69.99.9";
-    constexpr uint16_t kPort = 55024;
-    auto deviceBuffers = makeRingBuffers(kTestRingSize);
-    RTPReceiver receiver(makeRxSDP(kGroup, kPort, 2), makeMapping(2, 0), deviceBuffers);
-    CHECK(receiver.start(), "receiver should start");
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-    ChannelDrainer drainer(deviceBuffers[0]);
-    LoopbackSender sender(kGroup, kPort);
-    constexpr uint16_t kOutagePackets = 40;
-    auto next = std::chrono::steady_clock::now();
-    for (uint16_t i = 0; i < 100; ++i) {
-        // Packets 30..69 are lost in a 40 ms outage
-        if (i < 30 || i >= 30 + kOutagePackets) {
-            sender.sendL24(static_cast<uint16_t>(7000 + i), i * kFramesPerPacket, 2, 0.25f);
-        }
-        std::this_thread::sleep_until(next += std::chrono::milliseconds(1));
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    receiver.stop();
-    const auto samples = drainer.stop();
-
-    const size_t silencePackets = countNear(samples, 0.0f) / kFramesPerPacket;
-    CHECK(countNear(samples, 0.25f) == (100 - kOutagePackets) * kFramesPerPacket, "every received packet should play");
-    // Idle runs give ~5 (the prefill cushion being rebuilt). Under heavy CPU
-    // load the sender thread itself stalls and bursts, shortening the outage in
-    // wall time, so fewer losses are covered by underruns; the regression this
-    // guards against silences every lost packet (exactly kOutagePackets).
-    CHECK(silencePackets < kOutagePackets / 2,
-          "only the cushion should be re-filled with silence, not the whole outage (got "
-              << silencePackets << " packets of silence for a " << kOutagePackets << "-packet outage)");
 }
 
 // ---------------------------------------------------------------------------
@@ -705,22 +369,164 @@ void testDeviceClockFromMediaClock() {
     device->StopIO(device->GetID(), 0);
 }
 
+// ---------------------------------------------------------------------------
+// TX streams must reload as transmitters.
+// ---------------------------------------------------------------------------
+void testTxStreamSurvivesReload() {
+    std::cout << "TX stream survives save/reload" << std::endl;
+    useEmptyConfig("txreload");
+
+    constexpr const char* kGroup = "239.69.99.2";
+    constexpr uint16_t kPort = 55010;
+    RxHarness harness;
+    auto outputBuffers = makeRingBuffers(kTestRingSize);
+
+    StreamID txID;
+    {
+        StreamManager manager(harness.context(), outputBuffers);
+        txID = manager.createTxStream("Regression TX", kGroup, kPort, 8, makeMapping(8, 8));
+        CHECK(!txID.isNull(), "TX stream should be created");
+    }
+
+    StreamManager reloaded(harness.context(), outputBuffers);
+    CHECK(reloaded.loadSavedStreams(), "saved TX stream should load");
+
+    MulticastListener listener(kGroup, kPort);
+    reloaded.setIOActive(true);
+    const size_t packets = listener.countPackets(std::chrono::milliseconds(200));
+    reloaded.setIOActive(false);
+    CHECK(packets > 50, "reloaded TX stream should transmit (saw " << packets << " packets in 200 ms)");
+}
+
+// ---------------------------------------------------------------------------
+// Receive path (step 2 phase 2): audio is placed by RTP timestamp. Tests
+// judge the stream as heard, from its first to its last non-silent sample.
+// ---------------------------------------------------------------------------
+void testReceiverFollowsSenderRestart() {
+    std::cout << "RX follows a sender restart" << std::endl;
+
+    RTPReceiver::PlacementStatistics stats{};
+    const auto samples = receiveAndListen("239.69.99.3", 55012, [](LoopbackSender& sender) {
+        auto next = std::chrono::steady_clock::now();
+        sendRun(sender, next, 1000, 0, 40, 0.25f, 0x12345678, kNoSkip);
+        // Sender restarts with a new SSRC and unrelated sequence and timestamp bases
+        sendRun(sender, next, 40000, 900000, 200, -0.5f, 0x0BADF00D, kNoSkip);
+    }, &stats);
+
+    const size_t restarted = countNear(samples, -0.5f);
+    CHECK(restarted >= 150 * kFramesPerPacket,
+          "audio from the restarted sender should play promptly (got " << restarted / kFramesPerPacket << " packets)");
+    CHECK(stats.reanchors >= 1, "the restart should re-anchor");
+}
+
+void testLostPacketKeepsTimeline() {
+    std::cout << "RX lost packet leaves exactly its own gap" << std::endl;
+
+    constexpr uint16_t kPackets = 30;
+    RTPReceiver::PlacementStatistics stats{};
+    const auto region = heardRegion(receiveAndListen("239.69.99.4", 55014, [](LoopbackSender& sender) {
+        auto next = std::chrono::steady_clock::now();
+        sendRun(sender, next, 2000, 0, kPackets, 0.25f, 0x12345678, [](uint16_t i) { return i == 15; });
+    }, &stats));
+
+    CHECK(countNear(region, 0.25f) == (kPackets - 1) * kFramesPerPacket,
+          "every received packet should be played (late drops: " << stats.lateDrops << ")");
+    CHECK(region.size() == kPackets * kFramesPerPacket,
+          "the stream should keep its length (got " << region.size() << " samples, want " << kPackets * kFramesPerPacket << ")");
+    CHECK(countNear(region, 0.0f) == kFramesPerPacket, "the lost packet should leave exactly one packet of silence");
+}
+
+void testLatePacketIsIgnored() {
+    std::cout << "RX ignores a single very late packet" << std::endl;
+
+    constexpr uint16_t kPackets = 60;
+    const auto region = heardRegion(receiveAndListen("239.69.99.5", 55016, [](LoopbackSender& sender) {
+        auto next = std::chrono::steady_clock::now();
+        for (uint16_t i = 0; i < kPackets; ++i) {
+            sender.sendL24(static_cast<uint16_t>(3000 + i), 400 * kFramesPerPacket + i * kFramesPerPacket, 2, 0.25f);
+            if (i == 30) {
+                sender.sendL24(static_cast<uint16_t>(3000 - 400), 0, 2, 0.9f);  // 400 packets late
+            }
+            std::this_thread::sleep_until(next += std::chrono::milliseconds(1));
+        }
+    }));
+
+    CHECK(countNear(region, 0.9f) == 0, "the late packet should not be played");
+    CHECK(countNear(region, 0.25f) == kPackets * kFramesPerPacket, "every in-order packet should still be played");
+    CHECK(countNear(region, 0.0f) == 0, "a late packet should not cause silence");
+}
+
+void testInterleavedSecondSourceIsIgnored() {
+    std::cout << "RX ignores an interleaved second source" << std::endl;
+
+    constexpr uint16_t kPackets = 100;
+    const auto region = heardRegion(receiveAndListen("239.69.99.6", 55018, [](LoopbackSender& sender) {
+        auto next = std::chrono::steady_clock::now();
+        for (uint16_t i = 0; i < kPackets; ++i) {
+            sender.sendL24(static_cast<uint16_t>(5000 + i), i * kFramesPerPacket, 2, 0.25f, 0xAAAA0001);
+            sender.sendL24(static_cast<uint16_t>(20000 + i), 777 + i * kFramesPerPacket, 2, 0.9f, 0xBBBB0002);
+            std::this_thread::sleep_until(next += std::chrono::milliseconds(1));
+        }
+    }));
+
+    CHECK(countNear(region, 0.9f) == 0, "the second source should never be played");
+    CHECK(countNear(region, 0.25f) == kPackets * kFramesPerPacket,
+          "the first source should play uninterrupted (got " << countNear(region, 0.25f) / kFramesPerPacket << " packets)");
+}
+
+void runRestartBehindPlayout(const char* group, uint16_t port, uint32_t restartSsrc, const char* label) {
+    const auto samples = receiveAndListen(group, port, [restartSsrc](LoopbackSender& sender) {
+        auto next = std::chrono::steady_clock::now();
+        sendRun(sender, next, 6000, 200 * kFramesPerPacket, 60, 0.25f, 0x12345678, kNoSkip);
+        // Restart with timestamps ~150 packets behind where playout has reached
+        sendRun(sender, next, 5900, 110 * kFramesPerPacket, 150, -0.5f, restartSsrc, kNoSkip);
+    });
+
+    CHECK(countNear(samples, -0.5f) >= 100 * kFramesPerPacket,
+          label << ": the restarted stream should play (got " << countNear(samples, -0.5f) / kFramesPerPacket
+                << " of 150 packets)");
+}
+
+void testRestartBehindPlayoutIsFollowed() {
+    std::cout << "RX follows a restart that lands behind playout" << std::endl;
+    runRestartBehindPlayout("239.69.99.7", 55020, 0x12345678, "same SSRC");
+    runRestartBehindPlayout("239.69.99.8", 55022, 0x0BADF00D, "new SSRC");
+}
+
+void testOutageKeepsTimeline() {
+    std::cout << "RX outage plays as its own length of silence" << std::endl;
+
+    constexpr uint16_t kOutagePackets = 40;
+    RTPReceiver::PlacementStatistics stats{};
+    const auto region = heardRegion(receiveAndListen("239.69.99.9", 55024, [](LoopbackSender& sender) {
+        auto next = std::chrono::steady_clock::now();
+        // Packets 30..69 are lost in a 40 ms outage
+        sendRun(sender, next, 7000, 0, 100, 0.25f, 0x12345678,
+                [](uint16_t i) { return i >= 30 && i < 30 + kOutagePackets; });
+    }, &stats));
+
+    CHECK(countNear(region, 0.25f) == (100 - kOutagePackets) * kFramesPerPacket,
+          "every received packet should play (late drops: " << stats.lateDrops << ")");
+    CHECK(region.size() == 100 * kFramesPerPacket,
+          "the outage must not add latency: the stream should keep its length (got " << region.size() << " samples)");
+    CHECK(countNear(region, 0.0f) == kOutagePackets * kFramesPerPacket, "the outage should be exactly its own length of silence");
+}
+
+
 } // namespace
 
 int main() {
     testMixedOutputReachesOutputBuffers();
-    testLargeIOBuffersAreChunked();
+    testInputReadsByDeviceTime();
     testDeviceSampleRate();
     testDeviceClockFromMediaClock();
-    testRateControllerTracksSender();
     testTxStreamSurvivesReload();
-    testJitterBufferReplacesStaleSlot();
-    testReceiverResyncsAfterSenderRestart();
-    testLostPacketBecomesSilence();
-    testLatePacketDoesNotResync();
+    testReceiverFollowsSenderRestart();
+    testLostPacketKeepsTimeline();
+    testLatePacketIsIgnored();
     testInterleavedSecondSourceIsIgnored();
     testRestartBehindPlayoutIsFollowed();
-    testOutageDoesNotAddLatency();
+    testOutageKeepsTimeline();
 
     std::cout << "\nCritical path regressions: " << checksPassed << " passed, "
               << checksFailed << " failed" << std::endl;

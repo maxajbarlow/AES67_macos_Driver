@@ -6,6 +6,9 @@
 
 #include "../Driver/AES67IOHandler.h"
 #include "../NetworkEngine/RTSafeStreamInterface.h"
+#include "../NetworkEngine/Clock/HostTime.h"
+#include "../NetworkEngine/Clock/MediaClock.h"
+#include "../NetworkEngine/Clock/TimestampedAudioBuffer.h"
 #include "../Shared/RingBuffer.hpp"
 #include <iostream>
 #include <iomanip>
@@ -46,15 +49,31 @@ namespace {
 class IOHandlerBenchmark {
 public:
     IOHandlerBenchmark()
-        : inputBuffers_(MakeRingBufferArray<kNumChannels>(512))
-        , outputBuffers_(MakeRingBufferArray<kNumChannels>(512))
+        : outputBuffers_(MakeRingBufferArray<kNumChannels>(512))
         , inputUnderruns_(0)
         , outputUnderruns_(0)
         , ioRunning_(false)
-        , rtInterface_(inputBuffers_, outputBuffers_, inputUnderruns_, outputUnderruns_, ioRunning_)
+        , rtInterface_(rxRouting_, mediaClock_, linkOffsetFrames_, outputBuffers_,
+                       inputUnderruns_, outputUnderruns_, ioRunning_)
     {
+        // Worst case for input: 16 streams of 8 channels routed onto all 128
+        // device channels, each holding audio at the positions being read
+        mediaClock_.reset(0, 0, MediaClock::samplesPerTick(48000.0, 1.0, HostTimebase::current()));
+        std::vector<float> data(kMaxBenchmarkFrames * kStreamChannels);
+        for (size_t i = 0; i < data.size(); ++i) data[i] = static_cast<float>(i % 1000);
+        for (size_t s = 0; s < kNumChannels / kStreamChannels; ++s) {
+            auto stream = std::make_unique<TimestampedAudioBuffer>(kStreamChannels, 8192);
+            stream->write(-linkOffsetFrames_.load(), kMaxBenchmarkFrames, data.data(), kStreamChannels, 0);
+            rxRouting_.publish(stream.get(), static_cast<uint32_t>(s * kStreamChannels));
+            streams_.push_back(std::move(stream));
+        }
+
         // Create I/O handler using RT-safe interface
         ioHandler_ = std::make_unique<AES67IOHandler>(rtInterface_);
+    }
+
+    ~IOHandlerBenchmark() {
+        for (auto& stream : streams_) rxRouting_.unpublish(stream.get());
     }
 
     BenchmarkResult benchmarkInputProcessing(UInt32 frameCount, size_t iterations) {
@@ -64,43 +83,20 @@ public:
         // Prepare test data
         std::vector<float> outputBuffer(frameCount * kNumChannels);
 
-        // Pre-fill input buffers with test data
-        for (size_t ch = 0; ch < kNumChannels; ++ch) {
-            std::vector<float> testData(frameCount);
-            for (size_t i = 0; i < frameCount; ++i) {
-                testData[i] = static_cast<float>(ch * 1000 + i);
-            }
-            inputBuffers_[ch].write(testData.data(), frameCount);
-        }
-
-        // Warmup
+        // Warmup (reads are non-destructive, so the same audio is read every time)
         for (int i = 0; i < 10; ++i) {
-            ioHandler_->processInput(outputBuffer.data(), frameCount, kNumChannels);
-            // Refill buffers
-            for (size_t ch = 0; ch < kNumChannels; ++ch) {
-                std::vector<float> testData(frameCount);
-                inputBuffers_[ch].write(testData.data(), frameCount);
-            }
+            ioHandler_->processInput(outputBuffer.data(), frameCount, kNumChannels, 0.0);
         }
 
         // Benchmark
         for (size_t i = 0; i < iterations; ++i) {
             auto start = high_resolution_clock::now();
 
-            ioHandler_->processInput(outputBuffer.data(), frameCount, kNumChannels);
+            ioHandler_->processInput(outputBuffer.data(), frameCount, kNumChannels, 0.0);
 
             auto end = high_resolution_clock::now();
             auto duration = duration_cast<nanoseconds>(end - start);
             timings.push_back(duration.count() / 1000.0); // Convert to microseconds
-
-            // Refill buffers for next iteration
-            for (size_t ch = 0; ch < kNumChannels; ++ch) {
-                std::vector<float> testData(frameCount);
-                for (size_t j = 0; j < frameCount; ++j) {
-                    testData[j] = static_cast<float>(ch * 1000 + j);
-                }
-                inputBuffers_[ch].write(testData.data(), frameCount);
-            }
         }
 
         return calculateStatistics("Input Processing", timings, frameCount);
@@ -212,7 +208,13 @@ private:
 
     using DeviceChannelBuffers = std::array<SPSCRingBuffer<float>, kNumChannels>;
 
-    DeviceChannelBuffers inputBuffers_;
+    static constexpr size_t kStreamChannels = 8;
+    static constexpr UInt32 kMaxBenchmarkFrames = 4096;
+
+    MediaClock mediaClock_;
+    RxRouting rxRouting_;
+    std::atomic<int64_t> linkOffsetFrames_{384};
+    std::vector<std::unique_ptr<TimestampedAudioBuffer>> streams_;
     DeviceChannelBuffers outputBuffers_;
     std::atomic<uint64_t> inputUnderruns_;
     std::atomic<uint64_t> outputUnderruns_;

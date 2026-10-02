@@ -11,6 +11,7 @@
 #include "../NetworkEngine/Clock/DeviceTimeline.h"
 #include "../NetworkEngine/Clock/HostTime.h"
 #include <CoreAudio/AudioServerPlugIn.h>
+#include <cmath>
 #include <utility>
 
 namespace AES67 {
@@ -42,15 +43,13 @@ AES67Device::AES67Device(std::shared_ptr<aspl::Context> context)
         .ClockIsStable = true,
         .ClockAlgorithm = kAudioDeviceClockAlgorithmRaw
     })
-    // Initialize ring buffers sized for maximum supported sample rate (384kHz)
-    // This ensures buffers are always large enough regardless of sample rate changes
-    // Power-of-2 sizing: 384kHz @ 3ms = 1152 samples → 2048 (next power of 2)
-    , inputBuffers_(MakeRingBufferArray(
-          CalculateRingBufferSize(384000.0)))  // Max sample rate
+    // Output ring buffers sized for the maximum supported sample rate (384kHz)
+    // so they never need resizing. Power-of-2 sizing: 384kHz @ 3ms = 1152 → 2048
     , outputBuffers_(MakeRingBufferArray(
           CalculateRingBufferSize(384000.0)))  // Max sample rate
 {
     AES67_LOG("AES67Device constructor: Starting initialization");
+    linkOffsetFrames_.store(LinkOffsetFramesFor(currentSampleRate_.load()));
     const Float64 initialSampleRate = currentSampleRate_.load();
     const size_t ringBufferSize = CalculateRingBufferSize(384000.0);
     AES67_LOGF("AES67Device: Initial sample rate = %.0f Hz", initialSampleRate);
@@ -81,7 +80,9 @@ void AES67Device::Initialize() {
     // Must be created before InitializeIOHandler() so it can be passed in.
     AES67_LOG("AES67Device: Creating RTSafeStreamInterface");
     rtInterface_ = std::make_unique<RTSafeStreamInterface>(
-        inputBuffers_,
+        rxRouting_,
+        mediaClock_,
+        linkOffsetFrames_,
         outputBuffers_,
         inputUnderruns_,
         outputUnderruns_,
@@ -95,7 +96,8 @@ void AES67Device::Initialize() {
 
     // Initialize Stream Manager (manages all AES67 network streams)
     AES67_LOG("AES67Device: Creating StreamManager");
-    streamManager_ = std::make_unique<StreamManager>(inputBuffers_, outputBuffers_);
+    streamManager_ = std::make_unique<StreamManager>(
+        RxContext{mediaClock_, networkTime_, rxRouting_, linkOffsetFrames_}, outputBuffers_);
     AES67_LOG("AES67Device: StreamManager created successfully");
 
     // Set device sample rate in StreamManager
@@ -161,6 +163,10 @@ void AES67Device::Initialize() {
 }
 
 AES67Device::~AES67Device() {
+    // Receivers reference mediaClock_, networkTime_ and rxRouting_, which are
+    // declared after streamManager_ and so would be destroyed first
+    streamManager_.reset();
+
     // Deactivate streams directly rather than calling StopIO() (which requires
     // framework context). This is safe in the destructor.
     if (inputStream_) {
@@ -178,6 +184,7 @@ void AES67Device::InitializeStreams() {
     aspl::StreamParameters inputParams;
     inputParams.Direction = aspl::Direction::Input;
     inputParams.StartingChannel = 1;
+    inputParams.Latency = static_cast<UInt32>(linkOffsetFrames_.load());
     inputParams.Format.mSampleRate = currentSampleRate_.load();
     inputParams.Format.mFormatID = kAudioFormatLinearPCM;
     inputParams.Format.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
@@ -279,6 +286,10 @@ OSStatus AES67Device::SetNominalSampleRateImpl(Float64 rate) {
     }
 
     currentSampleRate_.store(rate);
+    linkOffsetFrames_.store(LinkOffsetFramesFor(rate));
+    if (inputStream_) {
+        inputStream_->SetLatencyAsync(static_cast<UInt32>(linkOffsetFrames_.load()));
+    }
 
     // Media positions are counted in samples, so a new rate is a new timeline
     RestartTimeline(rate);
@@ -293,7 +304,7 @@ OSStatus AES67Device::SetNominalSampleRateImpl(Float64 rate) {
     }
 
     AES67_LOGF("SetNominalSampleRateImpl: Now running at %.0f Hz (ring buffer %.2f ms)",
-               rate, (inputBuffers_[0].capacity() * 1000.0) / rate);
+               rate, (outputBuffers_[0].capacity() * 1000.0) / rate);
     return kAudioHardwareNoError;
 }
 
@@ -301,6 +312,13 @@ void AES67Device::RestartTimeline(Float64 sampleRate) {
     std::lock_guard<std::mutex> lock(clockWriteMutex_);
     mediaClock_.reset(hostTimeNow(), 0,
                       MediaClock::samplesPerTick(sampleRate, 1.0, HostTimebase::current()));
+    // Network time was anchored to the old timeline; receivers re-anchor on
+    // their next packet (they also see the new clock generation)
+    networkTime_.reset();
+}
+
+int64_t AES67Device::LinkOffsetFramesFor(Float64 sampleRate) {
+    return static_cast<int64_t>(std::llround(sampleRate * kLinkOffsetSeconds));
 }
 
 OSStatus AES67Device::GetZeroTimeStampImpl(UInt32 clientID, Float64* outSampleTime, UInt64* outHostTime,

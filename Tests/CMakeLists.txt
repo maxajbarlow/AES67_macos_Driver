@@ -46,8 +46,8 @@ add_executable(TestRTPReceiver
     TestRTPReceiver.cpp
     ../NetworkEngine/RTP/RTPReceiver.cpp
     ../NetworkEngine/RTP/SimpleRTP.cpp
-    ../NetworkEngine/RTP/LockFreeCircularJitterBuffer.cpp
-    ../NetworkEngine/RTP/LockFreePacketPool.cpp
+    ../NetworkEngine/RTP/RtpPlacement.cpp
+    ../NetworkEngine/Clock/TimestampedAudioBuffer.cpp
     ../Driver/SDPParser.cpp
     ../Driver/AudioThreadPriority.cpp
     ../NetworkEngine/StreamChannelMapper.cpp
@@ -135,6 +135,7 @@ target_compile_features(TestMultiStream PRIVATE cxx_std_17)
 add_executable(BenchmarkIOHandler
     BenchmarkIOHandler.cpp
     ../Driver/AES67IOHandler.cpp
+    ../NetworkEngine/Clock/TimestampedAudioBuffer.cpp
     ../Shared/Types.cpp
 )
 
@@ -156,8 +157,8 @@ add_executable(TestIntegrationAudioPath
     ../NetworkEngine/RTP/RTPReceiver.cpp
     ../NetworkEngine/RTP/RTPTransmitter.cpp
     ../NetworkEngine/RTP/SimpleRTP.cpp
-    ../NetworkEngine/RTP/LockFreeCircularJitterBuffer.cpp
-    ../NetworkEngine/RTP/LockFreePacketPool.cpp
+    ../NetworkEngine/RTP/RtpPlacement.cpp
+    ../NetworkEngine/Clock/TimestampedAudioBuffer.cpp
     ../Driver/SDPParser.cpp
     ../Driver/AudioThreadPriority.cpp
     ../NetworkEngine/StreamChannelMapper.cpp
@@ -206,8 +207,22 @@ target_include_directories(TestClockFoundations PRIVATE
 
 target_compile_features(TestClockFoundations PRIVATE cxx_std_17)
 
+# Test: Step 2 RX placement by timestamp and IO routing
+add_executable(TestRxTimestamp
+    TestRxTimestamp.cpp
+    ../NetworkEngine/RTP/RtpPlacement.cpp
+    ../NetworkEngine/Clock/TimestampedAudioBuffer.cpp
+)
+
+target_include_directories(TestRxTimestamp PRIVATE
+    ${CMAKE_SOURCE_DIR}
+)
+
+target_compile_features(TestRxTimestamp PRIVATE cxx_std_17)
+
 # Add tests to CTest
 enable_testing()
+add_test(NAME RxTimestamp COMMAND TestRxTimestamp)
 add_test(NAME ClockFoundations COMMAND TestClockFoundations)
 add_test(NAME CriticalPathRegressions COMMAND TestCriticalPathRegressions)
 add_test(NAME SDPParser COMMAND TestSDPParser)
