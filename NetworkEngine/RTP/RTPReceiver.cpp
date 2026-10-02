@@ -9,7 +9,6 @@
 #include "../../Driver/DebugLog.h"
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <chrono>
@@ -125,6 +124,7 @@ bool RTPReceiver::start() {
     candidateCount_ = 0;
     rejectedPackets_ = 0;
     resyncFillRemaining_ = 0;
+    underrunCredit_ = 0;
     // Silence length for lost packets until the first packet is decoded
     lastFrameCount_ = sdp_.framecount > 0
         ? sdp_.framecount
@@ -324,18 +324,18 @@ void RTPReceiver::consumeLoop() {
         // new sequence, backed off by the prefill depth. Those earlier sequence
         // numbers were never sent, so they play as silence while the jitter
         // buffer rebuilds its cushion.
-        const int32_t resyncTo = resyncRequest_.exchange(-1, std::memory_order_acq_rel);
+        int32_t resyncTo = resyncRequest_.load(std::memory_order_acquire);
         if (resyncTo >= 0) {
-            const auto current = static_cast<uint16_t>(expectedSequenceNumber_.load(std::memory_order_acquire));
-            const auto target = static_cast<uint16_t>(static_cast<uint32_t>(resyncTo) - kPrefillPacketCount);
-            const auto window = static_cast<int32_t>(jitterBuffer_.getMaxBufferSize());
-            // A request raced with an earlier resync if the target is already in reach
-            if (std::abs(RTP::sequenceDistance(current, target)) > window) {
-                expectedSequenceNumber_.store(target, std::memory_order_release);
-                resyncFillRemaining_ = kPrefillPacketCount;
-                rateController.reset();
-                AES67_LOGF("RTPReceiver: resynced to sequence %d (stream=%s)", resyncTo, sdp_.sessionName.c_str());
-            }
+            // Publish the new expected sequence before clearing the request, so
+            // the receive thread never judges packets against a stale value.
+            // If a newer request arrived meanwhile the CAS fails and it is
+            // applied on the next tick.
+            expectedSequenceNumber_.store(resyncTarget(resyncTo), std::memory_order_release);
+            resyncFillRemaining_ = kPrefillPacketCount;
+            underrunCredit_ = 0;
+            rateController.reset();
+            resyncRequest_.compare_exchange_strong(resyncTo, -1, std::memory_order_acq_rel);
+            AES67_LOGF("RTPReceiver: resynced to sequence %d (stream=%s)", resyncTo, sdp_.sessionName.c_str());
         }
 
         uint32_t expectedSeq = expectedSequenceNumber_.load(std::memory_order_acquire);
@@ -361,25 +361,37 @@ void RTPReceiver::consumeLoop() {
             if (decodedFrames > 0) {
                 lastFrameCount_ = decodedFrames;
             }
+            underrunCredit_ = 0;
         } else {
             // Expected packet not available
             size_t bufferedCount = jitterBuffer_.getBufferedPacketCount();
 
             if (bufferedCount > 0) {
                 // Buffer has packets but not the one we want — packet loss.
-                // Play silence in its place so this stream stays aligned with
-                // the others, then skip to the next sequence number.
+                // Skip to the next sequence number so we don't stall.
                 expectedSequenceNumber_.store((expectedSeq + 1) & 0xFFFF, std::memory_order_release);
                 if (resyncFillRemaining_ > 0) {
-                    --resyncFillRemaining_;  // placeholder after a resync, never sent
-                } else {
+                    // Placeholder after a resync (never sent): silence rebuilds the cushion
+                    --resyncFillRemaining_;
+                    writeSilence(lastFrameCount_);
+                } else if (underrunCredit_ > 0) {
+                    // Lost during an outage we already underran through: Core
+                    // Audio played that time as zeros, so don't add it again
+                    --underrunCredit_;
                     stats_.packetsLost.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    // Play silence in its place so this stream stays aligned
+                    // with the others
+                    stats_.packetsLost.fetch_add(1, std::memory_order_relaxed);
+                    writeSilence(lastFrameCount_);
                 }
-                writeSilence(lastFrameCount_);
             } else {
                 // Buffer completely empty — underrun.
                 // Do NOT advance sequence number; the packet may still arrive.
                 stats_.underruns.fetch_add(1, std::memory_order_relaxed);
+                if (underrunCredit_ < jitterBuffer_.getMaxBufferSize()) {
+                    ++underrunCredit_;
+                }
             }
         }
 
@@ -470,21 +482,33 @@ void RTPReceiver::processPacket(const RTP::RTPPacket& packet) {
     }
 }
 
+uint16_t RTPReceiver::resyncTarget(int32_t resyncSequence) {
+    return static_cast<uint16_t>(static_cast<uint32_t>(resyncSequence) - kPrefillPacketCount);
+}
+
 bool RTPReceiver::acceptFromCurrentSource(uint16_t sequenceNumber, uint32_t ssrc) {
-    const auto expected = static_cast<uint16_t>(expectedSequenceNumber_.load(std::memory_order_acquire));
+    // Judge against a resync the consumer has not applied yet, if any, so
+    // packets just after a source switch are not mistaken for strays
+    const int32_t pending = resyncRequest_.load(std::memory_order_acquire);
+    const auto expected = pending >= 0
+        ? resyncTarget(pending)
+        : static_cast<uint16_t>(expectedSequenceNumber_.load(std::memory_order_acquire));
     const auto window = static_cast<int32_t>(jitterBuffer_.getMaxBufferSize());
     const int32_t gap = RTP::sequenceDistance(expected, sequenceNumber);
 
-    if (ssrc == sourceSsrc_ && gap <= window && gap >= -window) {
+    // Playable: from our source, at or ahead of the consumer, within the buffer.
+    // Anything behind the consumer has already been played or declared lost.
+    if (ssrc == sourceSsrc_ && gap >= 0 && gap <= window) {
         candidateCount_ = 0;
         return true;
     }
 
-    // Another SSRC, or a sequence number the jitter buffer cannot hold: a sender
-    // restart (RFC 3550 senders pick a random SSRC and initial sequence number),
-    // a very long outage, a very late packet, or a second sender on the group.
-    // Only a sustained run of consecutive packets from the same candidate is
-    // treated as a restart; anything else is dropped.
+    // Another SSRC, a sequence number behind the consumer, or one the jitter
+    // buffer cannot hold: a sender restart (RFC 3550 senders pick a random SSRC
+    // and initial sequence number, which may land behind us), a very long
+    // outage, a late packet, or a second sender on the group. Only a sustained
+    // run of consecutive packets from the same candidate is treated as a
+    // restart; anything else is dropped.
     const bool continuesCandidate = candidateCount_ > 0 && ssrc == candidateSsrc_ &&
         RTP::sequenceDistance(candidateSequence_, sequenceNumber) > 0 &&
         RTP::sequenceDistance(candidateSequence_, sequenceNumber) <= window;

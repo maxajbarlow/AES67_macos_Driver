@@ -10,6 +10,8 @@
 //   - Receiver not resyncing after a sender restart
 //   - Lost packets shifting the timeline instead of being replaced by silence
 //   - Late packets or a second sender on the group triggering spurious resyncs
+//   - A restart landing behind the playout point leaving the stream silent
+//   - Outages being replayed as silence on top of the underrun, adding latency
 //
 // Uses a non-aborting CHECK so every failure is reported, and works under NDEBUG.
 //
@@ -569,6 +571,85 @@ void testInterleavedSecondSourceIsIgnored() {
                                                              << " of " << kPackets << " packets)");
 }
 
+// ---------------------------------------------------------------------------
+// A sender restart whose new sequence base lands just BEHIND the playout point
+// (within the jitter window) must still be followed. Packets behind the
+// consumer can never be played, so without a resync the stream stays silent.
+// ---------------------------------------------------------------------------
+void runRestartBehindPlayout(const char* group, uint16_t port, uint32_t restartSsrc, const char* label) {
+    auto deviceBuffers = makeRingBuffers(kTestRingSize);
+    RTPReceiver receiver(makeRxSDP(group, port, 2), makeMapping(2, 0), deviceBuffers);
+    CHECK(receiver.start(), label << ": receiver should start");
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    ChannelDrainer drainer(deviceBuffers[0]);
+    LoopbackSender sender(group, port);
+    auto next = std::chrono::steady_clock::now();
+    for (uint16_t i = 0; i < 60; ++i) {
+        sender.sendL24(static_cast<uint16_t>(6000 + i), i * kFramesPerPacket, 2, 0.25f);
+        std::this_thread::sleep_until(next += std::chrono::milliseconds(1));
+    }
+    // Restart about 150 packets behind where playout has reached
+    for (uint16_t i = 0; i < 150; ++i) {
+        sender.sendL24(static_cast<uint16_t>(5900 + i), 500000 + i * kFramesPerPacket, 2, -0.5f, restartSsrc);
+        std::this_thread::sleep_until(next += std::chrono::milliseconds(1));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    receiver.stop();
+    const auto samples = drainer.stop();
+
+    CHECK(countNear(samples, -0.5f) >= 100 * kFramesPerPacket,
+          label << ": the restarted stream should play (got " << countNear(samples, -0.5f) / kFramesPerPacket
+                << " of 150 packets)");
+}
+
+void testRestartBehindPlayoutIsFollowed() {
+    std::cout << "RX follows a restart that lands behind playout" << std::endl;
+    runRestartBehindPlayout("239.69.99.7", 55020, 0x12345678, "same SSRC");
+    runRestartBehindPlayout("239.69.99.8", 55022, 0x0BADF00D, "new SSRC");
+}
+
+// ---------------------------------------------------------------------------
+// After an outage the consumer has already underrun for most of the gap, and
+// Core Audio has played that time as zeros. The missing packets must not then
+// be played as silence again, or every outage adds its length to the latency.
+// ---------------------------------------------------------------------------
+void testOutageDoesNotAddLatency() {
+    std::cout << "RX outage does not add latency" << std::endl;
+
+    constexpr const char* kGroup = "239.69.99.9";
+    constexpr uint16_t kPort = 55024;
+    auto deviceBuffers = makeRingBuffers(kTestRingSize);
+    RTPReceiver receiver(makeRxSDP(kGroup, kPort, 2), makeMapping(2, 0), deviceBuffers);
+    CHECK(receiver.start(), "receiver should start");
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    ChannelDrainer drainer(deviceBuffers[0]);
+    LoopbackSender sender(kGroup, kPort);
+    constexpr uint16_t kOutagePackets = 40;
+    auto next = std::chrono::steady_clock::now();
+    for (uint16_t i = 0; i < 100; ++i) {
+        // Packets 30..69 are lost in a 40 ms outage
+        if (i < 30 || i >= 30 + kOutagePackets) {
+            sender.sendL24(static_cast<uint16_t>(7000 + i), i * kFramesPerPacket, 2, 0.25f);
+        }
+        std::this_thread::sleep_until(next += std::chrono::milliseconds(1));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    receiver.stop();
+    const auto samples = drainer.stop();
+
+    const size_t silencePackets = countNear(samples, 0.0f) / kFramesPerPacket;
+    CHECK(countNear(samples, 0.25f) == (100 - kOutagePackets) * kFramesPerPacket, "every received packet should play");
+    // Idle runs give ~5 (the prefill cushion being rebuilt). Under heavy CPU
+    // load the sender thread itself stalls and bursts, shortening the outage in
+    // wall time, so fewer losses are covered by underruns; the regression this
+    // guards against silences every lost packet (exactly kOutagePackets).
+    CHECK(silencePackets < kOutagePackets / 2,
+          "only the cushion should be re-filled with silence, not the whole outage (got "
+              << silencePackets << " packets of silence for a " << kOutagePackets << "-packet outage)");
+}
+
 } // namespace
 
 int main() {
@@ -582,6 +663,8 @@ int main() {
     testLostPacketBecomesSilence();
     testLatePacketDoesNotResync();
     testInterleavedSecondSourceIsIgnored();
+    testRestartBehindPlayoutIsFollowed();
+    testOutageDoesNotAddLatency();
 
     std::cout << "\nCritical path regressions: " << checksPassed << " passed, "
               << checksFailed << " failed" << std::endl;

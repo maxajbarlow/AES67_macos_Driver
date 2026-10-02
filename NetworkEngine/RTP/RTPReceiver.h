@@ -152,16 +152,23 @@ private:
     // rather than a late packet or a second sender on the group.
     static constexpr int kSourceSwitchPackets = 4;
     bool acceptFromCurrentSource(uint16_t sequenceNumber, uint32_t ssrc);
+
+    // Expected sequence after resyncing to a packet: backed off by the prefill
+    // depth so the placeholders play as silence while the cushion rebuilds
+    static uint16_t resyncTarget(int32_t resyncSequence);
     uint32_t sourceSsrc_{0};
     uint32_t candidateSsrc_{0};
     uint16_t candidateSequence_{0};
     int candidateCount_{0};
     uint64_t rejectedPackets_{0};
 
-    // Consume thread only: frames in the most recently decoded packet, and the
-    // number of placeholder sequence numbers left after a resync (not losses)
+    // Consume thread only: frames in the most recently decoded packet, the
+    // number of placeholder sequence numbers left after a resync (not losses),
+    // and underrun ticks since the last decoded packet (losses covered by an
+    // underrun were already played as zeros by Core Audio)
     size_t lastFrameCount_{0};
     size_t resyncFillRemaining_{0};
+    size_t underrunCredit_{0};
 
     // Statistics (atomic operations, no mutex needed for individual updates)
     Statistics stats_;
