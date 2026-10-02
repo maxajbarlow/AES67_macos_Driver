@@ -7,6 +7,9 @@
 #include "RTPReceiver.h"
 #include "SimpleRTP.h"
 #include "../../Driver/DebugLog.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <chrono>
@@ -118,6 +121,14 @@ bool RTPReceiver::start() {
     // Reset jitter buffer and prefill gate
     jitterBuffer_.reset();
     expectedSequenceNumber_.store(0, std::memory_order_relaxed);
+    resyncRequest_.store(-1, std::memory_order_relaxed);
+    candidateCount_ = 0;
+    rejectedPackets_ = 0;
+    resyncFillRemaining_ = 0;
+    // Silence length for lost packets until the first packet is decoded
+    lastFrameCount_ = sdp_.framecount > 0
+        ? sdp_.framecount
+        : static_cast<size_t>(std::lround(sdp_.sampleRate * std::chrono::duration<double>(packetInterval_).count()));
     prefillComplete_.store(false, std::memory_order_relaxed);
 
     // Start receive thread (producer - adds packets to jitter buffer)
@@ -301,18 +312,31 @@ void RTPReceiver::consumeLoop() {
     // RTPTransmitter::transmitLoop().
     auto nextConsumeTime = std::chrono::steady_clock::now();
 
-    // Adaptive rate matching state
-    double rateAdjustment = 0.0;        // current fractional adjustment
-    size_t packetsSinceRateCheck = 0;
+    RateController rateController(packetInterval_, kPrefillPacketCount);
 
     while (running_) {
         std::this_thread::sleep_until(nextConsumeTime);
 
         // Advance target time (with rate adjustment applied)
-        auto adjustedInterval = std::chrono::microseconds(
-            static_cast<int64_t>(packetInterval_.count() * (1.0 + rateAdjustment))
-        );
-        nextConsumeTime += adjustedInterval;
+        nextConsumeTime += rateController.nextInterval(packetInterval_);
+
+        // Sender restarted (or a gap longer than the jitter buffer): jump to the
+        // new sequence, backed off by the prefill depth. Those earlier sequence
+        // numbers were never sent, so they play as silence while the jitter
+        // buffer rebuilds its cushion.
+        const int32_t resyncTo = resyncRequest_.exchange(-1, std::memory_order_acq_rel);
+        if (resyncTo >= 0) {
+            const auto current = static_cast<uint16_t>(expectedSequenceNumber_.load(std::memory_order_acquire));
+            const auto target = static_cast<uint16_t>(static_cast<uint32_t>(resyncTo) - kPrefillPacketCount);
+            const auto window = static_cast<int32_t>(jitterBuffer_.getMaxBufferSize());
+            // A request raced with an earlier resync if the target is already in reach
+            if (std::abs(RTP::sequenceDistance(current, target)) > window) {
+                expectedSequenceNumber_.store(target, std::memory_order_release);
+                resyncFillRemaining_ = kPrefillPacketCount;
+                rateController.reset();
+                AES67_LOGF("RTPReceiver: resynced to sequence %d (stream=%s)", resyncTo, sdp_.sessionName.c_str());
+            }
+        }
 
         uint32_t expectedSeq = expectedSequenceNumber_.load(std::memory_order_acquire);
 
@@ -328,10 +352,14 @@ void RTPReceiver::consumeLoop() {
             // Successfully got the expected packet — decode and map to ring buffers
             expectedSequenceNumber_.store((expectedSeq + 1) & 0xFFFF, std::memory_order_release);
 
+            size_t decodedFrames = 0;
             if (sdp_.encoding == "L16") {
-                decodeL16(jitterReadBuffer_, outputLength);
+                decodedFrames = decodeL16(jitterReadBuffer_, outputLength);
             } else if (sdp_.encoding == "L24") {
-                decodeL24(jitterReadBuffer_, outputLength);
+                decodedFrames = decodeL24(jitterReadBuffer_, outputLength);
+            }
+            if (decodedFrames > 0) {
+                lastFrameCount_ = decodedFrames;
             }
         } else {
             // Expected packet not available
@@ -339,9 +367,15 @@ void RTPReceiver::consumeLoop() {
 
             if (bufferedCount > 0) {
                 // Buffer has packets but not the one we want — packet loss.
-                // Skip to the next sequence number so we don't stall.
+                // Play silence in its place so this stream stays aligned with
+                // the others, then skip to the next sequence number.
                 expectedSequenceNumber_.store((expectedSeq + 1) & 0xFFFF, std::memory_order_release);
-                stats_.packetsLost.fetch_add(1, std::memory_order_relaxed);
+                if (resyncFillRemaining_ > 0) {
+                    --resyncFillRemaining_;  // placeholder after a resync, never sent
+                } else {
+                    stats_.packetsLost.fetch_add(1, std::memory_order_relaxed);
+                }
+                writeSilence(lastFrameCount_);
             } else {
                 // Buffer completely empty — underrun.
                 // Do NOT advance sequence number; the packet may still arrive.
@@ -349,32 +383,11 @@ void RTPReceiver::consumeLoop() {
             }
         }
 
-        // ── Adaptive rate matching ──────────────────────────────────
-        // Every kRateCheckIntervalPackets, sample the first mapped channel's
-        // ring buffer fill level and nudge the consume rate to keep it near 50%.
-        ++packetsSinceRateCheck;
-        if (packetsSinceRateCheck >= kRateCheckIntervalPackets) {
-            packetsSinceRateCheck = 0;
-
-            size_t deviceCh = mapping_.deviceChannelStart;
-            if (deviceCh < 128) {
-                auto& ringBuf = deviceChannels_[deviceCh];
-                size_t cap = ringBuf.capacity();
-                if (cap > 0) {
-                    double fillRatio = static_cast<double>(ringBuf.available()) /
-                                       static_cast<double>(cap);
-                    double error = fillRatio - kTargetFillRatio;
-
-                    // Positive error (buffer too full) → speed up consumption (negative adjust)
-                    // Negative error (buffer too empty) → slow down consumption (positive adjust)
-                    rateAdjustment -= error * kRateAdjustmentGain;
-
-                    // Clamp to maximum adjustment range
-                    if (rateAdjustment > kMaxRateAdjustment) rateAdjustment = kMaxRateAdjustment;
-                    if (rateAdjustment < -kMaxRateAdjustment) rateAdjustment = -kMaxRateAdjustment;
-                }
-            }
-        }
+        // ── Sender rate tracking ────────────────────────────────────
+        // Hold the jitter buffer at its prefill depth so consumption follows
+        // the sender's packet clock (see RateController for what this can and
+        // cannot correct).
+        rateController.addDepthSample(static_cast<double>(jitterBuffer_.getBufferedPacketCount()));
     }
 }
 
@@ -411,10 +424,13 @@ void RTPReceiver::processPacket(const RTP::RTPPacket& packet) {
     // Update connection state
     if (!connected_) {
         connected_ = true;
+        sourceSsrc_ = packet.header.ssrc;
         // Initialize expected sequence number from first packet.
         // Use release ordering so the consume thread (which loads with
         // acquire) is guaranteed to see this initial value.
         expectedSequenceNumber_.store(sequenceNumber, std::memory_order_release);
+    } else if (!acceptFromCurrentSource(sequenceNumber, packet.header.ssrc)) {
+        return;
     }
     auto now = std::chrono::steady_clock::now();
     lastPacketTimeNs_.store(
@@ -454,6 +470,45 @@ void RTPReceiver::processPacket(const RTP::RTPPacket& packet) {
     }
 }
 
+bool RTPReceiver::acceptFromCurrentSource(uint16_t sequenceNumber, uint32_t ssrc) {
+    const auto expected = static_cast<uint16_t>(expectedSequenceNumber_.load(std::memory_order_acquire));
+    const auto window = static_cast<int32_t>(jitterBuffer_.getMaxBufferSize());
+    const int32_t gap = RTP::sequenceDistance(expected, sequenceNumber);
+
+    if (ssrc == sourceSsrc_ && gap <= window && gap >= -window) {
+        candidateCount_ = 0;
+        return true;
+    }
+
+    // Another SSRC, or a sequence number the jitter buffer cannot hold: a sender
+    // restart (RFC 3550 senders pick a random SSRC and initial sequence number),
+    // a very long outage, a very late packet, or a second sender on the group.
+    // Only a sustained run of consecutive packets from the same candidate is
+    // treated as a restart; anything else is dropped.
+    const bool continuesCandidate = candidateCount_ > 0 && ssrc == candidateSsrc_ &&
+        RTP::sequenceDistance(candidateSequence_, sequenceNumber) > 0 &&
+        RTP::sequenceDistance(candidateSequence_, sequenceNumber) <= window;
+    candidateCount_ = continuesCandidate ? candidateCount_ + 1 : 1;
+    candidateSsrc_ = ssrc;
+    candidateSequence_ = sequenceNumber;
+
+    if (candidateCount_ >= kSourceSwitchPackets) {
+        AES67_LOGF("RTPReceiver: following new source ssrc=%08x seq=%u (was ssrc=%08x, expected seq=%u) stream=%s",
+                   ssrc, sequenceNumber, sourceSsrc_, expected, sdp_.sessionName.c_str());
+        sourceSsrc_ = ssrc;
+        candidateCount_ = 0;
+        resyncRequest_.store(sequenceNumber, std::memory_order_release);
+        return true;
+    }
+
+    if (++rejectedPackets_ == 1 || rejectedPackets_ % 1000 == 0) {
+        AES67_LOGF("RTPReceiver: ignored packet #%llu ssrc=%08x seq=%u (playing ssrc=%08x near seq=%u) stream=%s",
+                   (unsigned long long)rejectedPackets_, ssrc, sequenceNumber, sourceSsrc_, expected,
+                   sdp_.sessionName.c_str());
+    }
+    return false;
+}
+
 bool RTPReceiver::validatePacket(const RTP::RTPPacket& packet) {
     // Check RTP version (should be 2)
     if (packet.header.version != 2) {
@@ -473,21 +528,21 @@ bool RTPReceiver::validatePacket(const RTP::RTPPacket& packet) {
     return true;
 }
 
-void RTPReceiver::decodeL16(const uint8_t* payload, size_t payloadSize) {
+size_t RTPReceiver::decodeL16(const uint8_t* payload, size_t payloadSize) {
     // L16: 16-bit big-endian signed PCM
     const size_t bytesPerSample = 2;
     const size_t bytesPerFrame = bytesPerSample * sdp_.numChannels;
     const size_t frameCount = payloadSize / bytesPerFrame;
 
     if (frameCount == 0 || frameCount > 512) {
-        return; // Invalid or excessive frame count
+        return 0; // Invalid or excessive frame count
     }
 
     // Ensure audio buffer is large enough
     const size_t totalSamples = frameCount * sdp_.numChannels;
     if (totalSamples > audioBuffer_.size()) {
         stats_.malformedPackets.fetch_add(1, std::memory_order_relaxed);
-        return;
+        return 0;
     }
 
     // Decode: big-endian int16 → float [-1.0, 1.0)
@@ -506,23 +561,24 @@ void RTPReceiver::decodeL16(const uint8_t* payload, size_t payloadSize) {
 
     // Map to device channels
     mapChannelsToDevice(audioBuffer_.data(), frameCount);
+    return frameCount;
 }
 
-void RTPReceiver::decodeL24(const uint8_t* payload, size_t payloadSize) {
+size_t RTPReceiver::decodeL24(const uint8_t* payload, size_t payloadSize) {
     // L24: 24-bit big-endian signed PCM
     const size_t bytesPerSample = 3;
     const size_t bytesPerFrame = bytesPerSample * sdp_.numChannels;
     const size_t frameCount = payloadSize / bytesPerFrame;
 
     if (frameCount == 0 || frameCount > 512) {
-        return; // Invalid or excessive frame count
+        return 0; // Invalid or excessive frame count
     }
 
     // Ensure audio buffer is large enough
     const size_t totalSamples = frameCount * sdp_.numChannels;
     if (totalSamples > audioBuffer_.size()) {
         stats_.malformedPackets.fetch_add(1, std::memory_order_relaxed);
-        return;
+        return 0;
     }
 
     // Decode: big-endian int24 → float [-1.0, 1.0)
@@ -544,6 +600,16 @@ void RTPReceiver::decodeL24(const uint8_t* payload, size_t payloadSize) {
     }
 
     // Map to device channels
+    mapChannelsToDevice(audioBuffer_.data(), frameCount);
+    return frameCount;
+}
+
+void RTPReceiver::writeSilence(size_t frameCount) {
+    const size_t totalSamples = frameCount * sdp_.numChannels;
+    if (frameCount == 0 || totalSamples > audioBuffer_.size()) {
+        return;
+    }
+    std::fill_n(audioBuffer_.begin(), totalSamples, 0.0f);
     mapChannelsToDevice(audioBuffer_.data(), frameCount);
 }
 

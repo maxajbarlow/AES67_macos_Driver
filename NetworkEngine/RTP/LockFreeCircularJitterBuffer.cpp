@@ -1,4 +1,5 @@
 #include "LockFreeCircularJitterBuffer.h"
+#include "SimpleRTP.h"
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -52,11 +53,32 @@ bool LockFreeCircularJitterBuffer::addPacket(const uint8_t* packetData, size_t p
     // Try to atomically transition from EMPTY to WRITING
     // This gives us exclusive write access to the slot
     SlotState expected = SlotState::EMPTY;
-    if (!slot.state.compare_exchange_strong(expected, SlotState::WRITING,
-                                            std::memory_order_acquire,
-                                            std::memory_order_relaxed)) {
-        // Slot is not empty (either WRITING, READY, or READING)
-        // We cannot write to it, so drop this packet
+    bool replacingStale = false;
+    bool claimed = slot.state.compare_exchange_strong(expected, SlotState::WRITING,
+                                                      std::memory_order_acquire,
+                                                      std::memory_order_relaxed);
+
+    // A READY slot holding an older packet is stale: it is a whole buffer
+    // behind and will never be played. Claim it (READY -> WRITING excludes
+    // the reader) rather than dropping the newer packet. A late packet must
+    // never evict a newer one.
+    if (!claimed && expected == SlotState::READY &&
+        RTP::sequenceDistance(static_cast<uint16_t>(slot.sequenceNumber.load(std::memory_order_relaxed)),
+                              static_cast<uint16_t>(sequenceNumber)) > 0) {
+        claimed = slot.state.compare_exchange_strong(expected, SlotState::WRITING,
+                                                     std::memory_order_acquire,
+                                                     std::memory_order_relaxed);
+        replacingStale = claimed;
+
+        // The reader discarded the stale packet in between: the slot is free
+        if (!claimed && expected == SlotState::EMPTY) {
+            claimed = slot.state.compare_exchange_strong(expected, SlotState::WRITING,
+                                                         std::memory_order_acquire,
+                                                         std::memory_order_relaxed);
+        }
+    }
+
+    if (!claimed) {
         droppedPackets_.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
@@ -85,9 +107,13 @@ bool LockFreeCircularJitterBuffer::addPacket(const uint8_t* packetData, size_t p
     // This makes all the data writes visible to readers
     slot.state.store(SlotState::READY, std::memory_order_release);
 
-    // Update statistics
+    // Update statistics (a replaced stale packet was already counted as valid)
     totalPackets_.fetch_add(1, std::memory_order_relaxed);
-    validPackets_.fetch_add(1, std::memory_order_relaxed);
+    if (replacingStale) {
+        droppedPackets_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        validPackets_.fetch_add(1, std::memory_order_relaxed);
+    }
 
     return true;
 }

@@ -171,8 +171,32 @@ target_include_directories(TestIntegrationAudioPath PRIVATE
 
 target_compile_features(TestIntegrationAudioPath PRIVATE cxx_std_17)
 
+# Regression Test: Critical path defects (links the full driver)
+set(DRIVER_TEST_SOURCES ${ALL_CPP_SOURCES})
+list(TRANSFORM DRIVER_TEST_SOURCES PREPEND "${CMAKE_SOURCE_DIR}/")
+
+add_executable(TestCriticalPathRegressions
+    TestCriticalPathRegressions.cpp
+    ${DRIVER_TEST_SOURCES}
+)
+
+target_include_directories(TestCriticalPathRegressions PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${ASPL_INCLUDE_DIR}
+)
+
+target_compile_features(TestCriticalPathRegressions PRIVATE cxx_std_17)
+
+target_link_libraries(TestCriticalPathRegressions PRIVATE
+    ${ASPL_LIBRARY}
+    "-framework CoreAudio"
+    "-framework CoreFoundation"
+    "-framework AudioToolbox"
+)
+
 # Add tests to CTest
 enable_testing()
+add_test(NAME CriticalPathRegressions COMMAND TestCriticalPathRegressions)
 add_test(NAME SDPParser COMMAND TestSDPParser)
 add_test(NAME ChannelMapper COMMAND TestChannelMapper)
 add_test(NAME RingBuffer COMMAND TestRingBuffer)

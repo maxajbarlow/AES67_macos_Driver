@@ -32,6 +32,10 @@ class AES67Device : public aspl::Device {
 public:
     static constexpr size_t kNumChannels = 128;
 
+    // Nominal rate at startup (AES67 baseline). Must be passed to libASPL via
+    // DeviceParameters::SampleRate, whose own default is 44.1 kHz.
+    static constexpr UInt32 kDefaultSampleRate = 48000;
+
     // Supported sample rates
     static constexpr std::array<Float64, 8> kSupportedSampleRates = {
         44100.0, 48000.0, 88200.0, 96000.0,
@@ -56,11 +60,10 @@ public:
     // Device Configuration
     //
 
-    // Get/Set sample rate
+    // Current sample rate as seen by the driver (follows the HAL nominal rate)
     Float64 GetSampleRate() const;
-    OSStatus SetSampleRate(Float64 sampleRate);
 
-    // Get available sample rates
+    // Rates offered to the HAL: supported rates that every active stream can deliver
     std::vector<AudioValueRange> GetAvailableSampleRates() const override;
 
     // Get/Set buffer size
@@ -132,10 +135,20 @@ public:
     uint64_t GetOutputUnderrunCount() const { return outputUnderruns_.load(); }
     void ResetStatistics();
 
+protected:
+    // Invoked by libASPL (inside a HAL configuration change) when a client sets
+    // kAudioDevicePropertyNominalSampleRate. Applies the rate to the driver,
+    // StreamManager and both streams' formats.
+    OSStatus SetNominalSampleRateImpl(Float64 rate) override;
+
 private:
     // Internal handlers
-    OSStatus OnSetSampleRate(Float64 sampleRate);
     OSStatus OnSetBufferSize(UInt32 bufferSize);
+
+    static bool IsSupportedSampleRate(Float64 sampleRate);
+
+    // Lock a stream's physical and virtual formats to the given sample rate
+    static void ApplyStreamSampleRate(aspl::Stream& stream, Float64 sampleRate);
 
     // Initialize streams and IO handler
     void InitializeStreams();
@@ -167,7 +180,7 @@ private:
     std::unique_ptr<RTSafeStreamInterface> rtInterface_;
 
     // Current configuration
-    std::atomic<Float64> currentSampleRate_{48000.0};
+    std::atomic<Float64> currentSampleRate_{static_cast<Float64>(kDefaultSampleRate)};
     std::atomic<UInt32> currentBufferSize_{64};
 
     // State
@@ -176,9 +189,6 @@ private:
     // Statistics
     std::atomic<uint64_t> inputUnderruns_{0};
     std::atomic<uint64_t> outputUnderruns_{0};
-
-    // Resize ring buffers to accommodate new sample rate
-    void ResizeRingBuffers(Float64 sampleRate);
 };
 
 } // namespace AES67

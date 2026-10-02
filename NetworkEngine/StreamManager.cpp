@@ -247,6 +247,7 @@ StreamID StreamManager::createTxStream(
     sdp.sampleRate = currentDeviceSampleRate_.load();
     sdp.encoding = "L24"; // Use L24 for best quality
     sdp.payloadType = 97; // Dynamic payload type
+    sdp.direction = "sendonly"; // loadSavedStreams() relies on this to recreate a transmitter
     sdp.sessionID = static_cast<uint64_t>(std::time(nullptr));
     sdp.sessionVersion = 1;
 
@@ -508,14 +509,25 @@ bool StreamManager::setDeviceSampleRate(double sampleRate) {
 
     std::lock_guard<std::mutex> lock(streamsMutex_);
 
-    // Check if any streams would be incompatible
+    if (!streamsSupportSampleRate(sampleRate)) {
+        return false;
+    }
+
+    currentDeviceSampleRate_.store(sampleRate);
+    return true;
+}
+
+bool StreamManager::isSampleRateCompatible(double sampleRate) const {
+    std::lock_guard<std::mutex> lock(streamsMutex_);
+    return streamsSupportSampleRate(sampleRate);
+}
+
+bool StreamManager::streamsSupportSampleRate(double sampleRate) const {
     for (const auto& pair : streams_) {
         if (std::abs(pair.second.sdp.sampleRate - sampleRate) > 0.1) {
             return false;
         }
     }
-
-    currentDeviceSampleRate_.store(sampleRate);
     return true;
 }
 

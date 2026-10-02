@@ -10,6 +10,7 @@
 #include "../NetworkInterfaceDetection.h"
 #include "SimpleRTP.h"
 #include "LockFreeCircularJitterBuffer.h"
+#include "RateController.h"
 #include "../../Driver/AudioThreadPriority.h"
 #include <thread>
 #include <atomic>
@@ -101,9 +102,12 @@ private:
     void processPacket(const RTP::RTPPacket& packet);
     bool validatePacket(const RTP::RTPPacket& packet);
 
-    // Audio decoding
-    void decodeL16(const uint8_t* payload, size_t payloadSize);
-    void decodeL24(const uint8_t* payload, size_t payloadSize);
+    // Audio decoding (return frames written to the device, 0 if the payload was rejected)
+    size_t decodeL16(const uint8_t* payload, size_t payloadSize);
+    size_t decodeL24(const uint8_t* payload, size_t payloadSize);
+
+    // Write one packet's worth of silence so a lost packet keeps its place on the timeline
+    void writeSilence(size_t frameCount);
 
     // Channel mapping: stream audio → device channels
     void mapChannelsToDevice(const float* interleavedAudio, size_t frameCount);
@@ -118,14 +122,6 @@ private:
     // before starting paced consumption, preventing initial starvation
     std::atomic<bool> prefillComplete_{false};
     static constexpr size_t kPrefillPacketCount = 6;
-
-    // Adaptive rate matching: lightweight P-controller to compensate for
-    // clock drift between network sender and local Core Audio clock.
-    // Adjusts consume interval based on ring buffer fill level.
-    static constexpr size_t kRateCheckIntervalPackets = 48;   // check every ~48ms
-    static constexpr double kMaxRateAdjustment = 0.005;       // +/- 0.5%
-    static constexpr double kTargetFillRatio = 0.5;           // 50% ring buffer fill
-    static constexpr double kRateAdjustmentGain = 0.0001;     // very gentle P-controller
 
     // Configuration
     SDPSession sdp_;
@@ -145,6 +141,27 @@ private:
 
     // Expected sequence number for consumer
     std::atomic<uint32_t> expectedSequenceNumber_{0};
+
+    // Set by the receive thread once a new source or sequence base is confirmed
+    // (e.g. sender restart); holds the sequence number to resync to, or -1.
+    std::atomic<int32_t> resyncRequest_{-1};
+
+    // Source tracking (receive thread only). Packets from another SSRC, or
+    // further from the playout point than the jitter buffer holds, are dropped
+    // unless kSourceSwitchPackets consecutive ones agree, which marks a restart
+    // rather than a late packet or a second sender on the group.
+    static constexpr int kSourceSwitchPackets = 4;
+    bool acceptFromCurrentSource(uint16_t sequenceNumber, uint32_t ssrc);
+    uint32_t sourceSsrc_{0};
+    uint32_t candidateSsrc_{0};
+    uint16_t candidateSequence_{0};
+    int candidateCount_{0};
+    uint64_t rejectedPackets_{0};
+
+    // Consume thread only: frames in the most recently decoded packet, and the
+    // number of placeholder sequence numbers left after a resync (not losses)
+    size_t lastFrameCount_{0};
+    size_t resyncFillRemaining_{0};
 
     // Statistics (atomic operations, no mutex needed for individual updates)
     Statistics stats_;
