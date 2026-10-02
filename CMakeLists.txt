@@ -133,6 +133,7 @@ set(NETWORK_SOURCES
     NetworkEngine/RTP/LockFreeCircularJitterBuffer.cpp
     NetworkEngine/RTP/LockFreePacketPool.cpp
     NetworkEngine/RTP/BufferStatusMonitor.cpp
+    NetworkEngine/Clock/TimestampedAudioBuffer.cpp
     NetworkEngine/PTP/PTPClock.cpp
     NetworkEngine/PTP/PTPDInterface.cpp
     NetworkEngine/PTP/PTPSlave.cpp

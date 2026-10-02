@@ -27,6 +27,51 @@ target_include_directories(AES67TestReceiver PRIVATE
 
 target_compile_features(AES67TestReceiver PRIVATE cxx_std_17)
 
+# Spike S1: throwaway HAL plug-in (no device) that probes whether PTP can run
+# inside the Core Audio driver host. Off by default; see Docs/Spikes/.
+option(BUILD_SPIKES "Build investigation spikes" OFF)
+
+if(APPLE AND BUILD_SPIKES)
+    add_library(AES67SandboxProbe MODULE SandboxProbe/SandboxProbe.cpp)
+    target_include_directories(AES67SandboxProbe PRIVATE ${ASPL_INCLUDE_DIR})
+    target_compile_features(AES67SandboxProbe PRIVATE cxx_std_17)
+    target_link_libraries(AES67SandboxProbe PRIVATE
+        ${ASPL_LIBRARY}
+        "-framework CoreAudio"
+        "-framework CoreFoundation"
+    )
+    set_target_properties(AES67SandboxProbe PROPERTIES
+        BUNDLE TRUE
+        BUNDLE_EXTENSION "driver"
+        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/SandboxProbe/Info.plist.in"
+    )
+    message(STATUS "  - AES67SandboxProbe (spike S1)")
+
+    # Spike S2: HAL plug-in whose device clock follows a scheduled clock
+    # model, plus a client that measures whether Core Audio obeys it
+    add_library(AES67ClockProbe MODULE ClockProbe/ClockProbe.cpp)
+    target_include_directories(AES67ClockProbe PRIVATE ${ASPL_INCLUDE_DIR})
+    target_compile_features(AES67ClockProbe PRIVATE cxx_std_17)
+    target_link_libraries(AES67ClockProbe PRIVATE
+        ${ASPL_LIBRARY}
+        "-framework CoreAudio"
+        "-framework CoreFoundation"
+    )
+    set_target_properties(AES67ClockProbe PROPERTIES
+        BUNDLE TRUE
+        BUNDLE_EXTENSION "driver"
+        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/ClockProbe/Info.plist.in"
+    )
+
+    add_executable(AES67ClockProbeClient ClockProbe/ClockProbeClient.cpp)
+    target_compile_features(AES67ClockProbeClient PRIVATE cxx_std_17)
+    target_link_libraries(AES67ClockProbeClient PRIVATE
+        "-framework CoreAudio"
+        "-framework CoreFoundation"
+    )
+    message(STATUS "  - AES67ClockProbe + AES67ClockProbeClient (spike S2)")
+endif()
+
 message(STATUS "Tools configured:")
 message(STATUS "  - AES67TestSender")
 message(STATUS "  - AES67TestReceiver")

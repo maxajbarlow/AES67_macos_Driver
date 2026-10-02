@@ -8,6 +8,8 @@
 #include "AES67IOHandler.h"
 #include "SDPParser.h"
 #include "DebugLog.h"
+#include "../NetworkEngine/Clock/DeviceTimeline.h"
+#include "../NetworkEngine/Clock/HostTime.h"
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <utility>
 
@@ -35,7 +37,10 @@ AES67Device::AES67Device(std::shared_ptr<aspl::Context> context)
         .ModelUID = "com.aes67.driver.model",
         .CanBeDefault = true,
         .CanBeDefaultForSystemSounds = false,
-        .SampleRate = kDefaultSampleRate
+        .SampleRate = kDefaultSampleRate,
+        .ZeroTimeStampPeriod = kZeroTimeStampPeriod,
+        .ClockIsStable = true,
+        .ClockAlgorithm = kAudioDeviceClockAlgorithmRaw
     })
     // Initialize ring buffers sized for maximum supported sample rate (384kHz)
     // This ensures buffers are always large enough regardless of sample rate changes
@@ -64,6 +69,9 @@ AES67Device::AES67Device(std::shared_ptr<aspl::Context> context)
 
 void AES67Device::Initialize() {
     AES67_LOG("AES67Device::Initialize() called");
+
+    // Valid clock from the start; restarted again whenever IO starts
+    RestartTimeline(currentSampleRate_.load());
 
     // Initialize streams
     AES67_LOG("AES67Device: Calling InitializeStreams()");
@@ -272,6 +280,9 @@ OSStatus AES67Device::SetNominalSampleRateImpl(Float64 rate) {
 
     currentSampleRate_.store(rate);
 
+    // Media positions are counted in samples, so a new rate is a new timeline
+    RestartTimeline(rate);
+
     // Streams must present the same rate as the device. We are inside a HAL
     // configuration change, so these Async setters apply in place.
     if (inputStream_) {
@@ -283,6 +294,23 @@ OSStatus AES67Device::SetNominalSampleRateImpl(Float64 rate) {
 
     AES67_LOGF("SetNominalSampleRateImpl: Now running at %.0f Hz (ring buffer %.2f ms)",
                rate, (inputBuffers_[0].capacity() * 1000.0) / rate);
+    return kAudioHardwareNoError;
+}
+
+void AES67Device::RestartTimeline(Float64 sampleRate) {
+    std::lock_guard<std::mutex> lock(clockWriteMutex_);
+    mediaClock_.reset(hostTimeNow(), 0,
+                      MediaClock::samplesPerTick(sampleRate, 1.0, HostTimebase::current()));
+}
+
+OSStatus AES67Device::GetZeroTimeStampImpl(UInt32 clientID, Float64* outSampleTime, UInt64* outHostTime,
+                                           UInt64* outSeed) {
+    // RT-SAFE: lock-free snapshot, no allocation
+    const ZeroTimeStamp zts = zeroTimeStampAt(mediaClock_.snapshot(), hostTimeNow(), kZeroTimeStampPeriod);
+    *outSampleTime = zts.sampleTime;
+    *outHostTime = zts.hostTime;
+    *outSeed = zts.seed;
+    (void)clientID;
     return kAudioHardwareNoError;
 }
 
@@ -359,6 +387,9 @@ OSStatus AES67Device::StartIOImpl(UInt32 clientID, UInt32 startCount) {
         }
 
         ioRunning_.store(true);
+
+        // New timeline for this IO session (new seed for the HAL)
+        RestartTimeline(currentSampleRate_.load());
 
         // Start RTP network threads now that a client needs audio
         if (streamManager_) {
