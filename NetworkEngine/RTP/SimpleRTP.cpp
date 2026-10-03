@@ -125,6 +125,11 @@ bool RTPSocket::openReceiver(const char* multicastIP, uint16_t port, const char*
         // Timeout is a safeguard; non-blocking mode is primary mechanism
     }
 
+    // Kernel arrival timestamps in host ticks: receive threads in the driver
+    // host can be scheduled tens of milliseconds late (Docs/Spikes/S1-PTP-Sandbox.md)
+    int timestampOn = 1;
+    setsockopt(sockfd_, SOL_SOCKET, SO_TIMESTAMP_MONOTONIC, &timestampOn, sizeof(timestampOn));
+
     // Increase receive buffer size (4 MB for high channel counts)
     int rcvbuf = 4 * 1024 * 1024;
     setsockopt(sockfd_, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
@@ -211,13 +216,30 @@ ssize_t RTPSocket::send(const RTPPacket& packet) {
     return sendmsg(sockfd_, &msg, 0);
 }
 
-ssize_t RTPSocket::receive(RTPPacket& packet, uint8_t* buffer, size_t bufferSize) {
+ssize_t RTPSocket::receive(RTPPacket& packet, uint8_t* buffer, size_t bufferSize, uint64_t* kernelHostTime) {
     if (sockfd_ < 0 || !isReceiver_) {
         return -1;
     }
 
-    // Receive into buffer
-    ssize_t bytesReceived = recvfrom(sockfd_, buffer, bufferSize, 0, nullptr, nullptr);
+    // Receive into buffer, with the kernel's arrival timestamp
+    struct iovec iov{buffer, bufferSize};
+    char control[CMSG_SPACE(sizeof(uint64_t)) + 64];
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
+    ssize_t bytesReceived = recvmsg(sockfd_, &msg, 0);
+
+    if (kernelHostTime) {
+        *kernelHostTime = 0;
+        for (struct cmsghdr* c = CMSG_FIRSTHDR(&msg); bytesReceived >= 0 && c; c = CMSG_NXTHDR(&msg, c)) {
+            if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_TIMESTAMP_MONOTONIC) {
+                memcpy(kernelHostTime, CMSG_DATA(c), sizeof(uint64_t));
+            }
+        }
+    }
 
     // Handle receive errors and conditions
     if (bytesReceived < 0) {

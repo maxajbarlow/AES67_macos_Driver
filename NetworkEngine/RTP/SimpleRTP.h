@@ -128,7 +128,9 @@ public:
     ssize_t send(const RTPPacket& packet);
 
     // Receive RTP packet
-    ssize_t receive(RTPPacket& packet, uint8_t* buffer, size_t bufferSize);
+    /// @param kernelHostTime If non-null, receives the kernel's arrival time in
+    ///        host ticks (SO_TIMESTAMP_MONOTONIC), or 0 if unavailable.
+    ssize_t receive(RTPPacket& packet, uint8_t* buffer, size_t bufferSize, uint64_t* kernelHostTime = nullptr);
 
     // Close socket
     void close();

@@ -1,39 +1,34 @@
 //
 // DebugLog.h
-// AES67 macOS Driver - Build #7
-// Debug logging utilities
+// AES67 macOS Driver
+// Debug logging to the unified log (os_log).
+//
+// The driver runs sandboxed inside the Core Audio driver host, where writing
+// to a file in /tmp is not permitted, so logs go to the unified log instead:
+//
+//   log show --last 5m --info --predicate 'subsystem == "com.aes67driver"'
+//   log stream --info --predicate 'subsystem == "com.aes67driver"'
+//
+// Not real-time safe: never log from the IO thread.
 //
 
 #pragma once
 
-#include <stdio.h>
-#include <time.h>
-#include <sys/time.h>
+#include <os/log.h>
+#include <cstdarg>
+#include <cstdio>
 
 namespace AES67 {
 namespace Debug {
 
-// Log file location
-inline const char* GetLogPath() {
-    return "/tmp/aes67driver_debug.log";
+inline os_log_t Logger() {
+    static os_log_t log = os_log_create("com.aes67driver", "driver");
+    return log;
 }
 
-// Write timestamped log message
+// Write a log message
 inline void Log(const char* message) {
-    FILE* f = fopen(GetLogPath(), "a");
-    if (f) {
-        struct timeval tv;
-        gettimeofday(&tv, nullptr);
-
-        char timestamp[64];
-        time_t nowtime = tv.tv_sec;
-        struct tm* nowtm = localtime(&nowtime);
-        strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", nowtm);
-
-        fprintf(f, "[%s.%06d] %s\n", timestamp, (int)tv.tv_usec, message);
-        fflush(f);
-        fclose(f);
-    }
+    os_log_info(Logger(), "%{public}s", message);
 }
 
 // Log with formatted string
@@ -44,15 +39,6 @@ inline void LogF(const char* format, ...) {
     vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
     Log(buffer);
-}
-
-// Clear log file
-inline void ClearLog() {
-    FILE* f = fopen(GetLogPath(), "w");
-    if (f) {
-        fprintf(f, "=== AES67 Driver Debug Log ===\n");
-        fclose(f);
-    }
 }
 
 } // namespace Debug

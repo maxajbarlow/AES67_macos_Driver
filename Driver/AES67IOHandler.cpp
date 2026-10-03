@@ -7,6 +7,7 @@
 
 #include "AES67IOHandler.h"
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 namespace AES67 {
@@ -34,8 +35,9 @@ void AES67IOHandler::OnReadClientInput(
     void* bytes,
     UInt32 bytesCount
 ) {
-    // RT-SAFE: Read from ring buffers (Network → Core Audio)
-    // This provides INPUT audio to the client (DAW)
+    // RT-SAFE: Read receive buffers by timestamp (Network → Core Audio)
+    // This provides INPUT audio to the client (DAW). Reads are non-destructive,
+    // so every client reading the same cycle hears the same audio.
     //
     // libASPL calls this with raw bytes in the stream's native format.
     // Our stream format is 32-bit float, so bytesCount = frameCount * channelCount * 4.
@@ -55,19 +57,11 @@ void AES67IOHandler::OnReadClientInput(
         return;
     }
 
-    float* output = static_cast<float*>(bytes);
-
-    // Process in chunks that fit processInput's stack scratch buffer
-    for (UInt32 done = 0; done < frameCount;) {
-        const UInt32 chunk = std::min(frameCount - done, kMaxFramesPerChunk);
-        processInput(output + static_cast<size_t>(done) * channelCount, chunk, channelCount);
-        done += chunk;
-    }
+    processInput(static_cast<float*>(bytes), frameCount, channelCount, timestamp);
 
     (void)client;
     (void)stream;
     (void)zeroTimestamp;
-    (void)timestamp;
 }
 
 void AES67IOHandler::OnWriteMixedOutput(
@@ -109,44 +103,30 @@ void AES67IOHandler::OnWriteMixedOutput(
     (void)timestamp;
 }
 
-void AES67IOHandler::processInput(float* outputData, UInt32 frameCount, UInt32 channelCount) noexcept {
-    // RT-SAFE: Read from input ring buffers (Network → Core Audio)
-    // Network threads write to inputBuffers_
-    // Core Audio reads from inputBuffers_ here
-    //
-    // PERFORMANCE OPTIMIZED: Batch reads per channel instead of per-sample
-    // This reduces ring buffer calls from (frameCount × channelCount) to (channelCount)
+void AES67IOHandler::processInput(float* outputData, UInt32 frameCount, UInt32 channelCount,
+                                  Float64 sampleTime) noexcept {
+    // RT-SAFE: no allocation, no locks. Device time T is media position
+    // (timeline origin + T); playout reads link-offset frames behind it.
+    std::memset(outputData, 0, static_cast<size_t>(frameCount) * channelCount * sizeof(float));
 
-    // Stack-allocated temporary buffer (RT-safe, no heap allocation).
-    // Callers split larger buffers into chunks of at most kMaxFramesPerChunk.
-    float channelBuffer[kMaxFramesPerChunk];
-
-    if (frameCount > kMaxFramesPerChunk) {
-        std::memset(outputData, 0, frameCount * channelCount * sizeof(float));
+    const MediaClock::Snapshot clock = rtInterface_.mediaClock().snapshot();
+    if (!clock.valid()) {
         return;
     }
+    const int64_t readPosition = clock.origin + static_cast<int64_t>(std::floor(sampleTime)) -
+                                 rtInterface_.linkOffsetFrames();
 
-    bool hadUnderrun = false;
-    auto& inputBuffers = rtInterface_.inputBuffers();
-
-    for (size_t ch = 0; ch < channelCount; ++ch) {
-        const size_t samplesRead = inputBuffers[ch].read(channelBuffer, frameCount);
-
-        if (samplesRead < frameCount) {
-            std::memset(&channelBuffer[samplesRead], 0,
-                       (frameCount - samplesRead) * sizeof(float));
-
-            if (!hadUnderrun) {
-                rtInterface_.recordInputUnderrun();
-                hadUnderrun = true;
-            }
+    bool missing = false;
+    rtInterface_.rxRouting().read([&](const RxRouting::Route& route) {
+        // Each stream fills its own device channels; unrouted channels stay silent
+        if (route.buffer->read(readPosition, frameCount, outputData, channelCount, route.deviceChannelStart) <
+            frameCount) {
+            missing = true;
         }
+    });
 
-        // Interleave into output
-        // outputData layout: [ch0_f0, ch1_f0, ..., ch127_f0, ch0_f1, ch1_f1, ...]
-        for (UInt32 frame = 0; frame < frameCount; ++frame) {
-            outputData[frame * channelCount + ch] = channelBuffer[frame];
-        }
+    if (missing) {
+        rtInterface_.recordInputUnderrun();
     }
 }
 

@@ -8,6 +8,8 @@
 // using localhost multicast and real component instances.
 //
 
+#include "RxTestSupport.h"
+#include "../Driver/AudioThreadPriority.h"
 #include "../NetworkEngine/RTP/SimpleRTP.h"
 #include "../NetworkEngine/RTP/RTPReceiver.h"
 #include "../NetworkEngine/RTP/RTPTransmitter.h"
@@ -25,6 +27,7 @@
 #include <atomic>
 #include <cstring>
 #include <numeric>
+#include <algorithm>
 #include <unistd.h>
 
 using namespace AES67;
@@ -132,8 +135,8 @@ static bool sendRawRTPPacket(
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0) return false;
 
-    // Set multicast TTL
-    uint8_t ttl = 1;
+    // Host-only multicast (TTL 0): test traffic never leaves this machine
+    uint8_t ttl = 0;
     setsockopt(sockfd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
 
     // Enable loopback so the sender's own machine receives the packet
@@ -185,107 +188,64 @@ static bool sendRawRTPPacket(
 // ============================================================================
 
 bool testRTPReceiveToRingBuffer() {
-    std::cout << "Test: RTP Receive -> Ring Buffer... ";
+    std::cout << "Test: RTP Receive -> Playout by timestamp... ";
 
-    // Create ring buffers
-    auto deviceBuffers = MakeRingBufferArray<kNumChannels>(kRingBufferSize);
-
-    // Configure a 2-channel L16 RX stream on 239.69.69.1:5004, mapped to device channels 0-1
+    // Configure a 2-channel L16 RX stream, mapped to device channels 0-1
     const uint16_t rxChannels = 2;
     const uint16_t rxPort = 15004; // Use high port to avoid conflicts
     const char* rxAddr = "239.69.69.1";
 
     SDPSession rxSDP = createTestSDP("RX Test", rxAddr, rxPort, rxChannels, "L16");
-    StreamID rxID = StreamID::generate();
-    ChannelMapping rxMapping = createTestMapping(rxID, "RX Test", rxChannels, 0);
+    ChannelMapping rxMapping = createTestMapping(StreamID::generate(), "RX Test", rxChannels, 0);
 
-    // Create receiver
-    RTPReceiver receiver(rxSDP, rxMapping, deviceBuffers);
+    TestSupport::RxHarness harness;
+    RTPReceiver receiver(rxSDP, rxMapping, harness.context());
     TEST_ASSERT(!receiver.isRunning(), "Receiver should not be running before start");
-
-    bool started = receiver.start();
-    TEST_ASSERT(started, "Receiver should start successfully");
+    TEST_ASSERT(receiver.start(), "Receiver should start successfully");
     TEST_ASSERT(receiver.isRunning(), "Receiver should be running after start");
-
-    // Give the receiver threads time to initialize
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-    // Create known audio data: 48 frames, 2 channels
-    // Channel 0: 0.5f for all frames, Channel 1: -0.5f for all frames
+    TestSupport::PlayoutReader reader(harness, {0, 1, 2, 3});
+
+    // 48 frames per packet: channel 0 = 0.5, channel 1 = -0.5
     const size_t frameCount = 48;
-    const size_t totalSamples = frameCount * rxChannels;
-    std::vector<float> audioData(totalSamples);
+    std::vector<float> audioData(frameCount * rxChannels);
     for (size_t f = 0; f < frameCount; ++f) {
-        audioData[f * rxChannels + 0] = 0.5f;   // Channel 0
-        audioData[f * rxChannels + 1] = -0.5f;   // Channel 1
+        audioData[f * rxChannels + 0] = 0.5f;
+        audioData[f * rxChannels + 1] = -0.5f;
     }
+    std::vector<uint8_t> l16Payload(audioData.size() * 2);
+    L16Codec::encode(audioData.data(), audioData.size(), l16Payload.data());
 
-    // Encode to L16
-    std::vector<uint8_t> l16Payload(totalSamples * 2);
-    L16Codec::encode(audioData.data(), totalSamples, l16Payload.data());
-
-    // Send multiple RTP packets with sequential sequence numbers
-    const uint32_t ssrc = 0x12345678;
+    // Real-time pacing: one 1 ms packet per millisecond
     const int numPackets = 20;
+    auto next = std::chrono::steady_clock::now();
     for (int i = 0; i < numPackets; ++i) {
-        bool sent = sendRawRTPPacket(
-            rxAddr, rxPort,
-            static_cast<uint16_t>(i),       // sequence number
-            static_cast<uint32_t>(i * 48),   // timestamp
-            ssrc,
-            PT_AES67_L16,
-            l16Payload.data(),
-            l16Payload.size()
-        );
+        bool sent = sendRawRTPPacket(rxAddr, rxPort, static_cast<uint16_t>(i), static_cast<uint32_t>(i * 48),
+                                     0x12345678, PT_AES67_L16, l16Payload.data(), l16Payload.size());
         TEST_ASSERT(sent, "RTP packet should be sent successfully");
-        // Small delay between packets to simulate real RTP timing
-        std::this_thread::sleep_for(std::chrono::microseconds(500));
+        std::this_thread::sleep_until(next += std::chrono::milliseconds(1));
     }
 
-    // Wait for receiver to process packets through jitter buffer -> ring buffers
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    // Let playout pass the last packet, then see what the IO thread heard
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const auto heard = reader.stopAll();
 
-    // Check that data appeared in the ring buffers at device channels 0 and 1
-    size_t ch0Available = deviceBuffers[0].available();
-    size_t ch1Available = deviceBuffers[1].available();
+    TEST_ASSERT(TestSupport::countNonSilent(heard[0]) == numPackets * frameCount,
+                "Channel 0 should play every received frame");
+    TEST_ASSERT(TestSupport::countNonSilent(heard[1]) == numPackets * frameCount,
+                "Channel 1 should play every received frame");
 
-    TEST_ASSERT(ch0Available > 0, "Channel 0 ring buffer should have data");
-    TEST_ASSERT(ch1Available > 0, "Channel 1 ring buffer should have data");
+    const auto ch0 = TestSupport::heardRegion(heard[0]);
+    const auto ch1 = TestSupport::heardRegion(heard[1]);
+    TEST_ASSERT(std::all_of(ch0.begin(), ch0.end(), [](float v) { return std::abs(v - 0.5f) < 0.01f; }),
+                "Channel 0 samples should be ~0.5f");
+    TEST_ASSERT(std::all_of(ch1.begin(), ch1.end(), [](float v) { return std::abs(v + 0.5f) < 0.01f; }),
+                "Channel 1 samples should be ~-0.5f");
 
-    // Read and verify sample values from channel 0
-    std::vector<float> readBuffer(ch0Available);
-    size_t ch0Read = deviceBuffers[0].read(readBuffer.data(), ch0Available);
-    TEST_ASSERT(ch0Read > 0, "Should read data from channel 0");
+    TEST_ASSERT(TestSupport::countNonSilent(heard[2]) == 0, "Unmapped channel 2 should be silent");
+    TEST_ASSERT(TestSupport::countNonSilent(heard[3]) == 0, "Unmapped channel 3 should be silent");
 
-    // Verify the samples are approximately 0.5 (L16 has limited precision)
-    bool ch0ValuesCorrect = true;
-    for (size_t i = 0; i < ch0Read; ++i) {
-        if (std::abs(readBuffer[i] - 0.5f) > 0.01f) {
-            ch0ValuesCorrect = false;
-            break;
-        }
-    }
-    TEST_ASSERT(ch0ValuesCorrect, "Channel 0 samples should be ~0.5f");
-
-    // Read and verify channel 1
-    readBuffer.resize(ch1Available);
-    size_t ch1Read = deviceBuffers[1].read(readBuffer.data(), ch1Available);
-    TEST_ASSERT(ch1Read > 0, "Should read data from channel 1");
-
-    bool ch1ValuesCorrect = true;
-    for (size_t i = 0; i < ch1Read; ++i) {
-        if (std::abs(readBuffer[i] - (-0.5f)) > 0.01f) {
-            ch1ValuesCorrect = false;
-            break;
-        }
-    }
-    TEST_ASSERT(ch1ValuesCorrect, "Channel 1 samples should be ~-0.5f");
-
-    // Verify unmapped channels remain empty
-    TEST_ASSERT(deviceBuffers[2].available() == 0, "Unmapped channel 2 should be empty");
-    TEST_ASSERT(deviceBuffers[3].available() == 0, "Unmapped channel 3 should be empty");
-
-    // Check receiver statistics
     StatisticsSnapshot stats = receiver.getStatistics();
     TEST_ASSERT(stats.packetsReceived > 0, "Should report received packets");
 
@@ -366,92 +326,54 @@ bool testRingBufferToRTPTransmit() {
 bool testFullLoopback() {
     std::cout << "Test: Full Loopback (TX -> Network -> RX)... ";
 
-    // Create separate buffer arrays for TX and RX
+    // TX reads its ring buffers; RX places by timestamp
     auto txBuffers = MakeRingBufferArray<kNumChannels>(kRingBufferSize);
-    auto rxBuffers = MakeRingBufferArray<kNumChannels>(kRingBufferSize);
+    TestSupport::RxHarness harness;
 
-    // Shared multicast group for loopback
     const char* loopAddr = "239.69.69.3";
     const uint16_t loopPort = 15008;
     const uint16_t channels = 2;
 
-    // TX: reads from txBuffers channels 0-1, sends to multicast
     SDPSession txSDP = createTestSDP("Loopback TX", loopAddr, loopPort, channels, "L24");
-    StreamID txID = StreamID::generate();
-    ChannelMapping txMapping = createTestMapping(txID, "Loopback TX", channels, 0);
-
-    // RX: receives from multicast, writes to rxBuffers channels 0-1
+    ChannelMapping txMapping = createTestMapping(StreamID::generate(), "Loopback TX", channels, 0);
     SDPSession rxSDP = createTestSDP("Loopback RX", loopAddr, loopPort, channels, "L24");
-    StreamID rxID = StreamID::generate();
-    ChannelMapping rxMapping = createTestMapping(rxID, "Loopback RX", channels, 0);
+    ChannelMapping rxMapping = createTestMapping(StreamID::generate(), "Loopback RX", channels, 0);
 
-    // Pre-fill TX buffers with a recognizable pattern
-    // Channel 0: constant 0.25f, Channel 1: constant -0.75f
-    const size_t prefillFrames = 960; // 20 packets
+    // 20 packets of a recognisable pattern; after that the transmitter
+    // underruns and sends silence (AES67 requires continuous packets)
+    const size_t prefillFrames = 960;
     std::vector<float> txCh0(prefillFrames, 0.25f);
     std::vector<float> txCh1(prefillFrames, -0.75f);
     txBuffers[0].write(txCh0.data(), prefillFrames);
     txBuffers[1].write(txCh1.data(), prefillFrames);
 
-    // Start receiver first so it binds to the multicast group
-    RTPReceiver receiver(rxSDP, rxMapping, rxBuffers);
-    bool rxStarted = receiver.start();
-    TEST_ASSERT(rxStarted, "Loopback receiver should start");
+    RTPReceiver receiver(rxSDP, rxMapping, harness.context());
+    TEST_ASSERT(receiver.start(), "Loopback receiver should start");
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    TestSupport::PlayoutReader reader(harness, {0, 1});
 
-    // Give receiver time to bind socket
+    RTPTransmitter transmitter(txSDP, txMapping, txBuffers);
+    TEST_ASSERT(transmitter.start(), "Loopback transmitter should start");
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    transmitter.stop();
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-    // Start transmitter
-    RTPTransmitter transmitter(txSDP, txMapping, txBuffers);
-    bool txStarted = transmitter.start();
-    TEST_ASSERT(txStarted, "Loopback transmitter should start");
-
-    // Let the loopback run for enough time for packets to flow
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-    // Stop both
-    transmitter.stop();
+    const auto heard = reader.stopAll();
     receiver.stop();
 
-    // Verify TX sent data
-    StatisticsSnapshot txStats = transmitter.getStatistics();
-    TEST_ASSERT(txStats.bytesSent > 0, "TX should have sent bytes");
+    TEST_ASSERT(transmitter.getStatistics().bytesSent > 0, "TX should have sent bytes");
+    TEST_ASSERT(receiver.getStatistics().packetsReceived > 0, "RX should have received packets");
 
-    // Verify RX received data
-    StatisticsSnapshot rxStats = receiver.getStatistics();
-    TEST_ASSERT(rxStats.packetsReceived > 0, "RX should have received packets");
-
-    // Verify data arrived in RX ring buffers
-    size_t rxCh0Available = rxBuffers[0].available();
-    size_t rxCh1Available = rxBuffers[1].available();
-    TEST_ASSERT(rxCh0Available > 0, "RX channel 0 should have data");
-    TEST_ASSERT(rxCh1Available > 0, "RX channel 1 should have data");
-
-    // Read received data and verify integrity
-    std::vector<float> rxCh0Data(rxCh0Available);
-    std::vector<float> rxCh1Data(rxCh1Available);
-    rxBuffers[0].read(rxCh0Data.data(), rxCh0Available);
-    rxBuffers[1].read(rxCh1Data.data(), rxCh1Available);
-
-    // Check that received values match sent values within L24 precision
-    // L24 round-trip tolerance: ~0.001
-    bool ch0Correct = true;
-    for (size_t i = 0; i < rxCh0Available; ++i) {
-        if (std::abs(rxCh0Data[i] - 0.25f) > 0.01f) {
-            ch0Correct = false;
-            break;
-        }
-    }
-    TEST_ASSERT(ch0Correct, "Loopback channel 0 data should match (~0.25f)");
-
-    bool ch1Correct = true;
-    for (size_t i = 0; i < rxCh1Available; ++i) {
-        if (std::abs(rxCh1Data[i] - (-0.75f)) > 0.01f) {
-            ch1Correct = false;
-            break;
-        }
-    }
-    TEST_ASSERT(ch1Correct, "Loopback channel 1 data should match (~-0.75f)");
+    // The pattern must arrive intact and in one piece: exactly the 960
+    // pre-filled frames, then the transmitter's silence
+    const auto ch0 = TestSupport::heardRegion(heard[0]);
+    const auto ch1 = TestSupport::heardRegion(heard[1]);
+    TEST_ASSERT(ch0.size() == prefillFrames && ch1.size() == prefillFrames,
+                "Loopback should deliver exactly the 960 pre-filled frames");
+    TEST_ASSERT(std::all_of(ch0.begin(), ch0.end(), [](float v) { return std::abs(v - 0.25f) < 0.001f; }),
+                "Loopback channel 0 data should match (~0.25f)");
+    TEST_ASSERT(std::all_of(ch1.begin(), ch1.end(), [](float v) { return std::abs(v + 0.75f) < 0.001f; }),
+                "Loopback channel 1 data should match (~-0.75f)");
 
     std::cout << "PASS" << std::endl;
     return true;
@@ -462,76 +384,40 @@ bool testFullLoopback() {
 // ============================================================================
 
 bool testUnderrunBehavior() {
-    std::cout << "Test: Underrun Behavior (empty ring buffers -> silence)... ";
+    std::cout << "Test: Underrun Behavior (stream stops -> silence)... ";
 
-    // Create ring buffers - leave them EMPTY (no data written)
+    // Empty ring buffers (still used for TX) read nothing
     auto deviceBuffers = MakeRingBufferArray<kNumChannels>(kRingBufferSize);
+    std::vector<float> readBuffer(48, 999.0f);
+    TEST_ASSERT(deviceBuffers[0].read(readBuffer.data(), 48) == 0, "Read from empty buffer should return 0");
 
-    // Verify all buffers start empty
-    for (size_t ch = 0; ch < kNumChannels; ++ch) {
-        TEST_ASSERT(deviceBuffers[ch].isEmpty(), "All buffers should start empty");
-    }
-
-    // Simulate what the IO handler does when reading from empty input buffers:
-    // It should fill with silence (zeros) and increment underrun counter.
-    //
-    // We test this directly using the ring buffer API since AES67IOHandler
-    // requires libASPL types. The IO handler's processInput() calls
-    // inputBuffers_[ch].read() -- if it returns 0, it zero-fills.
-    const size_t frameCount = 48;
-    std::vector<float> readBuffer(frameCount, 999.0f); // Fill with non-zero sentinel
-
-    // Read from empty ring buffer -- should return 0 (no data available)
-    size_t samplesRead = deviceBuffers[0].read(readBuffer.data(), frameCount);
-    TEST_ASSERT(samplesRead == 0, "Read from empty buffer should return 0");
-
-    // The IO handler would fill with silence here:
-    if (samplesRead < frameCount) {
-        std::memset(&readBuffer[samplesRead], 0, (frameCount - samplesRead) * sizeof(float));
-    }
-
-    // Verify silence was filled
-    bool allZeros = true;
-    for (size_t i = 0; i < frameCount; ++i) {
-        if (readBuffer[i] != 0.0f) {
-            allZeros = false;
-            break;
-        }
-    }
-    TEST_ASSERT(allZeros, "Underrun should result in silence (all zeros)");
-
-    // Now test with an actual RTPReceiver that is connected but gets no data
-    // after the initial packets. The consume loop should increment underruns.
+    // A receiver whose sender stops: playout goes silent at exactly the point
+    // the audio ends, rather than stalling or repeating
     SDPSession sdp = createTestSDP("Underrun RX", "239.69.69.4", 15010, 2, "L16");
-    StreamID id = StreamID::generate();
-    ChannelMapping mapping = createTestMapping(id, "Underrun RX", 2, 0);
+    ChannelMapping mapping = createTestMapping(StreamID::generate(), "Underrun RX", 2, 0);
+    TestSupport::RxHarness harness;
+    RTPReceiver receiver(sdp, mapping, harness.context());
+    TEST_ASSERT(receiver.start(), "Underrun test receiver should start");
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    TestSupport::PlayoutReader reader(harness, 0);
 
-    RTPReceiver receiver(sdp, mapping, deviceBuffers);
-    bool started = receiver.start();
-    TEST_ASSERT(started, "Underrun test receiver should start");
-
-    // Send a few packets to connect, then stop sending
-    const size_t samples = 48 * 2;
-    std::vector<float> audio(samples, 0.1f);
-    std::vector<uint8_t> payload(samples * 2);
-    L16Codec::encode(audio.data(), samples, payload.data());
-
+    std::vector<float> audio(48 * 2, 0.1f);
+    std::vector<uint8_t> payload(audio.size() * 2);
+    L16Codec::encode(audio.data(), audio.size(), payload.data());
+    auto next = std::chrono::steady_clock::now();
     for (int i = 0; i < 3; ++i) {
-        sendRawRTPPacket("239.69.69.4", 15010, i, i * 48, 0xAABBCCDD,
-                         PT_AES67_L16, payload.data(), payload.size());
-        std::this_thread::sleep_for(std::chrono::microseconds(500));
+        sendRawRTPPacket("239.69.69.4", 15010, i, i * 48, 0xAABBCCDD, PT_AES67_L16, payload.data(), payload.size());
+        std::this_thread::sleep_until(next += std::chrono::milliseconds(1));
     }
-
-    // Now stop sending and wait -- the consume loop should detect underruns
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
-    StatisticsSnapshot stats = receiver.getStatistics();
-    // The receiver should have detected underruns in the consume loop
-    // because the jitter buffer becomes empty after the initial packets
-    TEST_ASSERT(stats.underruns > 0 || stats.packetsReceived > 0,
-                "Should detect underruns or have received initial packets");
-
+    const auto heard = reader.stop();
     receiver.stop();
+
+    const auto region = TestSupport::heardRegion(heard);
+    TEST_ASSERT(region.size() == 3 * 48, "The three packets should play as 144 frames");
+    const auto last = std::find_if(heard.rbegin(), heard.rend(), [](float v) { return v != 0.0f; });
+    const size_t trailingSilence = static_cast<size_t>(last - heard.rbegin());
+    TEST_ASSERT(trailingSilence > 48 * 100, "Playout should continue in silence after the sender stops");
 
     std::cout << "PASS" << std::endl;
     return true;
@@ -610,113 +496,55 @@ bool testOverrunBehavior() {
 bool testMultiStreamChannelIsolation() {
     std::cout << "Test: Multi-Stream Channel Isolation... ";
 
-    // Create ring buffers
-    auto deviceBuffers = MakeRingBufferArray<kNumChannels>(kRingBufferSize);
-
-    // Stream A: 2 channels on 239.69.69.5:15012, mapped to device channels 0-1
-    // Stream B: 2 channels on 239.69.69.6:15014, mapped to device channels 4-5
+    // Stream A on device channels 0-1, stream B on 4-5, sharing one device context
     const uint16_t channels = 2;
-
     SDPSession sdpA = createTestSDP("Stream A", "239.69.69.5", 15012, channels, "L16");
-    StreamID idA = StreamID::generate();
-    ChannelMapping mappingA = createTestMapping(idA, "Stream A", channels, 0);
-
+    ChannelMapping mappingA = createTestMapping(StreamID::generate(), "Stream A", channels, 0);
     SDPSession sdpB = createTestSDP("Stream B", "239.69.69.6", 15014, channels, "L16");
-    StreamID idB = StreamID::generate();
-    ChannelMapping mappingB = createTestMapping(idB, "Stream B", channels, 4);
+    ChannelMapping mappingB = createTestMapping(StreamID::generate(), "Stream B", channels, 4);
 
-    // Create two receivers
-    RTPReceiver receiverA(sdpA, mappingA, deviceBuffers);
-    RTPReceiver receiverB(sdpB, mappingB, deviceBuffers);
-
-    bool startedA = receiverA.start();
-    bool startedB = receiverB.start();
-    TEST_ASSERT(startedA, "Receiver A should start");
-    TEST_ASSERT(startedB, "Receiver B should start");
-
-    // Give receivers time to bind
+    TestSupport::RxHarness harness;
+    RTPReceiver receiverA(sdpA, mappingA, harness.context());
+    RTPReceiver receiverB(sdpB, mappingB, harness.context());
+    TEST_ASSERT(receiverA.start(), "Receiver A should start");
+    TEST_ASSERT(receiverB.start(), "Receiver B should start");
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    TestSupport::PlayoutReader reader(harness, {0, 1, 2, 3, 4, 5});
 
-    // Send distinct data to each stream
-    // Stream A: all samples = 0.3f
-    // Stream B: all samples = -0.7f
-    const size_t frameCount = 48;
-    const size_t totalSamples = frameCount * channels;
-
-    std::vector<float> audioA(totalSamples, 0.3f);
-    std::vector<float> audioB(totalSamples, -0.7f);
-
-    std::vector<uint8_t> payloadA(totalSamples * 2);
-    std::vector<uint8_t> payloadB(totalSamples * 2);
-
-    L16Codec::encode(audioA.data(), totalSamples, payloadA.data());
-    L16Codec::encode(audioB.data(), totalSamples, payloadB.data());
+    std::vector<float> audioA(48 * channels, 0.3f);
+    std::vector<float> audioB(48 * channels, -0.7f);
+    std::vector<uint8_t> payloadA(audioA.size() * 2);
+    std::vector<uint8_t> payloadB(audioB.size() * 2);
+    L16Codec::encode(audioA.data(), audioA.size(), payloadA.data());
+    L16Codec::encode(audioB.data(), audioB.size(), payloadB.data());
 
     const int numPackets = 20;
+    auto next = std::chrono::steady_clock::now();
     for (int i = 0; i < numPackets; ++i) {
-        sendRawRTPPacket("239.69.69.5", 15012, i, i * 48, 0x11111111,
-                         PT_AES67_L16, payloadA.data(), payloadA.size());
-        sendRawRTPPacket("239.69.69.6", 15014, i, i * 48, 0x22222222,
-                         PT_AES67_L16, payloadB.data(), payloadB.size());
-        std::this_thread::sleep_for(std::chrono::microseconds(500));
+        sendRawRTPPacket("239.69.69.5", 15012, i, i * 48, 0x11111111, PT_AES67_L16, payloadA.data(), payloadA.size());
+        sendRawRTPPacket("239.69.69.6", 15014, i, i * 48, 0x22222222, PT_AES67_L16, payloadB.data(), payloadB.size());
+        std::this_thread::sleep_until(next += std::chrono::milliseconds(1));
     }
-
-    // Wait for processing
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
-    // Check Stream A data arrived in channels 0-1 only
-    size_t aCh0 = deviceBuffers[0].available();
-    size_t aCh1 = deviceBuffers[1].available();
-    TEST_ASSERT(aCh0 > 0, "Stream A: channel 0 should have data");
-    TEST_ASSERT(aCh1 > 0, "Stream A: channel 1 should have data");
-
-    // Check Stream B data arrived in channels 4-5 only
-    size_t bCh4 = deviceBuffers[4].available();
-    size_t bCh5 = deviceBuffers[5].available();
-    TEST_ASSERT(bCh4 > 0, "Stream B: channel 4 should have data");
-    TEST_ASSERT(bCh5 > 0, "Stream B: channel 5 should have data");
-
-    // Verify isolation: channels 2-3 (between A and B) should be empty
-    TEST_ASSERT(deviceBuffers[2].available() == 0,
-                "Channel 2 (gap between streams) should be empty");
-    TEST_ASSERT(deviceBuffers[3].available() == 0,
-                "Channel 3 (gap between streams) should be empty");
-
-    // Verify Stream A data is correct (~0.3f)
-    std::vector<float> aCh0Data(aCh0);
-    deviceBuffers[0].read(aCh0Data.data(), aCh0);
-    bool aCorrect = true;
-    for (size_t i = 0; i < aCh0; ++i) {
-        if (std::abs(aCh0Data[i] - 0.3f) > 0.02f) {
-            aCorrect = false;
-            break;
-        }
-    }
-    TEST_ASSERT(aCorrect, "Stream A channel 0 values should be ~0.3f");
-
-    // Verify Stream B data is correct (~-0.7f)
-    std::vector<float> bCh4Data(bCh4);
-    deviceBuffers[4].read(bCh4Data.data(), bCh4);
-    bool bCorrect = true;
-    for (size_t i = 0; i < bCh4; ++i) {
-        if (std::abs(bCh4Data[i] - (-0.7f)) > 0.02f) {
-            bCorrect = false;
-            break;
-        }
-    }
-    TEST_ASSERT(bCorrect, "Stream B channel 4 values should be ~-0.7f");
-
-    // Verify no cross-contamination: Stream A data should NOT appear in Stream B channels
-    // and vice versa. We already confirmed the gap channels are empty.
-    // Additionally verify that Stream A's values are distinct from Stream B's
-    TEST_ASSERT(std::abs(0.3f - (-0.7f)) > 0.5f,
-                "Stream A and B values should be clearly distinct");
-
-    // Stop both receivers
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const auto heard = reader.stopAll();
     receiverA.stop();
     receiverB.stop();
-    TEST_ASSERT(!receiverA.isRunning(), "Receiver A should stop");
-    TEST_ASSERT(!receiverB.isRunning(), "Receiver B should stop");
+
+    const size_t expected = numPackets * 48;
+    TEST_ASSERT(TestSupport::countNonSilent(heard[0]) == expected, "Stream A: channel 0 should play every frame");
+    TEST_ASSERT(TestSupport::countNonSilent(heard[1]) == expected, "Stream A: channel 1 should play every frame");
+    TEST_ASSERT(TestSupport::countNonSilent(heard[4]) == expected, "Stream B: channel 4 should play every frame");
+    TEST_ASSERT(TestSupport::countNonSilent(heard[5]) == expected, "Stream B: channel 5 should play every frame");
+    TEST_ASSERT(TestSupport::countNonSilent(heard[2]) == 0, "Channel 2 (gap between streams) should be silent");
+    TEST_ASSERT(TestSupport::countNonSilent(heard[3]) == 0, "Channel 3 (gap between streams) should be silent");
+
+    const auto a = TestSupport::heardRegion(heard[0]);
+    const auto b = TestSupport::heardRegion(heard[4]);
+    TEST_ASSERT(std::all_of(a.begin(), a.end(), [](float v) { return std::abs(v - 0.3f) < 0.02f; }),
+                "Stream A channel 0 values should be ~0.3f");
+    TEST_ASSERT(std::all_of(b.begin(), b.end(), [](float v) { return std::abs(v + 0.7f) < 0.02f; }),
+                "Stream B channel 4 values should be ~-0.7f");
+    TEST_ASSERT(!receiverA.isRunning() && !receiverB.isRunning(), "Receivers should stop");
 
     std::cout << "PASS" << std::endl;
     return true;
@@ -799,83 +627,48 @@ bool testEncodingRoundTrip() {
 bool testChannelMappingThroughReceiver() {
     std::cout << "Test: Channel Mapping Correctness (offset mapping)... ";
 
-    auto deviceBuffers = MakeRingBufferArray<kNumChannels>(kRingBufferSize);
-
-    // Configure a 4-channel stream mapped to device channels 16-19
+    // A 4-channel stream mapped to device channels 16-19
     const uint16_t rxChannels = 4;
     SDPSession sdp = createTestSDP("Mapped RX", "239.69.69.7", 15016, rxChannels, "L16");
-    StreamID id = StreamID::generate();
-    ChannelMapping mapping = createTestMapping(id, "Mapped RX", rxChannels, 16);
+    ChannelMapping mapping = createTestMapping(StreamID::generate(), "Mapped RX", rxChannels, 16);
 
-    RTPReceiver receiver(sdp, mapping, deviceBuffers);
-    bool started = receiver.start();
-    TEST_ASSERT(started, "Mapped receiver should start");
-
+    TestSupport::RxHarness harness;
+    RTPReceiver receiver(sdp, mapping, harness.context());
+    TEST_ASSERT(receiver.start(), "Mapped receiver should start");
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    std::vector<uint32_t> listen;
+    for (uint32_t ch = 0; ch < 24; ++ch) listen.push_back(ch);
+    TestSupport::PlayoutReader reader(harness, listen);
 
-    // Create 4-channel interleaved audio with distinct per-channel values
-    // Channel 0: 0.1, Channel 1: 0.2, Channel 2: 0.3, Channel 3: 0.4
-    const size_t frameCount = 48;
-    const size_t totalSamples = frameCount * rxChannels;
-    std::vector<float> audio(totalSamples);
-    for (size_t f = 0; f < frameCount; ++f) {
-        audio[f * rxChannels + 0] = 0.1f;
-        audio[f * rxChannels + 1] = 0.2f;
-        audio[f * rxChannels + 2] = 0.3f;
-        audio[f * rxChannels + 3] = 0.4f;
+    // Stream channel n carries 0.1 * (n + 1)
+    std::vector<float> audio(48 * rxChannels);
+    for (size_t f = 0; f < 48; ++f) {
+        for (size_t c = 0; c < rxChannels; ++c) audio[f * rxChannels + c] = 0.1f * (c + 1);
     }
+    std::vector<uint8_t> payload(audio.size() * 2);
+    L16Codec::encode(audio.data(), audio.size(), payload.data());
 
-    std::vector<uint8_t> payload(totalSamples * 2);
-    L16Codec::encode(audio.data(), totalSamples, payload.data());
-
-    const int numPackets = 15;
-    for (int i = 0; i < numPackets; ++i) {
-        sendRawRTPPacket("239.69.69.7", 15016, i, i * 48, 0x33333333,
-                         PT_AES67_L16, payload.data(), payload.size());
-        std::this_thread::sleep_for(std::chrono::microseconds(500));
+    auto next = std::chrono::steady_clock::now();
+    for (int i = 0; i < 15; ++i) {
+        sendRawRTPPacket("239.69.69.7", 15016, i, i * 48, 0x33333333, PT_AES67_L16, payload.data(), payload.size());
+        std::this_thread::sleep_until(next += std::chrono::milliseconds(1));
     }
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
-    // Verify data landed in device channels 16-19
-    TEST_ASSERT(deviceBuffers[16].available() > 0, "Device channel 16 should have data");
-    TEST_ASSERT(deviceBuffers[17].available() > 0, "Device channel 17 should have data");
-    TEST_ASSERT(deviceBuffers[18].available() > 0, "Device channel 18 should have data");
-    TEST_ASSERT(deviceBuffers[19].available() > 0, "Device channel 19 should have data");
-
-    // Verify channels 0-15 and 20+ are empty
-    for (int ch = 0; ch < 16; ++ch) {
-        TEST_ASSERT(deviceBuffers[ch].available() == 0,
-                    "Channels below mapping range should be empty");
-    }
-    for (int ch = 20; ch < 24; ++ch) {
-        TEST_ASSERT(deviceBuffers[ch].available() == 0,
-                    "Channels above mapping range should be empty");
-    }
-
-    // Verify per-channel data correctness
-    auto verifyChannel = [&](size_t devCh, float expectedVal, const char* desc) -> bool {
-        size_t avail = deviceBuffers[devCh].available();
-        std::vector<float> data(avail);
-        deviceBuffers[devCh].read(data.data(), avail);
-        for (size_t i = 0; i < avail; ++i) {
-            if (std::abs(data[i] - expectedVal) > 0.02f) {
-                std::cerr << "FAIL: " << desc << " (sample " << i
-                          << " = " << data[i] << ", expected ~" << expectedVal << ")" << std::endl;
-                testsFailed++;
-                return false;
-            }
-        }
-        testsPassed++;
-        return true;
-    };
-
-    verifyChannel(16, 0.1f, "Device ch16 should have stream ch0 data (~0.1)");
-    verifyChannel(17, 0.2f, "Device ch17 should have stream ch1 data (~0.2)");
-    verifyChannel(18, 0.3f, "Device ch18 should have stream ch2 data (~0.3)");
-    verifyChannel(19, 0.4f, "Device ch19 should have stream ch3 data (~0.4)");
-
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const auto heard = reader.stopAll();
     receiver.stop();
+
+    for (uint32_t ch = 0; ch < 24; ++ch) {
+        const bool mapped = ch >= 16 && ch < 20;
+        if (!mapped) {
+            TEST_ASSERT(TestSupport::countNonSilent(heard[ch]) == 0, "Channels outside the mapping should be silent");
+            continue;
+        }
+        const float expected = 0.1f * (ch - 16 + 1);
+        const auto region = TestSupport::heardRegion(heard[ch]);
+        TEST_ASSERT(region.size() == 15 * 48, "Mapped channels should play every frame");
+        TEST_ASSERT(std::all_of(region.begin(), region.end(), [expected](float v) { return std::abs(v - expected) < 0.02f; }),
+                    "Device channel " << ch << " should carry stream channel " << ch - 16);
+    }
 
     std::cout << "PASS" << std::endl;
     return true;
@@ -888,58 +681,37 @@ bool testChannelMappingThroughReceiver() {
 bool testReceiverStatistics() {
     std::cout << "Test: Receiver Statistics Accuracy... ";
 
-    auto deviceBuffers = MakeRingBufferArray<kNumChannels>(kRingBufferSize);
-
     SDPSession sdp = createTestSDP("Stats RX", "239.69.69.8", 15018, 2, "L16");
-    StreamID id = StreamID::generate();
-    ChannelMapping mapping = createTestMapping(id, "Stats RX", 2, 0);
-
-    RTPReceiver receiver(sdp, mapping, deviceBuffers);
+    ChannelMapping mapping = createTestMapping(StreamID::generate(), "Stats RX", 2, 0);
+    TestSupport::RxHarness harness;
+    RTPReceiver receiver(sdp, mapping, harness.context());
     receiver.start();
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-    // Prepare L16 payload for 2 channels, 48 frames
-    const size_t totalSamples = 48 * 2;
-    std::vector<float> audio(totalSamples, 0.0f);
-    std::vector<uint8_t> payload(totalSamples * 2);
-    L16Codec::encode(audio.data(), totalSamples, payload.data());
+    std::vector<float> audio(48 * 2, 0.0f);
+    std::vector<uint8_t> payload(audio.size() * 2);
+    L16Codec::encode(audio.data(), audio.size(), payload.data());
 
-    // Send 10 packets with sequential sequence numbers
-    for (int i = 0; i < 10; ++i) {
-        sendRawRTPPacket("239.69.69.8", 15018, i, i * 48, 0x44444444,
-                         PT_AES67_L16, payload.data(), payload.size());
-        std::this_thread::sleep_for(std::chrono::microseconds(800));
+    // Packets 0-9, then 10-14 are lost and 15 arrives on schedule
+    auto next = std::chrono::steady_clock::now();
+    for (int i = 0; i < 16; ++i) {
+        if (i < 10 || i == 15) {
+            sendRawRTPPacket("239.69.69.8", 15018, i, i * 48, 0x44444444, PT_AES67_L16, payload.data(), payload.size());
+        }
+        std::this_thread::sleep_until(next += std::chrono::milliseconds(1));
     }
-
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     StatisticsSnapshot stats = receiver.getStatistics();
-
-    // Should have received all 10 packets
-    TEST_ASSERT(stats.packetsReceived >= 8,
-                "Should receive most of the 10 packets sent");
-
-    // Bytes received should be > 0
-    TEST_ASSERT(stats.bytesReceived > 0, "Should track bytes received");
-
-    // No malformed packets (we sent valid ones)
+    TEST_ASSERT(stats.packetsReceived == 11, "Should receive all 11 packets sent");
+    TEST_ASSERT(stats.bytesReceived == 11 * payload.size(), "Should count every payload byte");
     TEST_ASSERT(stats.malformedPackets == 0, "Should have no malformed packets");
-
-    // Now send a gap: skip sequence numbers 10-14, send 15
-    sendRawRTPPacket("239.69.69.8", 15018, 15, 15 * 48, 0x44444444,
-                     PT_AES67_L16, payload.data(), payload.size());
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-    StatisticsSnapshot stats2 = receiver.getStatistics();
-    // The receiver should detect the gap (packets 10-14 lost)
-    TEST_ASSERT(stats2.packetsLost > 0 || stats2.packetsReceived > stats.packetsReceived,
-                "Should detect gap or receive the new packet");
+    TEST_ASSERT(stats.packetsLost == 5, "Should count exactly the 5 lost packets");
+    TEST_ASSERT(receiver.getPlacementStatistics().lateDrops == 0, "On-time packets should not be late");
 
     receiver.stop();
-
-    // Test reset functionality
     receiver.resetStatistics();
+    TEST_ASSERT(receiver.getStatistics().packetsReceived == 0, "Reset should clear statistics");
 
     std::cout << "PASS" << std::endl;
     return true;
@@ -984,6 +756,10 @@ bool testTransmitterContinuousFlow() {
 // ============================================================================
 
 int main() {
+    // Send test packets like a hardware sender: a starved test thread would
+    // send them after their timestamps, which the receiver rightly drops as late
+    AudioThreadPriority::configureForRealTime();
+
     std::cout << "========================================" << std::endl;
     std::cout << "AES67 Integration Tests: Full Audio Path" << std::endl;
     std::cout << "========================================" << std::endl;

@@ -121,6 +121,28 @@ Selection is automatic with a configurable preference, and switching sources is 
 
 ### PTP slave (new)
 
+#### Target network (from the Riedel Artist SIC AES67 card's PTP settings, October 2026)
+
+| Setting | Value | What the slave must do |
+|---|---|---|
+| PTP mode | Hybrid | Sync, Follow_Up and Announce arrive by multicast; **Delay_Req is sent unicast to the master's address** (the source of its Sync/Announce), and Delay_Resp arrives unicast on port 320. Keep multicast Delay_Req as an option for non-hybrid networks. |
+| Role | TimeReceiver (slave) | The Riedel is not the grandmaster; a separate device on the network is. |
+| Domain | 0 | The default. |
+| Announce interval / receipt timeout | 1 (2 s) / 3 | Derive the timeout from the received `logAnnounceInterval` (here 6 s), never a fixed value. |
+| Sync interval / delay request interval | 0 / 0 (1 per second) | These are the Riedel's own port settings; the grandmaster sets the real rates, which spike S3 must measure. If Sync really is 1 Hz, the servo gets one measurement per second and needs a longer averaging window than an 8 Hz network. |
+| Media 1 / Media 2 | Shared PTP settings | Suggests dual networks (SMPTE ST 2022-7). The driver uses one network; 2022-7 redundancy is out of scope for step 2. |
+
+From a SmartPanel's AES67 tab (RSP-1232HL):
+
+| Setting | Value | Implication |
+|---|---|---|
+| Packet time | 1.000 ms | 48 frames at 48 kHz, matching the Riedel SDP in `Docs/Examples/`. |
+| Receive buffer | 8.000 ms (8 x packet time) | The network's receive latency convention; basis for the default link offset (decision 1). Also the arrival window our TX packets must meet in phase 5. |
+| Play mode | synton | Unconfirmed reading: syntonised playout (frequency-locked, latency set by the buffer) rather than absolute time alignment. If so, TX interop needs the right rate more than PTP phase, which phase 3's recovered clock already provides. Check Riedel's documentation. |
+| Media 1 address | 10.46.70.211, port 6060 | Same address range as the development Mac, but during spike S1 that Mac heard no PTP on 224.0.1.129, so S3 needs a port on the PTP network. |
+
+The card also has an NMOS tab, so streams there may be managed through NMOS (IS-04/IS-05) rather than SAP or SDP files. That is a candidate for after step 2.
+
 - Reuse from `PTPSlave`: socket setup (plus `SO_TIMESTAMP_MONOTONIC`), header and Announce field parsing, Delay_Req builder, requesting-port matching.
 - Write fresh:
   - Delay_Resp on the general port.
@@ -176,11 +198,38 @@ Each phase is a separate PR, test-first, and leaves the driver working.
   - **Real HAL:** with the installed driver, the client (`AES67ClockProbeClient --uid com.aes67.driver.device --constant 0 --no-ramp --expect-level 0.25`) measured the rate at +0.0 ppm (HAL actual rate 48000.000 Hz), with 0 timeline jumps and 0 overloads in 2345 callbacks.
   - **Receive audio:** host-only test packets through a receive-only config arrived unbroken: 100.0% of 1,200,640 input samples were at the expected level.
 
-### Phase 2: RX by timestamp
+### Phase 2: RX by timestamp (done; verified in the real HAL)
 
 - Receive thread decodes into PlayoutBuffers; IO handler reads by sample time with link offset; consume thread and jitter buffer deleted; link offset reported as latency.
 - Add a tone-continuity analyser tool (extend `QuickCapture`) for long hardware captures.
 - Exit: simulated two-stream alignment exact; loss, restart, outage and second-sender tests pass against the new design; two-client reads identical.
+- Implementation:
+  - `RtpPlacement` maps RTP timestamps (minus the SDP mediaclk offset) to media positions through one device-wide `NetworkTimeMapping`, so streams on the same network timeline stay sample-aligned.
+  - `RxRouting` gives the IO thread a lock-free table of receive buffers, with reclamation so a buffer is never freed during a read.
+  - Arrival times are kernel timestamps (`SO_TIMESTAMP_MONOTONIC`).
+  - The consume thread, `LockFreeCircularJitterBuffer` family, `RateController` and `NetworkEngine/Resampling` were deleted.
+  - Driver logging moved to the unified log (`com.aes67driver`), because the sandbox blocks the old `/tmp` file log.
+  - The tone-continuity check became `AES67ClockProbeClient --sawtooth`.
+- Burst finding:
+  - **What the real HAL showed:** a sender stall followed by a catch-up burst re-anchored the timeline twice: late, then early.
+  - **Fix:** a re-anchor now needs a run of at least half a link offset whose margins agree to within a quarter of a link offset. A burst's margins grow by a packet each, so it fails that test. Transient stalls drop their late packets but no longer move the timeline.
+  - **Second finding (2026-10-03):** the HAL check still re-anchored about twice a minute with the Python test sender. Recording its packets' kernel arrival times showed why. After a 15 ms stall, the sender sent its next 4 packets at normal pace, all 15 ms late, before bursting the rest. Four packets with agreeing margins passed the rule above, so the timeline moved, and the catch-up then moved it back. With a real-time priority sender, the same run had no re-anchors.
+  - **Fix:** a timeline change persists; a stall does not. A confirming run must now also cover 50 ms of media (`RtpPlacement::kSourceSwitchSeconds`). A sender restart or SSRC change now plays up to 50 ms more silence before it is followed. `TestRxTimestamp` replays the observed stall (15 ms, 4 steady packets) and a 22 ms, 10-packet stall; both re-anchored twice before the fix.
+- Real HAL so far (installed driver, two host-only streams, two client processes):
+  - input latency reported as 384 frames (8 ms)
+  - +0.0 ppm, 0 timeline jumps, 0 overloads
+  - **identical input for two simultaneous clients in all 1876 shared IO cycles**
+  - streams sample-aligned except around the burst events above
+- Real HAL, 2026-10-03, phase 3 build (which includes this phase), two host-only streams from a sender 200 ppm fast, two clients, real-time priority sender:
+  - 0 re-anchors, 0 timeline jumps, 0 overloads
+  - test sawtooth continuous: 0 breaks in 2.88 M samples
+  - two streams sample-aligned: 0 of 2.88 M frames differ
+  - two clients identical in all 1876 shared IO cycles
+- Real HAL with the 50 ms rule, 2026-10-03, using the Python sender as a natural stall generator:
+  - 120 s run: 0 re-anchors, 0 sawtooth breaks, 0 timeline jumps, two clients identical in all 1878 shared cycles
+  - 60 s run with kernel arrival timestamps recorded: the sender stalled beyond the 8 ms link offset 14 times (worst 23.5 ms), still with 0 re-anchors and 0 breaks. Packets later than the link offset play as silence. The two streams differ in a few hundred frames, consistent with a stall falling between the sender's packets for the two streams.
+- Pending:
+  - **Interface re-resolution.** The receive interface address is resolved once, so a DHCP renewal or Wi-Fi roam breaks receivers until coreaudiod restarts.
 
 ### Phase 3: Stream-recovered clock
 
@@ -196,7 +245,7 @@ Each phase is a separate PR, test-first, and leaves the driver working.
   - Servo simulation with jittered, skewed timestamps.
   - Loopback against a scripted PTP master.
   - Hardware run against the Riedel or a Dante device as grandmaster.
-- Exit: lock within 30 s; criterion 2.
+- Exit: frequency lock within about 30 s and phase settled within about 2 minutes at a 1 Hz Sync rate (faster on faster networks); hybrid-mode unicast Delay_Req verified against the target network; criterion 2.
 
 ### Phase 5: TX on the media clock
 
@@ -209,7 +258,7 @@ Each phase is a separate PR, test-first, and leaves the driver working.
 
 - **S1, PTP inside the sandbox: resolved, PTP runs in-process.** Inside the driver host (`_coreaudiod`, macOS 26.0.1) the probe bound UDP 319/320, joined 224.0.1.129, sent, and received with kernel monotonic timestamps, with or without `AudioServerPlugIn_Network`. Host threads were scheduled up to 31.7 ms late, so kernel timestamps are mandatory. Details: [Spikes/S1-PTP-Sandbox.md](Spikes/S1-PTP-Sandbox.md).
 - **S2, HAL acceptance: resolved, Core Audio follows the model exactly.** With the Raw algorithm and a 16384-frame period, the measured rate matched a +300 ppm model to 0.1 ppm, tracked a +300 to -300 ppm ramp within 3 ppm (re-anchoring every 100 ms), and a phase step with a new seed produced exactly one clean timeline jump with no overloads in 3284 IO cycles. Core Audio adds no smoothing under Raw, so the servo must publish a smooth rate and slew small phase errors rather than step. Details: [Spikes/S2-HAL-Clock.md](Spikes/S2-HAL-Clock.md).
-- **S3, PTP accuracy.** Log offset and path-delay statistics against a real grandmaster to set link offset defaults and lock thresholds.
+- **S3, PTP accuracy.** Log offset and path-delay statistics against a real grandmaster to set link offset defaults and lock thresholds. On the target network this means the network's grandmaster, not the Riedel (a TimeReceiver). Also measure the actual Sync, Announce and Delay_Resp rates, and confirm the master answers unicast Delay_Req (hybrid mode).
 
 ## Risks
 
@@ -220,7 +269,7 @@ Each phase is a separate PR, test-first, and leaves the driver working.
 
 ## Decisions needed
 
-1. **Default link offset.** Proposed 2 ms, configurable 0.25-20 ms. What does the Riedel setup use?
+1. **Default link offset: decided, 8 x packet time (8 ms at 1 ms packets), configurable 0.25-20 ms.** Matches the target network's receive buffer convention, favouring robustness on a busy network; revisit after spike S3 measures jitter and PTP accuracy.
 2. **Stream-recovered mode (Phase 3).** Recommended, because it delivers drift-free RX from the Riedel before PTP lands.
 3. **PTP placement.** Resolved by spike S1: in-process.
 4. **ASRC.** Defer to Phase 6, choose the library then.

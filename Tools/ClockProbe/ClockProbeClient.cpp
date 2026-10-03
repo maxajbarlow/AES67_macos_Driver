@@ -11,6 +11,11 @@
 //   --constant <ppm>      expect a constant rate offset instead of the S2 schedule
 //   --no-ramp             skip the S2 input ramp check
 //   --expect-level <v>    report the share of input channel 0 samples equal to v
+//   --sawtooth <period> <amplitude>
+//                         check input channel 0 is a continuous sawtooth (no
+//                         dropped or repeated samples once it has started)
+//   --compare <a> <b>     count frames where input channels a and b differ
+//   --dump <path>         write "sampleTime checksum" per callback, to compare clients
 //
 
 #include <CoreAudio/CoreAudio.h>
@@ -23,6 +28,7 @@
 #include <cstdlib>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -37,6 +43,11 @@ struct Options {
     bool rampCheck = true;
     bool levelCheck = false;
     float expectedLevel = 0.0f;
+    double sawtoothPeriod = 0.0;
+    double sawtoothAmplitude = 0.0;
+    int compareA = -1;
+    int compareB = -1;
+    const char* dumpPath = nullptr;
 } options;
 
 struct Callback {
@@ -53,6 +64,15 @@ struct State {
     std::atomic<uint32_t> overloads{0};
     std::atomic<uint64_t> levelMatches{0};
     std::atomic<uint64_t> levelSamples{0};
+    // --sawtooth
+    float lastSawtooth = 0.0f;
+    std::atomic<uint64_t> sawtoothSamples{0};
+    std::atomic<uint64_t> sawtoothBreaks{0};
+    // --compare
+    std::atomic<uint64_t> compareFrames{0};
+    std::atomic<uint64_t> compareMismatches{0};
+    // --dump
+    std::vector<std::pair<double, uint64_t>> checksums;
 };
 
 double ticksToSeconds(uint64_t ticks) {
@@ -90,6 +110,37 @@ OSStatus ioProc(AudioObjectID, const AudioTimeStamp*, const AudioBufferList* inp
         state->levelMatches.fetch_add(matches, std::memory_order_relaxed);
         state->levelSamples.fetch_add(frames, std::memory_order_relaxed);
     }
+    if (options.sawtoothPeriod > 0.0) {
+        // Silence before the stream starts or after it ends is not checked
+        const float step = static_cast<float>(options.sawtoothAmplitude / options.sawtoothPeriod);
+        for (UInt32 i = 0; i < frames; ++i) {
+            const float sample = samples[i * channels];
+            if (sample != 0.0f && state->lastSawtooth != 0.0f) {
+                float delta = sample - state->lastSawtooth;
+                if (delta < 0.0f) delta += static_cast<float>(options.sawtoothAmplitude);  // wrap
+                state->sawtoothSamples.fetch_add(1, std::memory_order_relaxed);
+                if (std::fabs(delta - step) > step * 0.01f) {
+                    state->sawtoothBreaks.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            state->lastSawtooth = sample;
+        }
+    }
+    if (options.compareA >= 0) {
+        uint64_t mismatches = 0;
+        for (UInt32 i = 0; i < frames; ++i) {
+            if (samples[i * channels + options.compareA] != samples[i * channels + options.compareB]) ++mismatches;
+        }
+        state->compareMismatches.fetch_add(mismatches, std::memory_order_relaxed);
+        state->compareFrames.fetch_add(frames, std::memory_order_relaxed);
+    }
+    if (options.dumpPath && index < state->checksums.size()) {
+        uint64_t hash = 1469598103934665603ULL;  // FNV-1a over the whole buffer
+        const auto* bytes = static_cast<const uint8_t*>(input->mBuffers[0].mData);
+        for (UInt32 b = 0; b < input->mBuffers[0].mDataByteSize; ++b) hash = (hash ^ bytes[b]) * 1099511628211ULL;
+        state->checksums[index] = {inputTime->mSampleTime, hash};
+    }
+
     bool continuous = true;
     double previous = state->lastRampValue;
     for (UInt32 i = 0; i < frames && options.rampCheck; ++i) {
@@ -158,6 +209,9 @@ int main(int argc, char* argv[]) {
         else if (arg == "--constant" && i + 1 < argc) { options.constantSchedule = true; options.constantPpm = std::atof(argv[++i]); }
         else if (arg == "--no-ramp") options.rampCheck = false;
         else if (arg == "--expect-level" && i + 1 < argc) { options.levelCheck = true; options.expectedLevel = static_cast<float>(std::atof(argv[++i])); }
+        else if (arg == "--sawtooth" && i + 2 < argc) { options.sawtoothPeriod = std::atof(argv[++i]); options.sawtoothAmplitude = std::atof(argv[++i]); }
+        else if (arg == "--compare" && i + 2 < argc) { options.compareA = std::atoi(argv[++i]); options.compareB = std::atoi(argv[++i]); }
+        else if (arg == "--dump" && i + 1 < argc) options.dumpPath = argv[++i];
     }
 
     const AudioObjectID device = findDevice();
@@ -168,6 +222,23 @@ int main(int argc, char* argv[]) {
 
     State state;
     state.callbacks.resize(20000);
+    state.checksums.resize(20000);
+
+    // Input latency as reported to clients (the driver reports its link offset)
+    {
+        AudioObjectPropertyAddress streamsAddress{kAudioDevicePropertyStreams, kAudioObjectPropertyScopeInput,
+                                                  kAudioObjectPropertyElementMain};
+        AudioStreamID inputStream = kAudioObjectUnknown;
+        UInt32 size = sizeof(inputStream);
+        if (AudioObjectGetPropertyData(device, &streamsAddress, 0, nullptr, &size, &inputStream) == noErr) {
+            UInt32 latency = 0;
+            size = sizeof(latency);
+            AudioObjectPropertyAddress latencyAddress{kAudioStreamPropertyLatency, kAudioObjectPropertyScopeGlobal,
+                                                      kAudioObjectPropertyElementMain};
+            AudioObjectGetPropertyData(inputStream, &latencyAddress, 0, nullptr, &size, &latency);
+            std::printf("input stream latency: %u frames\n", latency);
+        }
+    }
 
     AudioObjectPropertyAddress overloadAddress{kAudioDeviceProcessorOverload, kAudioObjectPropertyScopeGlobal,
                                                kAudioObjectPropertyElementMain};
@@ -236,9 +307,30 @@ int main(int argc, char* argv[]) {
                     100.0 * state.levelMatches.load() / std::max<uint64_t>(1, state.levelSamples.load()),
                     static_cast<unsigned long long>(state.levelSamples.load()));
     }
+    bool audioOk = true;
+    if (options.sawtoothPeriod > 0.0) {
+        std::printf("sawtooth on channel 0: %llu samples checked, %llu breaks\n",
+                    static_cast<unsigned long long>(state.sawtoothSamples.load()),
+                    static_cast<unsigned long long>(state.sawtoothBreaks.load()));
+        audioOk = audioOk && state.sawtoothSamples.load() > 0 && state.sawtoothBreaks.load() == 0;
+    }
+    if (options.compareA >= 0) {
+        std::printf("channels %d and %d: %llu of %llu frames differ\n", options.compareA, options.compareB,
+                    static_cast<unsigned long long>(state.compareMismatches.load()),
+                    static_cast<unsigned long long>(state.compareFrames.load()));
+        audioOk = audioOk && state.compareMismatches.load() == 0;
+    }
+    if (options.dumpPath) {
+        if (FILE* f = std::fopen(options.dumpPath, "w")) {
+            for (size_t i = 0; i < n; ++i) {
+                std::fprintf(f, "%.0f %llu\n", state.checksums[i].first, static_cast<unsigned long long>(state.checksums[i].second));
+            }
+            std::fclose(f);
+        }
+    }
     const size_t allowedJumps = options.constantSchedule ? 0 : 1;
     const bool pass = worstError < 20.0 && timelineJumps <= allowedJumps && rampBreaks <= allowedJumps &&
-                      state.overloads.load() == 0;
+                      state.overloads.load() == 0 && audioOk;
     std::printf("%s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }

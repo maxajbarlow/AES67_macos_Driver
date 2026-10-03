@@ -130,8 +130,7 @@ set(NETWORK_SOURCES
     NetworkEngine/RTP/SimpleRTP.cpp
     NetworkEngine/RTP/RTPReceiver.cpp
     NetworkEngine/RTP/RTPTransmitter.cpp
-    NetworkEngine/RTP/LockFreeCircularJitterBuffer.cpp
-    NetworkEngine/RTP/LockFreePacketPool.cpp
+    NetworkEngine/RTP/RtpPlacement.cpp
     NetworkEngine/RTP/BufferStatusMonitor.cpp
     NetworkEngine/Clock/TimestampedAudioBuffer.cpp
     NetworkEngine/PTP/PTPClock.cpp
@@ -139,10 +138,6 @@ set(NETWORK_SOURCES
     NetworkEngine/PTP/PTPSlave.cpp
     NetworkEngine/PTP/CustomSys.cpp
     NetworkEngine/PTP/PhaseLockedLoop.cpp
-    NetworkEngine/Resampling/Resampler.cpp
-    NetworkEngine/Resampling/ClockAdjustmentController.cpp
-    NetworkEngine/Resampling/SmoothedPIController.cpp
-    NetworkEngine/Resampling/SampleRateAdapter.cpp
     NetworkEngine/NetworkUtils.cpp
     NetworkEngine/NetworkErrorHandler.cpp
     NetworkEngine/NetworkInterfaceDetection.cpp
