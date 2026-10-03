@@ -26,6 +26,7 @@ A work-in-progress open-source virtual audio driver for macOS that aims to provi
 
 - Transmit on the media clock: TX streams send continuously whenever configured (silence when no app is playing), follow the recovered clock, and loop back through the driver's own receiver sample-exact.
 - SAP announcements (RFC 2974): each TX stream is announced while configured and deleted when removed, so receivers that discover streams by SAP (Dante Controller among them) can list it. Until PTP (phase 4) the announcement signals the Mac's own clock (`ts-refclk:localmac=`), so PTP-aligned receivers such as Dante will list the stream but not play it yet.
+- Network changes: streams rejoin within about a second when their interface gets a new address, goes down and up, is replugged, or "auto" comes to mean a different interface. Tested with scripted interface changes and real binding on `lo0`, not yet with a real DHCP renewal or Wi-Fi roam.
 
 **Next:** repeat the RX test on the Riedel with the rebuilt path, for 1 hour with a test tone.
 
@@ -79,8 +80,8 @@ AES67 needs every device on one PTP-derived media clock. Step 2 replaces the dri
 - Streams bind to a specific network interface (prevents duplicate packets on multi-NIC machines), joining and sending by interface index so a new address does not break them
 - Receive threads follow the Core Audio IO lifecycle (no receive work while no client is running); transmit threads run whenever a TX stream is configured
 - An earlier PTP slave implementation exists but is not functional (see Known Limitations); step 2 phase 4 replaces it
-- Test sender/receiver tools exercise the network path over loopback
-- 18 tests (SDP parser, channel mapper, ring buffer, RTP receiver, RTP transmitter, PTP clock, stream manager, multi-stream, integration audio path, critical-path regressions, clock foundations, RX timestamp placement, clock recovery, SAP listener, SAP announcer, network monitor, TX on the media clock, and a check of the driver bundle's code signature), all passing in Debug and Release builds. Tests that transmit or announce use TTL 0, so nothing leaves the machine. The clock, receive and transmit suites also run clean under ThreadSanitizer, and key tests are checked by mutation (deliberately breaking the code and confirming a test fails)
+- Test tools: `AES67TestSender` sends a sine-wave stream with SAP announcements on the default interface (TTL 32, so it puts a stream on the network; default 239.1.1.1:5004, the built-in test RX stream), and `AES67TestReceiver` receives and checks one
+- 18 tests (SDP parser, channel mapper, ring buffer, RTP receiver, RTP transmitter, PTP clock, stream manager, multi-stream, integration audio path, critical-path regressions, clock foundations, RX timestamp placement, clock recovery, SAP listener, SAP announcer, network monitor, TX on the media clock, and a check of the driver bundle's code signature), all passing in Debug and Release builds. Tests that transmit or announce use TTL 0 or the loopback interface, so nothing leaves the machine. The clock, receive, transmit and network-monitor suites also run clean under ThreadSanitizer, and key tests are checked by mutation (deliberately breaking the code and confirming a test fails)
 - IO handler benchmark exists for real-time performance characterisation
 - Doxygen API documentation can be generated via `make docs`
 - Flexible configuration: supports interface name ("en0") or IP address, auto-detects if not specified. The setting is kept as written and resolved each time a stream starts, and streams rejoin within about a second when their interface changes (new DHCP address, link down and up, a replugged adapter, or a different primary interface)
@@ -128,6 +129,7 @@ The driver reads `streams.json` from `$AES67_CONFIG_PATH`, `~/Library/Applicatio
 
 ### Other Known Gaps
 - Dante receivers subscribe only to AES67 multicast inside the prefix in their AES67 settings (default 239.69.0.0/16). The driver logs a warning for TX streams outside it.
+- A stream whose interface is set as an IPv4 address works only while an interface holds that address. Set an interface name (for example `"en0"`) so the stream survives DHCP changes.
 - A configured TX stream wakes its transmit thread once per packet (every 1 ms at the default packet time), even when no app is playing.
 - The SDP parser truncates fractional `a=ptime` values (0.125, 0.25, 0.333 ms) and defaults a missing channel count to 2 rather than 1.
 - The RTP parser ignores CSRC, header extension and padding fields.
@@ -160,12 +162,13 @@ AES67Driver/
 │   ├── PTP/                 # Earlier PTP code, not functional (to be replaced)
 │   │   └── ptpd/            # Vendored ptpd source (not used)
 │   ├── StreamManager        # RX/TX stream lifecycle: receivers follow Core Audio IO, transmitters run while configured
+│   ├── NetworkMonitor       # Restarts a stream's sockets when its interface changes (DHCP, link, replug)
 │   └── Discovery/           # SAP (RFC 2974): SAPListener discovers streams, SAPAnnouncer announces TX streams
 ├── Shared/                  # Common components
 │   ├── RingBuffer.hpp       # Lock-free SPSC ring buffer
 │   └── Types.h              # Common data structures
 ├── Tools/                   # Test utilities
-│   ├── AES67TestSender      # Sends RTP test packets over loopback
+│   ├── AES67TestSender      # Sends a test stream and SAP announcements on the network (TTL 32)
 │   ├── AES67TestReceiver    # Receives and validates RTP packets
 │   ├── QuickCapture         # Records from a Core Audio device, reports non-silence
 │   ├── ClockProbe/          # Spike S2 probe; client measures a device's clock and checks input continuity
@@ -187,14 +190,14 @@ These describe what the code is written to target, not what has been verified wi
 | RTP RX Path | Multicast join, decode, placement by RTP timestamp | Verified in Core Audio with test senders; earlier design verified with Riedel Artist |
 | RTP TX Path | Encode, multicast send on the media clock | Continuous; loopback sample-exact; follows the recovered clock; not yet verified in Core Audio or with hardware |
 | Playout Latency | Fixed link offset, 8 x packet time (8 ms) | Implemented; reported to Core Audio as input latency |
-| Multicast Binding | Interface-specific via IP_MULTICAST_IF | **Verified working on multi-NIC** |
+| Multicast Binding | Interface-specific, by index (`MCAST_JOIN_GROUP`, `IP_MULTICAST_IFINDEX`) | Earlier address-based binding verified on a multi-NIC Mac; index-based binding tested on `lo0` |
 | IO Lifecycle | Receivers start/stop with Core Audio IO; transmitters run while configured | Implemented; receive gating verified in DAW |
 | RT-Safe Boundary | Compile-time separation of RT/non-RT paths | Implemented |
 | Device Clock | Zero timestamps from the driver's media clock | **Implemented (step 2 phase 1)**, verified in the real HAL |
 | Media Clock Recovery | From a received stream, later from PTP | **From a received stream: implemented (step 2 phase 3)**, verified in the real HAL with a test sender. From PTP: planned (phase 4) |
 | PTP Network Sync | IEEE 1588 slave-only | Planned rewrite (step 2 phase 4); earlier code not functional |
 | Stream Persistence | JSON config in /Library/Application Support/ | Loads at startup; saving from coreaudiod not working |
-| Interface Config | Name ("en0"), IP, or auto-detect | **Implemented** |
+| Interface Config | Name ("en0"), IP, or auto-detect | **Implemented**; kept as written, resolved at each stream start, followed through network changes |
 | Driver Transport | AudioServerPlugIn | Loads into coreaudiod |
 
 ## Building
