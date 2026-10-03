@@ -144,6 +144,7 @@ set(NETWORK_SOURCES
     NetworkEngine/NetworkInterfaceDetection.cpp
     NetworkEngine/DoPDecoder.cpp
     NetworkEngine/Discovery/SAPListener.cpp
+    NetworkEngine/Discovery/SAPAnnouncer.cpp
     NetworkEngine/Discovery/RTSPClient.cpp
 )
 
