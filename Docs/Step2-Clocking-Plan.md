@@ -231,11 +231,23 @@ Each phase is a separate PR, test-first, and leaves the driver working.
 - Pending:
   - **Interface re-resolution.** The receive interface address is resolved once, so a DHCP renewal or Wi-Fi roam breaks receivers until coreaudiod restarts.
 
-### Phase 3: Stream-recovered clock
+### Phase 3: Stream-recovered clock (implemented; hardware validation pending)
 
 - Device clock follows a reference RX stream's RTP rate.
 - First user-visible payoff: drift-free RX from a single sender (the Riedel) without PTP.
 - Exit: success criterion 1 in simulation; criterion 3 on hardware.
+- Implementation:
+  - **Measurement.** Each accepted packet's margin is how far ahead of the read point its end landed: `position + frames - (arrival - link offset)`, using the kernel arrival time and the sub-sample clock position. If the local clock is fast relative to the sender, margins shrink; if slow, they grow.
+  - **`ClockServo`** (`NetworkEngine/Clock/ClockServo.h`) is a PI loop on that margin. Jitter only ever delays packets, so it measures the largest margin in each 100 ms window, then takes the median of the last 5 windows: under heavy jitter a window can hold no undelayed packet, and one such window must not kick the rate. It is critically damped at 0.1 rad/s (settles in about 40 s), clamped to +/-2000 ppm, and integrates over the nominal window period so an outage does not weigh one stale error by its length.
+  - **`RecoveredClockSource`** chooses the reference: the first stream to report. Other streams are ignored until the reference has been silent for 1 s, when the next one takes over at the current rate. A stopped reference is released with the rate held. When a stream's margins jump (its placement re-anchored, the shared network mapping moved, or the timeline restarted), the servo re-learns its reference margin bumplessly, folding the proportional term into the integral so the rate does not step.
+  - **Device.** `AES67Device` owns the source. Rate updates call `MediaClock::setRate` at the current host time, under the clock write lock. A timeline restart (IO start, sample rate change) resets the source first, so no rate steered against the old timeline lands on the new one. TX runs on the same clock, so it is frequency-locked to the received stream, which may be what the Riedel's "synton" play mode needs.
+- Result:
+  - `Tests/TestClockRecovery.cpp` runs the real `RtpPlacement` against a simulated drifting sender. Without the servo, a 100 ppm sender re-anchors repeatedly. With it, 8 hours at +/-100 ppm gave no re-anchors and no drops, latency constant to +/-1 sample once settled, the rate within 0.5 ppm of the sender's, and no rate step above 5 ppm. A 1000 ppm sender acquired without leaving the window; 3 ms of jitter stayed locked.
+  - Over multicast loopback through a real `RTPReceiver`, with a faster test servo (1 rad/s), a sender 1500 ppm fast re-anchored without recovery. With recovery it played with 0 re-anchors and 0 silent samples, and the clock ran at the sender's rate to within about 40 ppm averaged over 3 s. `TestCriticalPathRegressions` checks the real device steers its clock and returns to nominal on an IO restart.
+  - Key tests were checked by mutation (no median filter, non-bumpless reacquire, takeover without the silence check, takeover resetting the rate, time-weighted integral), and the suites run clean under ThreadSanitizer.
+  - Real HAL (2026-10-03): with two host-only streams from a real-time priority sender 200 ppm fast, Core Audio's measured device rate converged on +200 ppm. It peaked at +228 ppm around 17 s, paying back the phase error built up during acquisition, then decayed (+204 ppm by 55 s). Audio was continuous: 0 re-anchors and 0 breaks in 2.88 M samples. In a first run, every 3 s window from 25 s on was within 8.3 ppm of +200 (most within 3 ppm). Only one coreaudiod restart was used for the whole session.
+  - Pending: criterion 3 on the Riedel.
+  - Limitation: one reference clock. A second sender on an unrelated clock still drifts against the device and re-anchors; its re-anchors of the shared mapping make the reference re-learn its margin rather than kick the rate. PTP (phase 4) or ASRC (phase 6) handles it.
 
 ### Phase 4: PTP
 

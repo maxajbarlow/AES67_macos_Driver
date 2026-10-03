@@ -12,6 +12,7 @@
 #include "../NetworkEngine/StreamManager.h"
 #include "../NetworkEngine/RTSafeStreamInterface.h"
 #include "../NetworkEngine/Clock/MediaClock.h"
+#include "../NetworkEngine/Clock/RecoveredClockSource.h"
 #include "../NetworkEngine/RTP/RtpPlacement.h"
 #include "../NetworkEngine/RTP/RxRouting.h"
 #include <aspl/Device.hpp>
@@ -211,7 +212,7 @@ private:
     // State
     std::atomic<bool> ioRunning_{false};
 
-    // Media clock. Writers (timeline restarts) are serialised by clockWriteMutex_;
+    // Media clock. Writers (timeline restarts, recovered rate) are serialised by clockWriteMutex_;
     // readers, including GetZeroTimeStampImpl on the IO thread, never lock.
     MediaClock mediaClock_;
     std::mutex clockWriteMutex_;
@@ -221,6 +222,12 @@ private:
     NetworkTimeMapping networkTime_;
     RxRouting rxRouting_;
     std::atomic<int64_t> linkOffsetFrames_{0};
+
+    // Stream-recovered clock (step 2 phase 3): steers mediaClock_'s rate to
+    // the reference receive stream. Takes clockWriteMutex_ inside its own lock,
+    // so it must be reset without clockWriteMutex_ held.
+    RecoveredClockSource clockRecovery_;
+    void ApplyRecoveredRate(double ratio);
 
     static int64_t LinkOffsetFramesFor(Float64 sampleRate);
 
