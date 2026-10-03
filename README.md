@@ -302,6 +302,7 @@ GPL-3.0 - See LICENSE file.
 ## Acknowledgments
 
 - [libASPL](https://github.com/gavv/libASPL) - Modern C++ AudioServerPlugIn framework
+- [marcnnn's fork](https://github.com/marcnnn/AES67_macos_Driver), tested against a Behringer WING: SAP announcements, several SDP fixes and the input/output channel split were ported from it, and its measurements inform the PTP and transmit plans (see [Prior work reviewed](Docs/Step2-Clocking-Plan.md#prior-work-reviewed))
 - AES67-2018 specification
 - RFC 3550 (RTP), RFC 4566 (SDP), RFC 2974 (SAP)
 
