@@ -228,8 +228,6 @@ sudo launchctl kickstart -k system/com.apple.audio.coreaudiod
 system_profiler SPAudioDataType | grep -A 5 "AES67"
 ```
 
-Restart Core Audio once per install. On macOS 26.0.1, many restarts in a row (about 20 in one night of testing) left system audio clients such as `loginwindow` and `ControlCenter` spinning at high CPU until the user logged out. This happens with or without this driver installed.
-
 ### Checking the Device Clock
 
 `AES67ClockProbeClient` runs IO on a device and measures what Core Audio does with its clock: rate against an expected value, timeline continuity and overloads. It is built with the investigation spikes:
