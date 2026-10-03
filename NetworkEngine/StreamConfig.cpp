@@ -389,43 +389,13 @@ std::optional<PersistedStreamConfig> StreamConfigManager::configFromJSON(const s
     }
 
     if (auto iface = extractStringField(json, "networkInterface")) {
-        // Resolve interface name or "auto" to IP address
-        std::string ifaceSpec = *iface;
-
-        if (ifaceSpec == "auto" || ifaceSpec.empty()) {
-            // Auto-detect best interface
-            std::string resolved = NetworkUtils::resolveInterfaceToIP("");
-            if (!resolved.empty()) {
-                config.networkInterface = resolved;
-                AES67_LOGF("StreamConfigManager: Auto-detected interface IP: %s", resolved.c_str());
-            } else {
-                AES67_LOG("StreamConfigManager: Warning - could not auto-detect interface");
-                config.networkInterface = "";
-            }
-        } else if (!NetworkUtils::isIPv4Address(ifaceSpec)) {
-            // It's an interface name like "en0" - resolve to IP
-            std::string resolved = NetworkUtils::getInterfaceIP(ifaceSpec);
-            if (!resolved.empty()) {
-                config.networkInterface = resolved;
-                AES67_LOGF("StreamConfigManager: Resolved interface '%s' to IP: %s",
-                           ifaceSpec.c_str(), resolved.c_str());
-            } else {
-                AES67_LOGF("StreamConfigManager: Warning - interface '%s' not found, using as-is",
-                           ifaceSpec.c_str());
-                config.networkInterface = ifaceSpec;
-            }
-        } else {
-            // Already an IP address
-            config.networkInterface = ifaceSpec;
-        }
-    } else {
-        // No interface specified - auto-detect
-        std::string resolved = NetworkUtils::resolveInterfaceToIP("");
-        if (!resolved.empty()) {
-            config.networkInterface = resolved;
-            AES67_LOGF("StreamConfigManager: No interface specified, auto-detected: %s", resolved.c_str());
-        }
+        // Kept as written ("en0", an IPv4 address, or "auto"/""): streams
+        // resolve it each time they start. Resolving it here froze the
+        // address of the moment, and saving then made it permanent.
+        config.networkInterface = *iface;
     }
+    // No interface specified: left empty, which means the primary interface
+    // as it is when the stream starts
 
     // Extract SDP object
     std::regex sdpRegex(R"("sdp"\s*:\s*\{([^}]+(?:\{[^}]+\})?[^}]*)\})");

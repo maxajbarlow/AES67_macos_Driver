@@ -140,8 +140,8 @@ private:
     std::atomic<int64_t> lastPacketTimeNs_{0};
 
     // Network interface binding
-    std::string networkInterface_;   // Interface name or IP from config
-    std::string resolvedInterfaceIP_; // Resolved IP address (empty = INADDR_ANY)
+    std::string networkInterface_;      // as configured: name, IPv4 address, or "" (auto)
+    std::string interfaceDescription_;  // what the last start() resolved it to (logs)
 };
 
 } // namespace AES67

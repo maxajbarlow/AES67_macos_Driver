@@ -11,6 +11,7 @@
 #include "RTP/RxContext.h"
 #include "RTP/TxContext.h"
 #include "Discovery/SAPAnnouncer.h"
+#include "NetworkMonitor.h"
 #include "RTP/RTPTransmitter.h"
 #include "PTP/PTPClock.h"
 #include <map>
@@ -51,8 +52,11 @@ public:
     /// Receivers run only while Core Audio IO is active (setIOActive). Transmitters
     /// run whenever their stream is configured: AES67 senders send continuously,
     /// silence included, and each is announced over SAP while it runs.
+    /// @param networkConfig How interface changes are watched (default: real
+    ///        interfaces, checked every second).
     StreamManager(RxContext rxContext, TxContext txContext,
-                  SAPAnnouncer::Config sapConfig = SAPAnnouncer::Config{});
+                  SAPAnnouncer::Config sapConfig = SAPAnnouncer::Config{},
+                  NetworkMonitor::Config networkConfig = NetworkMonitor::Config{});
     ~StreamManager();
 
     // Prevent copy/move
@@ -68,6 +72,10 @@ public:
 
     /// Add an RX stream with explicit channel mapping.
     StreamID addStream(const SDPSession& sdp, const ChannelMapping& mapping);
+
+    /// As above, received on a given interface ("en0", an IPv4 address, or ""
+    /// for the primary interface), resolved each time the stream starts.
+    StreamID addStream(const SDPSession& sdp, const ChannelMapping& mapping, const std::string& networkInterface);
 
     /// Import an RX stream from an SDP file on disk.
     StreamID importSDPFile(const std::string& filepath);
@@ -127,6 +135,13 @@ public:
 
     // Get stream info
     std::optional<StreamInfo> getStreamInfo(const StreamID& id) const;
+
+    /// Live statistics of a stream's receiver or transmitter.
+    std::optional<StatisticsSnapshot> getStreamStatistics(const StreamID& id) const;
+
+    /// Streams restarted because their interface changed (address, link,
+    /// index, or which interface "auto" means).
+    uint64_t getNetworkRestartCount() const { return networkRestarts_.load(); }
 
     // Check if stream exists
     bool hasStream(const StreamID& id) const;
@@ -239,6 +254,10 @@ private:
     // Announce a running TX stream over SAP (caller holds streamsMutex_)
     void announceTx(const StreamID& id, const ManagedStream& managed);
 
+    // An interface streams use changed: restart those streams on it as it
+    // is now (called on the network monitor's thread)
+    void onInterfaceChanged(const std::string& networkInterface);
+
 
     // Configuration helpers
     void autoSaveIfEnabled();
@@ -269,6 +288,10 @@ private:
 
     // IO lifecycle state — true when Core Audio IO is active (StartIO/StopIO)
     std::atomic<bool> ioActive_{false};
+    std::atomic<uint64_t> networkRestarts_{0};
+
+    // Last member: destroyed first, so no change is handled mid-destruction
+    std::unique_ptr<NetworkMonitor> networkMonitor_;
 
     // Device state
     std::atomic<double> currentDeviceSampleRate_{48000.0};

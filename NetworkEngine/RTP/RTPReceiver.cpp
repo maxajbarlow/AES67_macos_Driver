@@ -38,33 +38,8 @@ RTPReceiver::RTPReceiver(
     , bytesPerSample_(sdp.encoding == "L16" ? 2 : 3)
     , networkInterface_(networkInterface)
 {
-    // Resolve network interface name to IP address
-    if (!networkInterface_.empty()) {
-        bool looksLikeIP = true;
-        for (char c : networkInterface_) {
-            if (c != '.' && !isdigit(c)) {
-                looksLikeIP = false;
-                break;
-            }
-        }
-
-        if (looksLikeIP) {
-            resolvedInterfaceIP_ = networkInterface_;
-            AES67_LOGF("RTPReceiver: using interface IP %s directly (stream=%s)",
-                       resolvedInterfaceIP_.c_str(), sdp_.sessionName.c_str());
-        } else {
-            resolvedInterfaceIP_ = NetworkInterfaceDetection::getInterfaceIPAddress(networkInterface_);
-            if (resolvedInterfaceIP_.empty()) {
-                AES67_LOGF("RTPReceiver: WARNING - failed to resolve interface '%s' to IP, "
-                           "falling back to INADDR_ANY (stream=%s)",
-                           networkInterface_.c_str(), sdp_.sessionName.c_str());
-            } else {
-                AES67_LOGF("RTPReceiver: resolved interface '%s' to IP %s (stream=%s)",
-                           networkInterface_.c_str(), resolvedInterfaceIP_.c_str(),
-                           sdp_.sessionName.c_str());
-            }
-        }
-    }
+    // The interface is resolved at each start(), never here: its address or
+    // index may change while the stream exists (DHCP, Wi-Fi roam, replug)
 }
 
 RTPReceiver::~RTPReceiver() {
@@ -99,12 +74,16 @@ bool RTPReceiver::start() {
         return false;
     }
 
-    // Open RTP receiver socket, optionally bound to a specific interface
-    const char* ifaceIP = resolvedInterfaceIP_.empty() ? nullptr : resolvedInterfaceIP_.c_str();
-    if (!rtpSocket_.openReceiver(sdp_.connectionAddress.c_str(), sdp_.port, ifaceIP)) {
-        AES67_LOGF("RTPReceiver::start: socket open failed for %s:%u iface=%s (stream=%s)",
-                   sdp_.connectionAddress.c_str(), sdp_.port,
-                   resolvedInterfaceIP_.empty() ? "ANY" : resolvedInterfaceIP_.c_str(),
+    // Join on the configured interface as it is now
+    unsigned interfaceIndex = 0;
+    if (!NetworkInterfaceDetection::socketInterfaceIndex(networkInterface_, interfaceIndex, interfaceDescription_)) {
+        AES67_LOGF("RTPReceiver::start: interface %s (stream=%s)", interfaceDescription_.c_str(),
+                   sdp_.sessionName.c_str());
+        return false;
+    }
+    if (!rtpSocket_.openReceiver(sdp_.connectionAddress.c_str(), sdp_.port, interfaceIndex)) {
+        AES67_LOGF("RTPReceiver::start: socket open failed for %s:%u on %s (stream=%s)",
+                   sdp_.connectionAddress.c_str(), sdp_.port, interfaceDescription_.c_str(),
                    sdp_.sessionName.c_str());
         return false;
     }
@@ -136,7 +115,7 @@ bool RTPReceiver::start() {
 
     AES67_LOGF("RTPReceiver::start: %s:%u on %s, link offset %lld frames, buffer %zu frames (stream=%s)",
                sdp_.connectionAddress.c_str(), sdp_.port,
-               resolvedInterfaceIP_.empty() ? "INADDR_ANY" : resolvedInterfaceIP_.c_str(),
+               interfaceDescription_.c_str(),
                static_cast<long long>(linkOffset), capacity, sdp_.sessionName.c_str());
 
     running_ = true;

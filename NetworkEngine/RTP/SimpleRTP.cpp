@@ -25,14 +25,13 @@ RTPSocket::RTPSocket()
     , isReceiver_(false)
 {
     memset(&multicastAddr_, 0, sizeof(multicastAddr_));
-    memset(&boundInterfaceAddr_, 0, sizeof(boundInterfaceAddr_));
 }
 
 RTPSocket::~RTPSocket() {
     close();
 }
 
-bool RTPSocket::openReceiver(const char* multicastIP, uint16_t port, const char* interfaceIP) {
+bool RTPSocket::openReceiver(const char* multicastIP, uint16_t port, unsigned interfaceIndex) {
     // Create UDP socket
     sockfd_ = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd_ < 0) {
@@ -74,43 +73,36 @@ bool RTPSocket::openReceiver(const char* multicastIP, uint16_t port, const char*
         return false;
     }
 
-    // Resolve interface address for multicast binding
-    struct in_addr ifaceAddr;
-    if (interfaceIP) {
-        ifaceAddr.s_addr = inet_addr(interfaceIP);
+    // Join the group on the interface by index, not address: a new address
+    // on the interface (DHCP renewal, Wi-Fi roam) leaves the membership
+    // intact. Index 0 means "let the routing table choose", which only the
+    // address-based join supports (MCAST_JOIN_GROUP needs a real index).
+    bool joined = false;
+    if (interfaceIndex != 0) {
+        struct group_req join {};
+        join.gr_interface = interfaceIndex;
+        auto* group = reinterpret_cast<struct sockaddr_in*>(&join.gr_group);
+        group->sin_family = AF_INET;
+        group->sin_len = sizeof(struct sockaddr_in);
+        group->sin_addr.s_addr = inet_addr(multicastIP);
+        joined = setsockopt(sockfd_, IPPROTO_IP, MCAST_JOIN_GROUP, &join, sizeof(join)) == 0;
     } else {
-        ifaceAddr.s_addr = htonl(INADDR_ANY);
+        struct ip_mreq mreq {};
+        mreq.imr_multiaddr.s_addr = inet_addr(multicastIP);
+        mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+        joined = setsockopt(sockfd_, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) == 0;
     }
-
-    // Store bound interface for proper IP_DROP_MEMBERSHIP on close()
-    boundInterfaceAddr_ = ifaceAddr;
-
-    // Bind multicast reception to a specific interface (prevents duplicate
-    // packets on machines with multiple NICs, common in pro audio setups)
-    if (interfaceIP) {
-        if (setsockopt(sockfd_, IPPROTO_IP, IP_MULTICAST_IF, &ifaceAddr, sizeof(ifaceAddr)) < 0) {
-            fprintf(stderr, "AES67 RTP openReceiver: IP_MULTICAST_IF failed for %s:%u iface=%s (errno=%d: %s)\n",
-                    multicastIP, port, interfaceIP, errno, strerror(errno));
-            ::close(sockfd_);
-            sockfd_ = -1;
-            return false;
-        }
-        fprintf(stderr, "AES67 RTP openReceiver: bound multicast to interface %s for %s:%u\n",
-                interfaceIP, multicastIP, port);
-    }
-
-    // Join multicast group on the specified interface
-    struct ip_mreq mreq;
-    mreq.imr_multiaddr.s_addr = inet_addr(multicastIP);
-    mreq.imr_interface = ifaceAddr;
-
-    if (setsockopt(sockfd_, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
-        fprintf(stderr, "AES67 RTP openReceiver: IP_ADD_MEMBERSHIP failed for %s:%u (errno=%d: %s)\n",
-                multicastIP, port, errno, strerror(errno));
+    if (!joined) {
+        fprintf(stderr, "AES67 RTP openReceiver: joining %s:%u on interface %u failed (errno=%d: %s)\n",
+                multicastIP, port, interfaceIndex, errno, strerror(errno));
         ::close(sockfd_);
         sockfd_ = -1;
         return false;
     }
+    joinedInterfaceIndex_ = interfaceIndex;
+    multicastAddr_.sin_family = AF_INET;
+    multicastAddr_.sin_addr.s_addr = inet_addr(multicastIP);
+    multicastAddr_.sin_port = htons(port);
 
     // Set non-blocking mode
     int flags = fcntl(sockfd_, F_GETFL, 0);
@@ -144,7 +136,7 @@ bool RTPSocket::openReceiver(const char* multicastIP, uint16_t port, const char*
     return true;
 }
 
-bool RTPSocket::openTransmitter(const char* multicastIP, uint16_t port, const char* interfaceIP, uint8_t ttl) {
+bool RTPSocket::openTransmitter(const char* multicastIP, uint16_t port, unsigned interfaceIndex, uint8_t ttl) {
     // Create UDP socket
     sockfd_ = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd_ < 0) {
@@ -162,13 +154,12 @@ bool RTPSocket::openTransmitter(const char* multicastIP, uint16_t port, const ch
         return false;
     }
 
-    // Set multicast interface
-    if (interfaceIP) {
-        struct in_addr ifaddr;
-        ifaddr.s_addr = inet_addr(interfaceIP);
-        if (setsockopt(sockfd_, IPPROTO_IP, IP_MULTICAST_IF, &ifaddr, sizeof(ifaddr)) < 0) {
-            fprintf(stderr, "AES67 RTP openTransmitter: IP_MULTICAST_IF failed for %s:%u iface=%s (errno=%d: %s)\n",
-                    multicastIP, port, interfaceIP, errno, strerror(errno));
+    // Send on the interface by index (0 lets the routing table choose), so a
+    // new address on the interface does not break sending
+    if (interfaceIndex != 0) {
+        if (setsockopt(sockfd_, IPPROTO_IP, IP_MULTICAST_IFINDEX, &interfaceIndex, sizeof(interfaceIndex)) < 0) {
+            fprintf(stderr, "AES67 RTP openTransmitter: IP_MULTICAST_IFINDEX %u failed for %s:%u (errno=%d: %s)\n",
+                    interfaceIndex, multicastIP, port, errno, strerror(errno));
             ::close(sockfd_);
             sockfd_ = -1;
             return false;
@@ -286,13 +277,25 @@ void RTPSocket::close() {
         // Leave multicast group if receiver
         // Use the same interface address that was used for IP_ADD_MEMBERSHIP
         if (isReceiver_) {
-            struct ip_mreq mreq;
-            mreq.imr_multiaddr = multicastAddr_.sin_addr;
-            mreq.imr_interface = boundInterfaceAddr_;
-            if (setsockopt(sockfd_, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
+            int left = 0;
+            if (joinedInterfaceIndex_ != 0) {
+                struct group_req leave {};
+                leave.gr_interface = joinedInterfaceIndex_;
+                auto* group = reinterpret_cast<struct sockaddr_in*>(&leave.gr_group);
+                group->sin_family = AF_INET;
+                group->sin_len = sizeof(struct sockaddr_in);
+                group->sin_addr = multicastAddr_.sin_addr;
+                left = setsockopt(sockfd_, IPPROTO_IP, MCAST_LEAVE_GROUP, &leave, sizeof(leave));
+            } else {
+                struct ip_mreq mreq {};
+                mreq.imr_multiaddr = multicastAddr_.sin_addr;
+                mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+                left = setsockopt(sockfd_, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mreq, sizeof(mreq));
+            }
+            if (left < 0) {
                 // Log but don't fail — socket is closing anyway.
                 // Repeated failures here could indicate multicast membership leak on macOS.
-                fprintf(stderr, "AES67 RTP: IP_DROP_MEMBERSHIP failed (errno=%d: %s)\n",
+                fprintf(stderr, "AES67 RTP: leaving the multicast group failed (errno=%d: %s)\n",
                         errno, strerror(errno));
             }
         }

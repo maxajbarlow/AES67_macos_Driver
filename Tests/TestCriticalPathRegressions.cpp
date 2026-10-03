@@ -20,6 +20,7 @@
 #include "SapTestSupport.h"
 #include "../NetworkEngine/Discovery/SAPListener.h"
 #include "../NetworkEngine/NetworkInterfaceDetection.h"
+#include "../NetworkEngine/NetworkMonitor.h"
 #include "../Driver/AES67Device.h"
 #include "../Driver/AES67IOHandler.h"
 #include "../NetworkEngine/StreamManager.h"
@@ -476,6 +477,87 @@ void testTxOptionsAreSaved() {
 }
 
 // ---------------------------------------------------------------------------
+// A stream's interface setting is kept as written. Loading used to replace
+// "lo0" or "en0" with its address at that moment, and the next save made the
+// address permanent, so a later DHCP change broke the stream for good.
+// ---------------------------------------------------------------------------
+void testInterfaceSettingSurvivesReloadAndSave() {
+    std::cout << "Interface settings are kept as written through reload and save" << std::endl;
+    const std::string path = useEmptyConfig("ifacesetting");
+    RxHarness harness;
+    TxRouting txRouting;
+    const TxContext txContext{harness.clock, txRouting};
+    {
+        StreamManager manager(harness.context(), txContext, testSap());
+        CHECK(!manager.createTxStream("Iface TX", "239.69.99.16", 55044, 2, makeMapping(2, 0),
+                                      StreamManager::TxOptions{"lo0", 0}).isNull(),
+              "a TX stream on lo0 should be created");
+    }
+    {
+        StreamManager reloaded(harness.context(), txContext, testSap());
+        CHECK(reloaded.loadSavedStreams(), "the TX stream should reload");
+        // Adding a stream saves every stream's configuration again
+        CHECK(!reloaded.addStream(makeRxSDP("239.69.99.17", 55046, 2), makeMapping(2, 0)).isNull(),
+              "an RX stream should be added");
+    }
+    std::ifstream file(path);
+    const std::string json((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    CHECK(json.find("\"networkInterface\": \"lo0\"") != std::string::npos,
+          "the TX stream's interface should still read lo0");
+    CHECK(json.find("127.0.0.1") == std::string::npos, "no interface address should have been written in its place");
+}
+
+// ---------------------------------------------------------------------------
+// When a stream's interface changes (new address, link down/up, replugged
+// adapter), its streams rejoin and resend on it as it is now, so a DHCP
+// renewal or Wi-Fi roam no longer stops them until coreaudiod restarts. The
+// interface state is scripted; the restarted streams use lo0 for real.
+// ---------------------------------------------------------------------------
+void testStreamsRestartWhenTheirInterfaceChanges() {
+    std::cout << "Streams rejoin when their interface changes" << std::endl;
+    useEmptyConfig("ifacechange");
+    std::mutex stateMutex;
+    auto loopback = NetworkInterfaceDetection::currentState("lo0");
+    CHECK(loopback.has_value(), "lo0 should exist");
+    NetworkMonitor::Config network;
+    network.interval = std::chrono::milliseconds(30);
+    network.provider = [&](const std::string& setting) -> std::optional<NetworkInterfaceDetection::InterfaceState> {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        return setting == "lo0" ? loopback : NetworkInterfaceDetection::currentState(setting);
+    };
+
+    RxHarness harness;
+    TxRouting txRouting;
+    StreamManager manager(harness.context(), TxContext{harness.clock, txRouting}, testSap(), network);
+    CHECK(!manager.createTxStream("Net TX", "239.69.99.18", 55048, 2, makeMapping(2, 0),
+                                  StreamManager::TxOptions{"lo0", 0}).isNull(),
+          "a TX stream on lo0 should be created");
+    CHECK(!manager.createTxStream("Other TX", "239.69.99.19", 55050, 2, makeMapping(2, 2), kHostOnly).isNull(),
+          "a TX stream on the default interface should be created");
+    const StreamID rx = manager.addStream(makeRxSDP("239.69.99.18", 55048, 2), makeMapping(2, 0), "lo0");
+    CHECK(!rx.isNull(), "an RX stream on lo0 should be added");
+    manager.setIOActive(true);
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    CHECK(manager.getNetworkRestartCount() == 0, "nothing restarts while nothing changes");
+
+    {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        loopback->ipv4 = "127.0.0.2";  // as if DHCP had renewed with a new address
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    CHECK(manager.getNetworkRestartCount() == 2, "the RX and TX streams on lo0 restart, the other TX does not (got "
+                                                     << manager.getNetworkRestartCount() << ")");
+
+    // Both restarted streams work: the RX on lo0 still hears the TX on lo0
+    const auto before = manager.getStreamStatistics(rx);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    const auto after = manager.getStreamStatistics(rx);
+    CHECK(before && after && after->packetsReceived > before->packetsReceived + 100,
+          "after restarting, the RX on lo0 should still receive the TX on lo0");
+    manager.setIOActive(false);
+}
+
+// ---------------------------------------------------------------------------
 // SAP: a TX stream is announced while it is configured, with an SDP a
 // receiver can subscribe from, and deleted when it goes. Its session ID is
 // unique and survives a reload, so receivers do not list it twice.
@@ -841,6 +923,8 @@ int main() {
     testIOStartStopLeavesStreamActivityToHAL();
     testDeviceClockFollowsReceivedStream();
     testTxOptionsAreSaved();
+    testInterfaceSettingSurvivesReloadAndSave();
+    testStreamsRestartWhenTheirInterfaceChanges();
     testInputAndOutputChannelsAreSeparate();
     testSenderSdpDirectionDoesNotMakeATransmitter();
     testTxStreamIsAnnounced();

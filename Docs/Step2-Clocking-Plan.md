@@ -244,7 +244,12 @@ Each phase is a separate PR, test-first, and leaves the driver working.
   - 120 s run: 0 re-anchors, 0 sawtooth breaks, 0 timeline jumps, two clients identical in all 1878 shared cycles
   - 60 s run with kernel arrival timestamps recorded: the sender stalled beyond the 8 ms link offset 14 times (worst 23.5 ms), still with 0 re-anchors and 0 breaks. Packets later than the link offset play as silence. The two streams differ in a few hundred frames, consistent with a stall falling between the sender's packets for the two streams.
 - Pending:
-  - **Interface re-resolution.** The receive interface address is resolved once, so a DHCP renewal or Wi-Fi roam breaks receivers until coreaudiod restarts.
+  - **Interface re-resolution: done (2026-10-03).**
+    - **The defect:** the interface setting was resolved to an address at config load, and since #14 that address was saved over the setting.
+    - **The fix:**
+      - Settings are kept as written and resolved at each start.
+      - Sockets join and send by interface index (`MCAST_JOIN_GROUP`, `IP_MULTICAST_IFINDEX`).
+      - A `NetworkMonitor` (getifaddrs once a second) restarts a changed interface's streams and re-announces its TX streams.
 
 ### Phase 3: Stream-recovered clock (implemented; hardware validation pending)
 

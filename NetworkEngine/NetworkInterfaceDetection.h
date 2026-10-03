@@ -1,6 +1,7 @@
 #ifndef NETWORK_INTERFACE_DETECTION_H
 #define NETWORK_INTERFACE_DETECTION_H
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -13,6 +14,38 @@ namespace AES67 {
  */
 class NetworkInterfaceDetection {
 public:
+    /// An interface as a stream uses it. Comparing two snapshots tells
+    /// whether a stream's multicast memberships and sends need renewing.
+    struct InterfaceState {
+        std::string name;    // "en0"
+        unsigned index{0};   // if_nametoindex: what sockets join and send by
+        std::string ipv4;    // current address (empty if none yet)
+        bool running{false}; // IFF_UP and IFF_RUNNING (link up)
+
+        bool operator==(const InterfaceState& other) const {
+            return name == other.name && index == other.index && ipv4 == other.ipv4 && running == other.running;
+        }
+        bool operator!=(const InterfaceState& other) const { return !(*this == other); }
+    };
+
+    /**
+     * Current state of the interface a stream's setting names: an interface
+     * name ("en0"), an IPv4 address (the interface holding it), or "" / "auto"
+     * (the primary ethernet interface). Resolved afresh on every call, so a
+     * new address, link state or interface index is always seen.
+     * @return The interface's state, or nullopt if no interface matches
+     */
+    static std::optional<InterfaceState> currentState(const std::string& setting);
+
+    /**
+     * Interface index a socket should join or send on for a stream's setting:
+     * 0 (the kernel's choice) for "" / "auto", otherwise the named interface's
+     * current index. Resolved when a stream starts, never cached.
+     * @param description Set to the interface used, for logs
+     * @return false if the setting names an interface that does not exist now
+     */
+    static bool socketInterfaceIndex(const std::string& setting, unsigned& index, std::string& description);
+
     /**
      * Get the primary ethernet interface
      * @return Name of the primary ethernet interface (e.g., "en0", "en1"), or empty string if not found

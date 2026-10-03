@@ -8,6 +8,7 @@
 #include "SimpleRTP.h"
 #include "../../Driver/DebugLog.h"
 #include "../Clock/HostTime.h"
+#include "../NetworkInterfaceDetection.h"
 #include <mach/mach_time.h>
 #include <algorithm>
 #include <cstring>
@@ -93,12 +94,17 @@ bool RTPTransmitter::start() {
         return false;
     }
 
-    // Open RTP transmitter socket
-    const char* ifaceIP = networkInterface_.empty() ? nullptr : networkInterface_.c_str();
-    if (!rtpSocket_.openTransmitter(sdp_.connectionAddress.c_str(), sdp_.port, ifaceIP, sdp_.ttl)) {
-        AES67_LOGF("RTPTransmitter::start: socket open failed for %s:%u iface=%s (stream=%s)",
-                   sdp_.connectionAddress.c_str(), sdp_.port,
-                   networkInterface_.empty() ? "ANY" : networkInterface_.c_str(),
+    // Send on the configured interface as it is now (resolved at each start)
+    unsigned interfaceIndex = 0;
+    std::string interfaceDescription;
+    if (!NetworkInterfaceDetection::socketInterfaceIndex(networkInterface_, interfaceIndex, interfaceDescription)) {
+        AES67_LOGF("RTPTransmitter::start: interface %s (stream=%s)", interfaceDescription.c_str(),
+                   sdp_.sessionName.c_str());
+        return false;
+    }
+    if (!rtpSocket_.openTransmitter(sdp_.connectionAddress.c_str(), sdp_.port, interfaceIndex, sdp_.ttl)) {
+        AES67_LOGF("RTPTransmitter::start: socket open failed for %s:%u on %s (stream=%s)",
+                   sdp_.connectionAddress.c_str(), sdp_.port, interfaceDescription.c_str(),
                    sdp_.sessionName.c_str());
         return false;
     }

@@ -187,15 +187,65 @@ std::string NetworkInterfaceDetection::getInterfaceMACAddress(const std::string&
     return mac;
 }
 
-std::string NetworkInterfaceDetection::resolveIPv4Address(const std::string& interfaceSetting) {
-    if (interfaceSetting.empty()) {
-        return getInterfaceIPAddress(getPrimaryEthernetInterface());
-    }
+std::optional<NetworkInterfaceDetection::InterfaceState> NetworkInterfaceDetection::currentState(
+    const std::string& setting) {
+    std::string name;
     struct in_addr probe {};
-    if (inet_pton(AF_INET, interfaceSetting.c_str(), &probe) == 1) {
-        return interfaceSetting;
+    if (setting.empty() || setting == "auto") {
+        name = getPrimaryEthernetInterface();
+    } else if (inet_pton(AF_INET, setting.c_str(), &probe) == 1) {
+        name = getInterfaceForIPAddress(setting);
+    } else {
+        name = setting;
     }
-    return getInterfaceIPAddress(interfaceSetting);
+    if (name.empty()) {
+        return std::nullopt;
+    }
+
+    InterfaceState state;
+    state.name = name;
+    state.index = if_nametoindex(name.c_str());
+    if (state.index == 0) {
+        return std::nullopt;
+    }
+
+    struct ifaddrs *ifaddrs_ptr, *ifa;
+    if (getifaddrs(&ifaddrs_ptr) == 0) {
+        for (ifa = ifaddrs_ptr; ifa != nullptr; ifa = ifa->ifa_next) {
+            if (!ifa->ifa_name || name != ifa->ifa_name) {
+                continue;
+            }
+            state.running = state.running || ((ifa->ifa_flags & IFF_UP) && (ifa->ifa_flags & IFF_RUNNING));
+            if (state.ipv4.empty() && ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_INET) {
+                state.ipv4 = inet_ntoa(reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr)->sin_addr);
+            }
+        }
+        freeifaddrs(ifaddrs_ptr);
+    }
+    return state;
+}
+
+bool NetworkInterfaceDetection::socketInterfaceIndex(const std::string& setting, unsigned& index,
+                                                     std::string& description) {
+    if (setting.empty() || setting == "auto") {
+        index = 0;
+        description = "default route";
+        return true;
+    }
+    const auto state = currentState(setting);
+    if (!state) {
+        index = 0;
+        description = setting + " (not present)";
+        return false;
+    }
+    index = state->index;
+    description = state->name + (state->ipv4.empty() ? "" : " " + state->ipv4);
+    return true;
+}
+
+std::string NetworkInterfaceDetection::resolveIPv4Address(const std::string& interfaceSetting) {
+    const auto state = currentState(interfaceSetting);
+    return state ? state.value().ipv4 : std::string{};
 }
 
 bool NetworkInterfaceDetection::supportsMulticast(const std::string& interfaceName) {
