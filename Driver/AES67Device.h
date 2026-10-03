@@ -8,7 +8,6 @@
 #pragma once
 
 #include "../Shared/Types.h"
-#include "../Shared/RingBuffer.hpp"
 #include "../NetworkEngine/StreamManager.h"
 #include "../NetworkEngine/RTSafeStreamInterface.h"
 #include "../NetworkEngine/Clock/MediaClock.h"
@@ -107,14 +106,6 @@ public:
     std::shared_ptr<aspl::Stream> GetOutputStream() const { return outputStream_; }
 
     //
-    // Ring Buffer Access (for NetworkEngine)
-    //
-
-    using DeviceChannelBuffers = std::array<SPSCRingBuffer<float>, kNumChannels>;
-
-    DeviceChannelBuffers& GetOutputBuffers() { return outputBuffers_; }
-
-    //
     // RT-Safe Interface Access
     //
 
@@ -182,13 +173,6 @@ private:
     void InitializeStreams();
     void InitializeIOHandler();
 
-    // Calculate optimal ring buffer size based on sample rate
-    // Returns size for desired latency (default: 3ms for network jitter tolerance)
-    // Result is rounded up to power of 2 for efficient modulo operations
-    static size_t CalculateRingBufferSize(Float64 sampleRate, double latencyMs = 3.0);
-
-    // Output ring buffers: Core Audio writes, RTP transmitters read
-    DeviceChannelBuffers outputBuffers_;  // CoreAudio → Network
 
     // Streams
     std::shared_ptr<aspl::Stream> inputStream_;
@@ -202,7 +186,7 @@ private:
 
     // RT-safe interface (compile-time boundary for IO handler)
     // Created during Initialize(), references the receive routing, media clock,
-    // link offset, outputBuffers_ and atomics
+    // link offset, transmit routing and atomics
     std::unique_ptr<RTSafeStreamInterface> rtInterface_;
 
     // Current configuration
@@ -222,6 +206,13 @@ private:
     NetworkTimeMapping networkTime_;
     RxRouting rxRouting_;
     std::atomic<int64_t> linkOffsetFrames_{0};
+
+    // Transmit path: where the IO thread writes each TX stream's output
+    TxRouting txRouting_;
+
+    // Frames between one timeline's positions and the next's (about 22 s at
+    // 48 kHz): beyond any buffer and any output written ahead
+    static constexpr int64_t kTimelineGapFrames = int64_t{1} << 20;
 
     // Stream-recovered clock (step 2 phase 3): steers mediaClock_'s rate to
     // the reference receive stream. Takes clockWriteMutex_ inside its own lock,

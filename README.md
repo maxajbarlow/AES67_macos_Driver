@@ -49,7 +49,7 @@ AES67 needs every device on one PTP-derived media clock. Step 2 replaces the dri
 | Phase 2: receive by RTP timestamp | Done | Received audio is placed by RTP timestamp at a fixed link offset (8 ms, matching the Riedel's 8 x packet time receive buffer), so latency is fixed and streams on one network timeline are sample-aligned. The jitter buffer, consume thread and rate controller are gone. In Core Audio: two streams sample-aligned and two apps receiving identical input, with no re-anchors or breaks. A re-anchor now needs a timeline change lasting 50 ms, so sender stalls no longer move the timeline |
 | Phase 3: clock recovered from a received stream | Done (Riedel test pending) | The device clock follows the first received stream, so a sender's drift no longer reaches the playout buffer. In simulation, 8 hours at +/-100 ppm: no re-anchors, no drops, latency constant to +/-1 sample. Over loopback, a 1500 ppm fast sender plays without a gap. In Core Audio, the device rate locked to a sender 200 ppm fast. Next: a 1-hour capture from the Riedel |
 | Phase 4: PTP slave and servo | Planned | Rewritten PTP slave driving the media clock |
-| Phase 5: transmit on the media clock | Planned | PTP-correct RTP timestamps for Dante and RAVENNA receivers |
+| Phase 5: transmit on the media clock | In progress | TX is now paced by the media clock and runs whenever a stream is configured, sending silence when no app is playing. Loopback through our own receiver is sample-exact, and TX follows the recovered clock. Still to come: PTP-derived timestamps for Dante and RAVENNA (needs phase 4) and verification in Core Audio |
 | Phase 6: resampling for foreign-clock streams | Optional | |
 | Spike S3: PTP accuracy against a real grandmaster | Needs hardware | |
 
@@ -62,7 +62,7 @@ AES67 needs every device on one PTP-derived media clock. Step 2 replaces the dri
 - The device appears as "AES67 Device" in Audio MIDI Setup
 - 128 input + 128 output channels are reported to the system
 - RTP receiver: joins multicast, decodes L16/L24, and writes each packet into a buffer indexed by media position, which the IO thread reads lock-free
-- RTP transmitter: reads from lock-free SPSC ring buffers, encodes L16/L24, sends multicast
+- RTP transmitter: the IO thread writes the output mix into each TX stream's buffer by media position; the transmitter sends each packet when the media clock reaches its end, continuously (silence when no app is playing), encoding L16/L24
 - Core Audio's sample clock is computed by the driver from its own media clock (step 2, phase 1), verified in the real HAL
 - IO handler reads/writes Core Audio buffers in the real-time callback
 - Received audio is placed by RTP timestamp at a fixed link offset, using kernel arrival timestamps (step 2, phase 2)
@@ -99,7 +99,7 @@ AES67 depends on every device sharing a PTP-derived media clock. This driver doe
 
 - Core Audio's sample clock comes from the driver's own media clock (step 2, phase 1). Without PTP, that clock follows the first received stream (phase 3), or the Mac's host clock when nothing is being received.
 - Received audio is placed by RTP timestamp (phase 2), so latency is fixed. Streams are sample-aligned only when their senders share a clock, and the device can follow only one sender's clock. A second sender on an unrelated clock still drifts against it and periodically re-anchors; that needs PTP (phase 4) or resampling (phase 6).
-- Transmitted RTP timestamps start at 0 rather than being derived from PTP time, so receivers that align playout to PTP (Dante in AES67 mode, RAVENNA) will not play the stream correctly. TX does run on the recovered clock, so it is frequency-locked to the received stream.
+- Transmitted RTP timestamps start at 0 rather than being derived from PTP time, so receivers that align playout to PTP (Dante in AES67 mode, RAVENNA) will not play the stream correctly. TX is paced by the media clock, so it follows the recovered clock and is frequency-locked to the received stream.
 
 Step 2 addresses these; see [Step 2: Clocking Redesign](#step-2-clocking-redesign-in-progress).
 
@@ -121,7 +121,7 @@ The SwiftUI Manager app renders its interface but does not control the driver. I
 The driver reads `streams.json` from `$AES67_CONFIG_PATH`, `~/Library/Application Support/AES67Driver/`, then `/Library/Application Support/AES67Driver/`. The installer creates the system directory owned by root, so the driver (running as `_coreaudiod`) cannot save changes there. Configurations written by an administrator are loaded at startup.
 
 ### Other Known Gaps
-- TX always sends 48 frames per 1 ms packet, so it is only correct at 48 kHz.
+- TX packets hold sample rate × ptime frames, but the TX stream's own SDP still states 48 frames per packet at other rates.
 - The SDP parser truncates fractional `a=ptime` values (0.125, 0.25, 0.333 ms), defaults a missing channel count to 2 rather than 1, and rejects some common `a=ts-refclk` forms.
 - The RTP parser ignores CSRC, header extension and padding fields.
 - The receive interface address is resolved once at load, so a DHCP renewal or Wi-Fi roam stops receivers until coreaudiod restarts.
@@ -141,8 +141,8 @@ AES67Driver/
 │   │   ├── SimpleRTP        # RTP socket layer (RFC 3550), kernel arrival timestamps
 │   │   ├── RTPReceiver      # Receive thread: decode, place, report clock margin
 │   │   ├── RtpPlacement     # RTP timestamp -> media position; re-anchor rules
-│   │   ├── RxRouting        # Lock-free table of receive buffers for the IO thread
-│   │   └── RTPTransmitter   # Packet encode + send
+│   │   ├── RxRouting        # Lock-free tables of receive and transmit buffers for the IO thread
+│   │   └── RTPTransmitter   # Sends on the media clock from a buffer the IO thread writes
 │   ├── Clock/               # Step 2 media clock
 │   │   ├── HostTime         # mach tick <-> nanosecond conversion
 │   │   ├── MediaClock       # Lock-free host-time <-> media-sample clock
@@ -178,7 +178,7 @@ These describe what the code is written to target, not what has been verified wi
 | Sample Rates | 44.1kHz - 384kHz | Starts at 48kHz; offers only rates the active streams use; 48kHz verified |
 | Bit Depths | L16, L24 | L24 verified with real hardware |
 | RTP RX Path | Multicast join, decode, placement by RTP timestamp | Verified in Core Audio with test senders; earlier design verified with Riedel Artist |
-| RTP TX Path | Encode, multicast send | Audio path fixed Oct 2026; 48kHz only; not hardware-verified |
+| RTP TX Path | Encode, multicast send on the media clock | Continuous; loopback sample-exact; follows the recovered clock; not yet verified in Core Audio or with hardware |
 | Playout Latency | Fixed link offset, 8 x packet time (8 ms) | Implemented; reported to Core Audio as input latency |
 | Multicast Binding | Interface-specific via IP_MULTICAST_IF | **Verified working on multi-NIC** |
 | IO Lifecycle | RTP threads start/stop with Core Audio IO | Implemented, verified in DAW |

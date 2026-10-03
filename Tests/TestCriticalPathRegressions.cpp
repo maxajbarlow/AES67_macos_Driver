@@ -23,9 +23,9 @@
 #include "../NetworkEngine/RTP/RTPReceiver.h"
 #include "../Driver/AudioThreadPriority.h"
 #include "../NetworkEngine/RTSafeStreamInterface.h"
+#include "../NetworkEngine/RTP/TxContext.h"
 #include "../NetworkEngine/Clock/HostTime.h"
 #include "../NetworkEngine/Clock/TimestampedAudioBuffer.h"
-#include "../Shared/RingBuffer.hpp"
 #include <mach/mach.h>
 #include <mach/thread_policy.h>
 #include <aspl/Context.hpp>
@@ -64,17 +64,6 @@ int checksFailed = 0;
     } while (0)
 
 constexpr size_t kNumChannels = 128;
-constexpr size_t kTestRingSize = 4096;
-
-template<size_t... Is>
-std::array<SPSCRingBuffer<float>, sizeof...(Is)> makeRingBuffers(size_t size, std::index_sequence<Is...>) {
-    return {((void)Is, SPSCRingBuffer<float>(size))...};
-}
-
-std::array<SPSCRingBuffer<float>, kNumChannels> makeRingBuffers(size_t size) {
-    return makeRingBuffers(size, std::make_index_sequence<kNumChannels>{});
-}
-
 // Point the driver's config search at a fresh file containing no streams.
 std::string useEmptyConfig(const std::string& name) {
     const char* tmp = std::getenv("TMPDIR");
@@ -184,24 +173,28 @@ const auto kNoSkip = [](uint16_t) { return false; };
 // RT-safe interface over a harness's receive context plus TX ring buffers
 struct IOFixture {
     RxHarness harness;
-    std::array<SPSCRingBuffer<float>, kNumChannels> outputBuffers = makeRingBuffers(8192);
+    TxRouting txRouting;
     std::atomic<uint64_t> inputUnderruns{0};
     std::atomic<uint64_t> outputOverruns{0};
     std::atomic<bool> ioRunning{true};
-    RTSafeStreamInterface rt{harness.routing, harness.clock, harness.linkOffsetFrames, outputBuffers,
+    RTSafeStreamInterface rt{harness.routing, harness.clock, harness.linkOffsetFrames, txRouting,
                              inputUnderruns, outputOverruns, ioRunning};
     AES67IOHandler handler{rt, kNumChannels, sizeof(float)};
 };
 
 // ---------------------------------------------------------------------------
-// C1: Core Audio output must reach the TX ring buffers.
+// C1: Core Audio output must reach the transmitters.
 // With DeviceParameters::EnableMixing (the default) libASPL delivers output via
-// OnWriteMixedOutput only; OnWriteClientOutput is never called.
+// OnWriteMixedOutput only; OnWriteClientOutput is never called. The mix is
+// written into each TX stream's buffer at the samples' media positions.
 // ---------------------------------------------------------------------------
-void testMixedOutputReachesOutputBuffers() {
-    std::cout << "C1: mixed output reaches TX ring buffers" << std::endl;
+void testMixedOutputReachesTxBuffers() {
+    std::cout << "C1: mixed output reaches TX buffers at its media position" << std::endl;
 
     IOFixture io;
+    TimestampedAudioBuffer tx(2, 16384);  // a 2-channel TX stream on device channels 8-9
+    CHECK(io.txRouting.publish(&tx, 8), "TX route should publish");
+
     constexpr UInt32 kFrames = 64;
     std::vector<float> interleaved(kFrames * kNumChannels);
     for (UInt32 f = 0; f < kFrames; ++f) {
@@ -211,32 +204,33 @@ void testMixedOutputReachesOutputBuffers() {
     }
 
     aspl::IORequestHandler& base = io.handler;
-    base.OnWriteMixedOutput(std::shared_ptr<aspl::Stream>(), 0.0, 0.0, interleaved.data(),
+    const Float64 sampleTime = 2048.0;
+    base.OnWriteMixedOutput(std::shared_ptr<aspl::Stream>(), 0.0, sampleTime, interleaved.data(),
                             static_cast<UInt32>(interleaved.size() * sizeof(float)));
 
-    CHECK(io.outputBuffers[8].available() == kFrames, "channel 8 should receive every mixed frame");
-    float channel8[kFrames] = {};
-    io.outputBuffers[8].read(channel8, kFrames);
+    const int64_t position = io.harness.clock.snapshot().origin + static_cast<int64_t>(sampleTime);
+    std::vector<float> stream(kFrames * 2);
+    CHECK(tx.read(position, kFrames, stream.data(), 2, 0) == kFrames,
+          "every mixed frame should be in the TX buffer at origin + sample time");
     bool matches = true;
     for (UInt32 f = 0; f < kFrames; ++f) {
-        matches = matches && std::fabs(channel8[f] - (8 * 0.001f + f * 1e-5f)) < 1e-7f;
+        matches = matches && std::fabs(stream[f * 2] - (8 * 0.001f + f * 1e-5f)) < 1e-7f &&
+                  std::fabs(stream[f * 2 + 1] - (9 * 0.001f + f * 1e-5f)) < 1e-7f;
     }
-    CHECK(matches, "channel 8 samples should be de-interleaved from the mixed buffer");
+    CHECK(matches, "the stream's channels should come from its device channels 8-9");
 
     // Output buffers larger than the handler's scratch buffer are processed in chunks
     constexpr UInt32 kLarge = 5000;
-    io.outputBuffers[0].reset();
     std::vector<float> large(kLarge * kNumChannels, 0.5f);
-    base.OnWriteMixedOutput(std::shared_ptr<aspl::Stream>(), 0.0, 0.0, large.data(),
+    base.OnWriteMixedOutput(std::shared_ptr<aspl::Stream>(), 0.0, 8192.0, large.data(),
                             static_cast<UInt32>(large.size() * sizeof(float)));
-    CHECK(io.outputBuffers[0].available() == kLarge, "all 5000 output frames should reach the TX ring");
+    std::vector<float> largeRead(kLarge * 2);
+    const int64_t largePosition = io.harness.clock.snapshot().origin + 8192;
+    CHECK(tx.read(largePosition, kLarge, largeRead.data(), 2, 0) == kLarge,
+          "all 5000 output frames should reach the TX buffer at consecutive positions");
+    io.txRouting.unpublish(&tx);
 }
 
-// ---------------------------------------------------------------------------
-// Input is read by device time: Core Audio's sample time T maps to media
-// position origin + T, and the IO thread plays what was received for
-// (origin + T - link offset). Reads are non-destructive, so every client
-// hears the same audio.
 // ---------------------------------------------------------------------------
 void testInputReadsByDeviceTime() {
     std::cout << "IO handler reads input by device time minus link offset" << std::endl;
@@ -414,29 +408,76 @@ void testDeviceClockFollowsReceivedStream() {
 // TX streams must reload as transmitters.
 // ---------------------------------------------------------------------------
 void testTxStreamSurvivesReload() {
-    std::cout << "TX stream survives save/reload" << std::endl;
+    std::cout << "TX stream survives save/reload and transmits continuously" << std::endl;
     useEmptyConfig("txreload");
 
     constexpr const char* kGroup = "239.69.99.2";
     constexpr uint16_t kPort = 55010;
     RxHarness harness;
-    auto outputBuffers = makeRingBuffers(kTestRingSize);
+    TxRouting txRouting;
+    const TxContext txContext{harness.clock, txRouting};
 
     StreamID txID;
     {
-        StreamManager manager(harness.context(), outputBuffers);
+        StreamManager manager(harness.context(), txContext);
         txID = manager.createTxStream("Regression TX", kGroup, kPort, 8, makeMapping(8, 8));
         CHECK(!txID.isNull(), "TX stream should be created");
     }
 
-    StreamManager reloaded(harness.context(), outputBuffers);
+    StreamManager reloaded(harness.context(), txContext);
     CHECK(reloaded.loadSavedStreams(), "saved TX stream should load");
 
+    // AES67 senders send continuously: no Core Audio client is running here
     MulticastListener listener(kGroup, kPort);
-    reloaded.setIOActive(true);
     const size_t packets = listener.countPackets(std::chrono::milliseconds(200));
-    reloaded.setIOActive(false);
-    CHECK(packets > 50, "reloaded TX stream should transmit (saw " << packets << " packets in 200 ms)");
+    CHECK(packets > 150, "a configured TX stream should transmit without IO (saw " << packets << " packets in 200 ms)");
+
+    reloaded.removeAllStreams();
+    const size_t afterRemoval = listener.countPackets(std::chrono::milliseconds(100));
+    CHECK(afterRemoval <= 1, "a removed TX stream should stop (saw " << afterRemoval << " packets)");
+}
+
+// ---------------------------------------------------------------------------
+// Timeline restarts (IO start, sample rate change) never reuse media
+// positions, so no buffer slot written on an old timeline can be read as
+// current on the new one (TX would replay old output).
+// ---------------------------------------------------------------------------
+void testTimelineRestartNeverReusesPositions() {
+    std::cout << "Timeline restarts never reuse media positions" << std::endl;
+    useEmptyConfig("monotonic");
+    auto context = std::make_shared<aspl::Context>();
+    auto device = std::make_shared<AES67Device>(context);
+    device->Initialize();
+
+    int64_t previous = device->GetMediaClock().snapshot().sampleAt(hostTimeNow());
+    bool increasing = true;
+    for (int i = 0; i < 3; ++i) {
+        const uint32_t generation = device->GetMediaClock().snapshot().generation;
+        CHECK(device->StartIO(device->GetID(), 0) == kAudioHardwareNoError, "IO should start");
+        const auto clock = device->GetMediaClock().snapshot();
+        CHECK(clock.generation != generation, "IO start should begin a new timeline");
+        const int64_t now = clock.sampleAt(hostTimeNow());
+        increasing = increasing && now > previous + 16384;
+        previous = now;
+        device->StopIO(device->GetID(), 0);
+    }
+    CHECK(increasing, "each new timeline should start beyond every position the previous one could have used");
+}
+
+// ---------------------------------------------------------------------------
+// With no configuration the device creates its RX test stream only: a TX test
+// stream would now transmit (and be announced) continuously on every install.
+// ---------------------------------------------------------------------------
+void testNoDefaultTxStream() {
+    std::cout << "No built-in TX stream without a configuration" << std::endl;
+    useEmptyConfig("defaults");
+    auto context = std::make_shared<aspl::Context>();
+    auto device = std::make_shared<AES67Device>(context);
+    device->Initialize();
+    MulticastListener listener("239.1.1.2", 5004);
+    CHECK(listener.countPackets(std::chrono::milliseconds(100)) == 0, "nothing should be sent to the old TX test group");
+    CHECK(device->GetStreamManager()->getStreamCount() == 1, "only the RX test stream should exist (got "
+                                                                  << device->GetStreamManager()->getStreamCount() << ")");
 }
 
 // ---------------------------------------------------------------------------
@@ -602,13 +643,15 @@ void testRealTimePriorityReportsSuccess() {
 }
 
 int main() {
-    testMixedOutputReachesOutputBuffers();
+    testMixedOutputReachesTxBuffers();
     testInputReadsByDeviceTime();
     testDeviceSampleRate();
     testDeviceClockFromMediaClock();
     testRealTimePriorityReportsSuccess();
     testIOStartStopLeavesStreamActivityToHAL();
     testDeviceClockFollowsReceivedStream();
+    testTimelineRestartNeverReusesPositions();
+    testNoDefaultTxStream();
     testTxStreamSurvivesReload();
     testReceiverFollowsSenderRestart();
     testLostPacketKeepsTimeline();

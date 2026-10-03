@@ -1,36 +1,51 @@
 /// @file RTPTransmitter.h
-/// @brief RTP packet transmitter with L16/L24 encoding and channel mapping.
+/// @brief RTP packet transmitter with L16/L24 encoding, paced by the media clock.
 
 #pragma once
 
 #include "../../Shared/Types.h"
-#include "../../Shared/RingBuffer.hpp"
 #include "../../Driver/SDPParser.h"
 #include "../StreamChannelMapper.h"
+#include "../Clock/TimestampedAudioBuffer.h"
 #include "SimpleRTP.h"
+#include "TxContext.h"
 #include "../../Driver/AudioThreadPriority.h"
 #include <thread>
 #include <atomic>
 #include <memory>
+#include <vector>
 
 namespace AES67 {
 
-/// Reads audio from device output ring buffers and transmits as RTP multicast packets.
+/// Transmits one stream from the device's output on the media clock.
 ///
-/// Single transmit thread using sleep_until pacing for drift-free timing.
-/// Sends continuous packets (including silence) for receiver clock recovery.
+/// The IO thread writes the output mix into this stream's TimestampedAudioBuffer
+/// at each sample's media position (through TxRouting). The transmit thread
+/// sends the packet holding media positions [M, M + F) when the media clock
+/// reaches M + F, as hardware senders do: neither early nor late at receivers.
+/// Positions nothing wrote (no Core Audio client running) are sent as silence,
+/// so the stream flows continuously whenever the transmitter runs.
+///
+/// RTP timestamps are M plus an offset. A timeline restart (new clock
+/// generation) moves media positions; the offset is adjusted so the RTP
+/// timestamps continue without a jump. With PTP (step 2 phase 4) the offset
+/// becomes the SDP mediaclk offset and timelines no longer restart.
 class RTPTransmitter {
 public:
-    using DeviceChannelBuffers = std::array<SPSCRingBuffer<float>, 128>;
+    struct TransmitStatistics {
+        uint64_t packetsSent{0};
+        uint64_t packetsSkipped{0};    // fell too far behind and were not sent
+        uint64_t timelineRestarts{0};  // media clock generation changes followed
+    };
 
     /// @param sdp SDP session describing the TX stream configuration.
-    /// @param mapping Channel mapping from device channels to stream channels.
-    /// @param deviceChannels Reference to device output ring buffers.
+    /// @param mapping Channel mapping from device output channels to stream channels.
+    /// @param context Media clock and the routing the IO thread writes through.
     /// @param networkInterface Interface name ("en0") or IP to bind multicast. Empty = default.
     RTPTransmitter(
         const SDPSession& sdp,
         const ChannelMapping& mapping,
-        DeviceChannelBuffers& deviceChannels,
+        TxContext context,
         const std::string& networkInterface = ""
     );
 
@@ -54,6 +69,10 @@ public:
 
     StatisticsSnapshot getStatistics() const;
     void resetStatistics();
+    TransmitStatistics getTransmitStatistics() const;
+
+    /// Frames per packet: the sample rate times ptime.
+    uint32_t framesPerPacket() const { return framesPerPacket_; }
 
     //
     // Configuration
@@ -63,12 +82,13 @@ public:
     const SDPSession& getSDPSession() const { return sdp_; }
     const ChannelMapping& getMapping() const { return mapping_; }
 
-private:
-    // Transmit thread function
-    void transmitLoop();
+    /// Packets more than this many behind are skipped rather than sent late,
+    /// so a descheduled thread leaves a gap instead of a burst.
+    static constexpr int64_t kMaxLatePackets = 4;
 
-    // Read audio from device channels and interleave
-    bool readDeviceChannels(float* interleavedAudio, size_t frameCount);
+private:
+    void transmitLoop();
+    void sendPosition(int64_t position, uint32_t timestamp);
 
     // Audio encoding
     void encodeL16(const float* audio, size_t frameCount, uint8_t* payload);
@@ -80,8 +100,13 @@ private:
     // Configuration
     SDPSession sdp_;
     ChannelMapping mapping_;
-    DeviceChannelBuffers& deviceChannels_;
+    TxContext context_;
     std::string networkInterface_;
+    const uint32_t framesPerPacket_;
+
+    // Output samples by media position, written by the IO thread
+    std::unique_ptr<TimestampedAudioBuffer> buffer_;
+    bool published_{false};
 
     // RTP socket
     RTP::RTPSocket rtpSocket_;
@@ -92,17 +117,16 @@ private:
 
     // Statistics (atomic operations, no mutex needed for individual updates)
     Statistics stats_;
+    std::atomic<uint64_t> packetsSent_{0};
+    std::atomic<uint64_t> packetsSkipped_{0};
+    std::atomic<uint64_t> timelineRestarts_{0};
 
-    // RTP state
+    // RTP state (transmit thread only while running)
     uint16_t sequenceNumber_{0};
-    uint32_t timestamp_{0};
+    uint32_t nextTimestamp_{0};
     uint32_t ssrc_{0};
 
-    // Timing
-    std::chrono::steady_clock::time_point startTime_;
-    std::chrono::microseconds packetInterval_;
-
-    // Audio buffer (reused to avoid allocations)
+    // Reused to avoid allocation on the transmit thread
     std::vector<float> audioBuffer_;
     std::vector<uint8_t> payloadBuffer_;
 };

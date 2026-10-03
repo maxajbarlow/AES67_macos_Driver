@@ -16,20 +16,6 @@
 
 namespace AES67 {
 
-// Helper to create initialized ring buffer array
-namespace {
-    template<size_t... Is>
-    auto MakeRingBufferArray(size_t bufferSize, std::index_sequence<Is...>) {
-        return std::array<SPSCRingBuffer<float>, sizeof...(Is)>{
-            ((void)Is, SPSCRingBuffer<float>(bufferSize))...
-        };
-    }
-
-    auto MakeRingBufferArray(size_t bufferSize) {
-        return MakeRingBufferArray(bufferSize, std::make_index_sequence<AES67Device::kNumChannels>{});
-    }
-}
-
 AES67Device::AES67Device(std::shared_ptr<aspl::Context> context)
     : aspl::Device(context, aspl::DeviceParameters{
         .Name = "AES67 Device",
@@ -43,22 +29,11 @@ AES67Device::AES67Device(std::shared_ptr<aspl::Context> context)
         .ClockIsStable = true,
         .ClockAlgorithm = kAudioDeviceClockAlgorithmRaw
     })
-    // Output ring buffers sized for the maximum supported sample rate (384kHz)
-    // so they never need resizing. Power-of-2 sizing: 384kHz @ 3ms = 1152 → 2048
-    , outputBuffers_(MakeRingBufferArray(
-          CalculateRingBufferSize(384000.0)))  // Max sample rate
     , clockRecovery_(ClockServo::Config{}, [this](uint64_t, double ratio) { ApplyRecoveredRate(ratio); })
 {
     AES67_LOG("AES67Device constructor: Starting initialization");
     linkOffsetFrames_.store(LinkOffsetFramesFor(currentSampleRate_.load()));
-    const Float64 initialSampleRate = currentSampleRate_.load();
-    const size_t ringBufferSize = CalculateRingBufferSize(384000.0);
-    AES67_LOGF("AES67Device: Initial sample rate = %.0f Hz", initialSampleRate);
-    AES67_LOGF("AES67Device: Ring buffer size = %zu samples (sized for max 384kHz)",
-               ringBufferSize);
-    AES67_LOGF("AES67Device: Buffer latency @ %.0f Hz = %.2f ms",
-               initialSampleRate,
-               (ringBufferSize * 1000.0) / initialSampleRate);
+    AES67_LOGF("AES67Device: Initial sample rate = %.0f Hz", currentSampleRate_.load());
 
     // NOTE: Cannot call InitializeStreams() here because shared_from_this()
     // won't work until the shared_ptr is fully constructed
@@ -84,7 +59,7 @@ void AES67Device::Initialize() {
         rxRouting_,
         mediaClock_,
         linkOffsetFrames_,
-        outputBuffers_,
+        txRouting_,
         inputUnderruns_,
         outputUnderruns_,
         ioRunning_
@@ -98,7 +73,8 @@ void AES67Device::Initialize() {
     // Initialize Stream Manager (manages all AES67 network streams)
     AES67_LOG("AES67Device: Creating StreamManager");
     streamManager_ = std::make_unique<StreamManager>(
-        RxContext{mediaClock_, networkTime_, rxRouting_, linkOffsetFrames_, &clockRecovery_}, outputBuffers_);
+        RxContext{mediaClock_, networkTime_, rxRouting_, linkOffsetFrames_, &clockRecovery_},
+        TxContext{mediaClock_, txRouting_});
     AES67_LOG("AES67Device: StreamManager created successfully");
 
     // Set device sample rate in StreamManager
@@ -109,7 +85,7 @@ void AES67Device::Initialize() {
     AES67_LOG("AES67Device: Attempting to load saved stream configurations");
     bool loadedSavedStreams = streamManager_->loadSavedStreams();
 
-    // If no saved streams were loaded, create test streams for initial testing
+    // If no saved streams were loaded, create a test RX stream for initial testing
     if (!loadedSavedStreams) {
         // Create test RX stream (Network → Core Audio) on channels 0-7
         AES67_LOG("AES67Device: No saved streams found, adding test RX stream (239.1.1.1:5004, 8ch @ 48kHz)");
@@ -137,27 +113,8 @@ void AES67Device::Initialize() {
             AES67_LOG("AES67Device: WARNING - Failed to add test RX stream");
         }
 
-        // Create test TX stream (Core Audio → Network) on channels 8-15
-        // Uses a different multicast group (239.1.1.2) to avoid confusion with RX
-        AES67_LOG("AES67Device: Adding test TX stream (239.1.1.2:5004, 8ch @ 48kHz, channels 8-15)");
-        ChannelMapping txMapping;
-        txMapping.streamChannelCount = 8;
-        txMapping.deviceChannelStart = 8;   // Channels 8-15 (non-overlapping with RX 0-7)
-        txMapping.deviceChannelCount = 8;
-
-        StreamID txStreamID = streamManager_->createTxStream(
-            "Test AES67 TX Stream",
-            "239.1.1.2",   // Different multicast group from RX (239.1.1.1)
-            5004,
-            8,
-            txMapping
-        );
-        if (!txStreamID.isNull()) {
-            AES67_LOG("AES67Device: Test TX stream added successfully");
-            AES67_LOGF("AES67Device: Test TX stream ID: %s", txStreamID.toString().c_str());
-        } else {
-            AES67_LOG("AES67Device: WARNING - Failed to add test TX stream");
-        }
+        // No built-in TX stream: a configured TX stream transmits
+        // continuously, so one must never appear unasked
     }
 
     AES67_LOG("AES67Device::Initialize() complete");
@@ -298,8 +255,7 @@ OSStatus AES67Device::SetNominalSampleRateImpl(Float64 rate) {
         ApplyStreamSampleRate(*outputStream_, rate);
     }
 
-    AES67_LOGF("SetNominalSampleRateImpl: Now running at %.0f Hz (ring buffer %.2f ms)",
-               rate, (outputBuffers_[0].capacity() * 1000.0) / rate);
+    AES67_LOGF("SetNominalSampleRateImpl: Now running at %.0f Hz", rate);
     return kAudioHardwareNoError;
 }
 
@@ -308,8 +264,14 @@ void AES67Device::RestartTimeline(Float64 sampleRate) {
     clockRecovery_.reset();
 
     std::lock_guard<std::mutex> lock(clockWriteMutex_);
-    mediaClock_.reset(hostTimeNow(), 0,
-                      MediaClock::samplesPerTick(sampleRate, 1.0, HostTimebase::current()));
+    // Media positions are never reused: the new timeline starts beyond any
+    // position the old one (or Core Audio writing output ahead on it) can have
+    // touched, so no buffer slot from before reads as current. Device sample
+    // time still starts at 0, counted from the new origin.
+    const MediaClock::Snapshot previous = mediaClock_.snapshot();
+    const uint64_t now = hostTimeNow();
+    const int64_t start = previous.valid() ? previous.sampleAt(now) + kTimelineGapFrames : 0;
+    mediaClock_.reset(now, start, MediaClock::samplesPerTick(sampleRate, 1.0, HostTimebase::current()));
     // Network time was anchored to the old timeline; receivers re-anchor on
     // their next packet (they also see the new clock generation)
     networkTime_.reset();
@@ -440,47 +402,6 @@ void AES67Device::ResetStatistics() {
 
 OSStatus AES67Device::OnSetBufferSize(UInt32 bufferSize) {
     return SetBufferSize(bufferSize);
-}
-
-size_t AES67Device::CalculateRingBufferSize(Float64 sampleRate, double latencyMs) {
-    // Calculate ring buffer size for desired latency
-    // Formula: samples = (sampleRate × latencyMs) / 1000
-    //
-    // Examples (with 3ms latency):
-    //   48kHz @ 3ms = 144 samples → 256 (rounded to power of 2)
-    //   96kHz @ 3ms = 288 samples → 512
-    //   192kHz @ 3ms = 576 samples → 1024
-    //   384kHz @ 3ms = 1152 samples → 2048
-    //
-    // Minimum 3ms buffer provides adequate tolerance for:
-    // - Network jitter (typical: 0.5-1ms)
-    // - Processing delays (typical: 0.5-1ms)
-    // - Scheduling variations (typical: 0.5-1ms)
-    //
-    // Power-of-2 sizing enables efficient modulo operations
-
-    // Calculate minimum size based on latency requirement
-    const size_t minSize = static_cast<size_t>(
-        (sampleRate * latencyMs) / 1000.0
-    );
-
-    // Round up to next power of 2 for efficient modulo operations
-    size_t size = 1;
-    while (size < minSize) {
-        size <<= 1;
-    }
-
-    // Enforce absolute minimum (512 samples = 10.6ms @ 48kHz, 1.3ms @ 384kHz)
-    constexpr size_t kMinRingBufferSize = 512;
-
-    // Enforce maximum to prevent excessive memory (8192 samples = 21.3ms @ 384kHz)
-    // At 128 channels × 4 bytes/sample: 8192 × 128 × 4 = 4MB per buffer direction
-    constexpr size_t kMaxRingBufferSize = 8192;
-
-    size = std::max(size, kMinRingBufferSize);
-    size = std::min(size, kMaxRingBufferSize);
-
-    return size;
 }
 
 } // namespace AES67

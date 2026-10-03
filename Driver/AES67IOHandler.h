@@ -70,7 +70,8 @@ public:
 
     // Called when Core Audio has output data for device
     // Receives the mix of all clients (DeviceParameters::EnableMixing is true,
-    // so libASPL never calls OnWriteClientOutput) and writes it to outputBuffers_
+    // so libASPL never calls OnWriteClientOutput) and writes it into each TX
+    // stream's buffer at the samples' media positions
     void OnWriteMixedOutput(
         const std::shared_ptr<aspl::Stream>& stream,
         Float64 zeroTimestamp,
@@ -88,7 +89,7 @@ private:
     // Process output stream (Core Audio → Network)
     // RT-SAFE: Writes to ring buffers, discards on overrun
     // Uses batch processing for optimal performance
-    void processOutput(const float* inputData, UInt32 frameCount, UInt32 channelCount) noexcept;
+    void processOutput(const float* inputData, UInt32 frameCount, UInt32 channelCount, Float64 sampleTime) noexcept;
 
     // RT-safe interface (compile-time boundary)
     // Provides lock-free access to ring buffers and atomic counters.
@@ -104,7 +105,7 @@ private:
     // Constants
     static constexpr size_t kNumChannels = 128;
 
-    // Largest block processOutput handles at once (stack scratch size)
+    // Largest block processOutput handles at once
     static constexpr UInt32 kMaxFramesPerChunk = 4096;
 
     // Allow benchmark direct access to processInput/processOutput
