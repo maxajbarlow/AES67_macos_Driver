@@ -28,6 +28,12 @@ class StreamManager {
 public:
     using StreamCallback = std::function<void(const StreamInfo&)>;
 
+    /// Where and how far a TX stream is sent.
+    struct TxOptions {
+        std::string networkInterface;  // name ("en0") or IP; empty = default route
+        uint8_t ttl{32};               // multicast TTL; 0 keeps the stream on this host
+    };
+
     /// @param rxContext Device state receivers place audio against (clock, routing, link offset).
     /// @param txContext Device state transmitters send from (clock, routing the IO thread writes).
     ///
@@ -65,6 +71,17 @@ public:
     //
 
     /// Create a TX stream that reads from device output channels and sends RTP.
+    StreamID createTxStream(
+        const std::string& name,
+        const std::string& multicastIP,
+        uint16_t port,
+        uint16_t numChannels,
+        const ChannelMapping& mapping,
+        const TxOptions& options
+    );
+
+    /// As above with default options (default route, TTL 32). An overload, as
+    /// a nested struct's initialisers are not usable in a default argument.
     StreamID createTxStream(
         const std::string& name,
         const std::string& multicastIP,
@@ -179,6 +196,7 @@ private:
         std::unique_ptr<RTPTransmitter> transmitter;
         StreamInfo info;
         bool isTransmit{false};
+        std::string networkInterface;  // as configured (saved with the stream)
     };
 
     // Validation helpers

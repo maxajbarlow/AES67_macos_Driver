@@ -65,6 +65,7 @@ SDPSession txSdp(const char* group, uint16_t port) {
     sdp.ptime = 1;
     sdp.framecount = kFramesPerPacket;
     sdp.direction = "sendonly";
+    sdp.ttl = 0;  // host-only: test streams never leave this machine
     return sdp;
 }
 
@@ -376,6 +377,23 @@ void testLoopbackThroughOurReceiverIsSampleExact() {
     CHECK(receiver.getPlacementStatistics().reanchors == 0, "the receiver should never need to re-anchor");
 }
 
+// A stream's TTL comes from its SDP: tests use 0 so nothing leaves the host
+void testMulticastTtlFollowsTheSdp() {
+    std::cout << "TX multicast TTL follows the stream's SDP" << std::endl;
+    TxHarness h;
+    RTPTransmitter hostOnly(txSdp("239.69.99.45", 55080), txMapping(0), h.context());
+    CHECK(hostOnly.start(), "transmitter should start");
+    CHECK(hostOnly.multicastTtl() == 0, "a TTL 0 stream should stay on this host (TTL " << int(hostOnly.multicastTtl()) << ")");
+    hostOnly.stop();
+
+    SDPSession routed = txSdp("239.69.99.45", 55080);
+    routed.ttl = 16;
+    RTPTransmitter network(routed, txMapping(2), h.context(), "127.0.0.1");  // loopback interface only
+    CHECK(network.start(), "transmitter should start");
+    CHECK(network.multicastTtl() == 16, "the socket should use the SDP's TTL (TTL " << int(network.multicastTtl()) << ")");
+    network.stop();
+}
+
 } // namespace
 
 int main() {
@@ -384,6 +402,7 @@ int main() {
     testFollowsTheMediaClockRate();
     testTimelineRestartKeepsRtpContinuous();
     testLoopbackThroughOurReceiverIsSampleExact();
+    testMulticastTtlFollowsTheSdp();
 
     std::cout << "\nTX media clock: " << checksPassed << " passed, " << checksFailed << " failed" << std::endl;
     return checksFailed == 0 ? 0 : 1;

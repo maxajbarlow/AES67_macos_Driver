@@ -144,7 +144,7 @@ bool RTPSocket::openReceiver(const char* multicastIP, uint16_t port, const char*
     return true;
 }
 
-bool RTPSocket::openTransmitter(const char* multicastIP, uint16_t port, const char* interfaceIP) {
+bool RTPSocket::openTransmitter(const char* multicastIP, uint16_t port, const char* interfaceIP, uint8_t ttl) {
     // Create UDP socket
     sockfd_ = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd_ < 0) {
@@ -154,7 +154,6 @@ bool RTPSocket::openTransmitter(const char* multicastIP, uint16_t port, const ch
     }
 
     // Set multicast TTL
-    uint8_t ttl = 32;
     if (setsockopt(sockfd_, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl)) < 0) {
         fprintf(stderr, "AES67 RTP openTransmitter: IP_MULTICAST_TTL failed for %s:%u (errno=%d: %s)\n",
                 multicastIP, port, errno, strerror(errno));
@@ -188,6 +187,18 @@ bool RTPSocket::openTransmitter(const char* multicastIP, uint16_t port, const ch
     multicastAddr_.sin_port = htons(port);
 
     return true;
+}
+
+uint8_t RTPSocket::multicastTTL() const {
+    if (sockfd_ < 0) {
+        return 0;
+    }
+    uint8_t ttl = 0;
+    socklen_t length = sizeof(ttl);
+    if (getsockopt(sockfd_, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, &length) < 0) {
+        return 0;
+    }
+    return ttl;
 }
 
 ssize_t RTPSocket::send(const RTPPacket& packet) {

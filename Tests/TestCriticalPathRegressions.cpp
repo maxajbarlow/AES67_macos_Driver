@@ -39,6 +39,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <iostream>
 #include <sstream>
 #include <thread>
@@ -65,6 +66,9 @@ int checksFailed = 0;
 
 constexpr size_t kNumChannels = 128;
 // Point the driver's config search at a fresh file containing no streams.
+// Test TX streams stay on this host: TTL 0, default interface
+const StreamManager::TxOptions kHostOnly{"", 0};
+
 std::string useEmptyConfig(const std::string& name) {
     const char* tmp = std::getenv("TMPDIR");
     std::string path = std::string(tmp ? tmp : "/tmp/") + "aes67_regression_" + name + ".json";
@@ -420,7 +424,7 @@ void testTxStreamSurvivesReload() {
     StreamID txID;
     {
         StreamManager manager(harness.context(), txContext);
-        txID = manager.createTxStream("Regression TX", kGroup, kPort, 8, makeMapping(8, 8));
+        txID = manager.createTxStream("Regression TX", kGroup, kPort, 8, makeMapping(8, 8), kHostOnly);
         CHECK(!txID.isNull(), "TX stream should be created");
     }
 
@@ -435,6 +439,27 @@ void testTxStreamSurvivesReload() {
     reloaded.removeAllStreams();
     const size_t afterRemoval = listener.countPackets(std::chrono::milliseconds(100));
     CHECK(afterRemoval <= 1, "a removed TX stream should stop (saw " << afterRemoval << " packets)");
+}
+
+// ---------------------------------------------------------------------------
+// A TX stream's interface and TTL are part of its configuration: both must
+// survive a save (saving used to drop every stream's interface).
+// ---------------------------------------------------------------------------
+void testTxOptionsAreSaved() {
+    std::cout << "TX interface and TTL are saved" << std::endl;
+    const std::string path = useEmptyConfig("txoptions");
+    RxHarness harness;
+    TxRouting txRouting;
+    {
+        StreamManager manager(harness.context(), TxContext{harness.clock, txRouting});
+        const StreamID id = manager.createTxStream("Options TX", "239.69.99.6", 55026, 2, makeMapping(2, 0),
+                                                   StreamManager::TxOptions{"127.0.0.1", 0});
+        CHECK(!id.isNull(), "TX stream should be created");
+    }
+    std::ifstream file(path);
+    const std::string json((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    CHECK(json.find("\"networkInterface\": \"127.0.0.1\"") != std::string::npos, "the TX stream's interface should be saved");
+    CHECK(json.find("\"ttl\": 0") != std::string::npos, "the TX stream's TTL should be saved");
 }
 
 // ---------------------------------------------------------------------------
@@ -650,6 +675,7 @@ int main() {
     testRealTimePriorityReportsSuccess();
     testIOStartStopLeavesStreamActivityToHAL();
     testDeviceClockFollowsReceivedStream();
+    testTxOptionsAreSaved();
     testTimelineRestartNeverReusesPositions();
     testNoDefaultTxStream();
     testTxStreamSurvivesReload();

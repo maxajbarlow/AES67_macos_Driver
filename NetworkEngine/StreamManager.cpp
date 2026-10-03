@@ -236,6 +236,17 @@ StreamID StreamManager::createTxStream(
     uint16_t numChannels,
     const ChannelMapping& mapping
 ) {
+    return createTxStream(name, multicastIP, port, numChannels, mapping, TxOptions{});
+}
+
+StreamID StreamManager::createTxStream(
+    const std::string& name,
+    const std::string& multicastIP,
+    uint16_t port,
+    uint16_t numChannels,
+    const ChannelMapping& mapping,
+    const TxOptions& options
+) {
     std::lock_guard<std::mutex> lock(streamsMutex_);
 
     // Build SDP session for transmit stream
@@ -250,6 +261,7 @@ StreamID StreamManager::createTxStream(
     sdp.direction = "sendonly"; // loadSavedStreams() relies on this to recreate a transmitter
     sdp.sessionID = static_cast<uint64_t>(std::time(nullptr));
     sdp.sessionVersion = 1;
+    sdp.ttl = options.ttl;
 
     // Validate
     std::string error;
@@ -281,9 +293,10 @@ StreamID StreamManager::createTxStream(
     managed.sdp = sdp;
     managed.mapping = completeMapping;
     managed.isTransmit = true;
+    managed.networkInterface = options.networkInterface;
 
     // Create RTP transmitter
-    managed.transmitter = createTransmitter(sdp, completeMapping);
+    managed.transmitter = createTransmitter(sdp, completeMapping, options.networkInterface);
     if (!managed.transmitter) {
         AES67_LOGF("StreamManager::createTxStream: failed to create RTP transmitter for '%s'",
                    name.c_str());
@@ -726,6 +739,7 @@ bool StreamManager::loadSavedStreams() {
         managed.sdp = config.sdp;
         managed.mapping = config.mapping;
         managed.isTransmit = (config.sdp.direction == "sendonly" || config.sdp.direction == "sendrecv");
+        managed.networkInterface = config.networkInterface;
 
         // Transmitters start now; receivers start only if IO is active
         if (managed.isTransmit) {
@@ -820,6 +834,7 @@ bool StreamManager::saveAllStreamsInternal() {
             managed.mapping,
             managed.info.description
         );
+        config.networkInterface = managed.networkInterface;
 
         configs.push_back(config);
     }
