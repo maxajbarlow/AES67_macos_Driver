@@ -136,6 +136,7 @@ SDPSession makeRxSDP(const char* group, uint16_t port, uint16_t channels) {
     sdp.payloadType = kPayloadTypeL24;
     sdp.ptime = 1;
     sdp.framecount = kFramesPerPacket;
+    sdp.ttl = 0;  // host-only, even if a regression made this stream transmit
     return sdp;
 }
 
@@ -562,6 +563,71 @@ void testTxStreamIsAnnounced() {
 }
 
 // ---------------------------------------------------------------------------
+// Input and output channels are separate: a Core Audio device has 128 of
+// each, in different buffers, so RX on inputs 1-2 and TX from outputs 1-2 is
+// the ordinary setup, not an overlap.
+// ---------------------------------------------------------------------------
+void testInputAndOutputChannelsAreSeparate() {
+    std::cout << "Input and output channels are allocated separately" << std::endl;
+    useEmptyConfig("iochannels");
+    RxHarness harness;
+    TxRouting txRouting;
+    StreamManager manager(harness.context(), TxContext{harness.clock, txRouting}, testSap());
+    using Direction = StreamManager::Direction;
+
+    const StreamID rx = manager.addStream(makeRxSDP("239.69.99.10", 55032, 2), makeMapping(2, 0));
+    CHECK(!rx.isNull(), "RX on input channels 0-1 should be added");
+    const StreamID tx = manager.createTxStream("IO TX", "239.69.99.11", 55034, 2, makeMapping(2, 0), kHostOnly);
+    CHECK(!tx.isNull(), "TX from output channels 0-1 should not clash with RX on input channels 0-1");
+    CHECK(manager.getAvailableChannelCount(Direction::Receive) == 126, "2 input channels in use");
+    CHECK(manager.getAvailableChannelCount(Direction::Transmit) == 126, "2 output channels in use");
+
+    CHECK(manager.createTxStream("IO TX 2", "239.69.99.12", 55036, 2, makeMapping(2, 1), kHostOnly).isNull(),
+          "a second TX overlapping output channels 0-1 should be refused");
+    CHECK(manager.addStream(makeRxSDP("239.69.99.13", 55038, 2), makeMapping(2, 1)).isNull(),
+          "a second RX overlapping input channels 0-1 should be refused");
+
+    CHECK(manager.getAllMappings(Direction::Receive).size() == 1 && manager.getAllMappings(Direction::Transmit).size() == 1,
+          "each direction lists its own mappings");
+    CHECK(manager.getMapping(tx).has_value() && manager.getMapping(rx).has_value(), "both streams' mappings are found");
+
+    manager.removeStream(tx);
+    CHECK(manager.getAvailableChannelCount(Direction::Transmit) == 128, "removing the TX frees its output channels");
+    CHECK(manager.getAvailableChannelCount(Direction::Receive) == 126, "and leaves the inputs alone");
+}
+
+// ---------------------------------------------------------------------------
+// A sender's SDP may describe its own role (a=sendonly or sendrecv). Added as
+// a receive stream it must stay one: on input channels, and still a receiver
+// (not a transmitter) after a reload.
+// ---------------------------------------------------------------------------
+void testSenderSdpDirectionDoesNotMakeATransmitter() {
+    std::cout << "A received stream stays a receiver whatever its SDP's direction" << std::endl;
+    useEmptyConfig("rxdirection");
+    RxHarness harness;
+    TxRouting txRouting;
+    const TxContext txContext{harness.clock, txRouting};
+    using Direction = StreamManager::Direction;
+
+    SDPSession senderSdp = makeRxSDP("239.69.99.14", 55040, 2);
+    senderSdp.direction = "sendonly";  // as the sender sees it
+    {
+        StreamManager manager(harness.context(), txContext, testSap());
+        CHECK(!manager.addStream(senderSdp, makeMapping(2, 0)).isNull(), "the RX stream should be added");
+        CHECK(manager.getAvailableChannelCount(Direction::Receive) == 126 &&
+                  manager.getAvailableChannelCount(Direction::Transmit) == 128,
+              "it should take input channels, not output channels");
+    }
+    StreamManager reloaded(harness.context(), txContext, testSap());
+    CHECK(reloaded.loadSavedStreams(), "the RX stream should reload");
+    CHECK(reloaded.getAvailableChannelCount(Direction::Receive) == 126 &&
+              reloaded.getAvailableChannelCount(Direction::Transmit) == 128,
+          "after a reload it should still be a receive stream");
+    MulticastListener listener("239.69.99.14", 55040);
+    CHECK(listener.countPackets(std::chrono::milliseconds(100)) == 0, "nothing should be transmitted to its group");
+}
+
+// ---------------------------------------------------------------------------
 // Timeline restarts (IO start, sample rate change) never reuse media
 // positions, so no buffer slot written on an old timeline can be read as
 // current on the new one (TX would replay old output).
@@ -775,6 +841,8 @@ int main() {
     testIOStartStopLeavesStreamActivityToHAL();
     testDeviceClockFollowsReceivedStream();
     testTxOptionsAreSaved();
+    testInputAndOutputChannelsAreSeparate();
+    testSenderSdpDirectionDoesNotMakeATransmitter();
     testTxStreamIsAnnounced();
     testTimelineRestartNeverReusesPositions();
     testNoDefaultTxStream();
