@@ -74,6 +74,9 @@ public:
     /// Frames per packet: the sample rate times ptime.
     uint32_t framesPerPacket() const { return framesPerPacket_; }
 
+    /// Multicast TTL in use (from the SDP; 0 keeps the stream on this host).
+    uint8_t multicastTtl() const { return rtpSocket_.multicastTTL(); }
+
     //
     // Configuration
     //

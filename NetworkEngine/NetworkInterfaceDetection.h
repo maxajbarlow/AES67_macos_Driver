@@ -47,6 +47,27 @@ public:
     static std::string getInterfaceIPAddress(const std::string& interfaceName);
 
     /**
+     * Name of the interface holding an IPv4 address
+     * @return Interface name, or empty string if no interface has it
+     */
+    static std::string getInterfaceForIPAddress(const std::string& ipAddress);
+
+    /**
+     * Hardware (MAC) address of an interface, dash-separated upper-case hex
+     * as SDP's ts-refclk:localmac= expects (e.g. "00-1D-C1-D1-7B-F3")
+     * @return MAC address, or empty string if the interface has none
+     */
+    static std::string getInterfaceMACAddress(const std::string& interfaceName);
+
+    /**
+     * IPv4 address for an interface setting as streams store it: an
+     * interface name ("en0"), an IPv4 address, or empty for the primary
+     * ethernet interface
+     * @return IPv4 address, or empty string if it cannot be resolved
+     */
+    static std::string resolveIPv4Address(const std::string& interfaceSetting);
+
+    /**
      * Check if an interface supports multicast
      * @param interfaceName Name of the interface to check
      * @return true if interface supports multicast, false otherwise

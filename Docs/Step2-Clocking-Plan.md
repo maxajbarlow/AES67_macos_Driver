@@ -278,9 +278,15 @@ Each phase is a separate PR, test-first, and leaves the driver working.
     - a timeline restart leaves RTP continuous
     - TX into our own receiver on one clock was sample-exact: 72,000 samples with 0 discontinuities
   - Clean under ThreadSanitizer.
+- SAP announcements (2026-10-03), the reason TX was brought forward:
+  - **`SAPAnnouncer`** (RFC 2974) announces each TX stream at once, re-announces it every 30 s randomised by +/-1/3, and sends a deletion (same message ID hash) on removal or shutdown.
+  - **Announced SDP.** `StreamManager` announces from the stream's own interface and TTL, with `recvonly`, the interface address in `o=`, framecount from the rate, and a random session ID saved with the stream.
+  - **Clock reference.** Until PTP, it signals the Mac's own clock with `ts-refclk:localmac=<interface MAC>` (RFC 7273) rather than claiming a PTP reference.
+  - **Dante prefix.** TX groups outside Dante's default AES67 prefix (239.69.0.0/16) are logged: marcnnn found with a WING that Dante lists such streams but never subscribes.
+  - **Tests.** Live tests announce on a test port with TTL 0. A capture on en0 during the full suite sees no test traffic leave the Mac. Earlier TX tests used TTL 32 and did reach the LAN; that is fixed.
 - Pending:
   - **The real HAL.** In particular, check whether coreaudiod's background timer coalescing delays TX while no client is running. marcnnn's fork measured 15-37 ms send stalls in that state, fixed only by clearing the process's Darwin background classification.
-  - **PTP-derived timestamps and a compliant SDP** (`ts-refclk`, `mediaclk`, framecount from the rate).
+  - **PTP-derived timestamps**, with `ts-refclk:ptp=` and a real `mediaclk` offset (phase 4).
   - **Criterion 4** with a Dante or RAVENNA receiver.
 
 ### Phase 6 (optional): ASRC for foreign-clock streams

@@ -115,6 +115,7 @@ static SDPSession createTestSDP(
     sdp.framecount = framecount;
     sdp.originAddress = "127.0.0.1";
     sdp.ptpDomain = 0;
+    sdp.ttl = 0;  // host-only: test streams never leave this machine
     return sdp;
 }
 

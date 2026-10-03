@@ -122,7 +122,11 @@ public:
     bool openReceiver(const char* multicastIP, uint16_t port, const char* interfaceIP = nullptr);
 
     // Transmitter setup
-    bool openTransmitter(const char* multicastIP, uint16_t port, const char* interfaceIP = nullptr);
+    /// @param ttl Multicast TTL. 0 keeps packets on this host (loopback only).
+    bool openTransmitter(const char* multicastIP, uint16_t port, const char* interfaceIP = nullptr, uint8_t ttl = 32);
+
+    /// The socket's multicast TTL as the kernel reports it (0 if not open).
+    uint8_t multicastTTL() const;
 
     // Send RTP packet
     ssize_t send(const RTPPacket& packet);

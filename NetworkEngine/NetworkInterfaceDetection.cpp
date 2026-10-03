@@ -6,6 +6,7 @@
 #include <arpa/inet.h>
 #include <string.h>
 #include <unistd.h>
+#include <cstdio>
 
 namespace AES67 {
 
@@ -139,6 +140,62 @@ std::string NetworkInterfaceDetection::getInterfaceIPAddress(const std::string& 
     }
 
     return ipAddress;
+}
+
+std::string NetworkInterfaceDetection::getInterfaceForIPAddress(const std::string& ipAddress) {
+    struct ifaddrs *ifaddrs_ptr, *ifa;
+    std::string name;
+
+    if (getifaddrs(&ifaddrs_ptr) == 0) {
+        for (ifa = ifaddrs_ptr; ifa != nullptr; ifa = ifa->ifa_next) {
+            if (ifa->ifa_name && ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_INET &&
+                ipAddress == inet_ntoa(reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr)->sin_addr)) {
+                name = ifa->ifa_name;
+                break;
+            }
+        }
+        freeifaddrs(ifaddrs_ptr);
+    }
+
+    return name;
+}
+
+std::string NetworkInterfaceDetection::getInterfaceMACAddress(const std::string& interfaceName) {
+    struct ifaddrs *ifaddrs_ptr, *ifa;
+    std::string mac;
+
+    if (getifaddrs(&ifaddrs_ptr) == 0) {
+        for (ifa = ifaddrs_ptr; ifa != nullptr; ifa = ifa->ifa_next) {
+            if (!ifa->ifa_name || interfaceName != ifa->ifa_name || !ifa->ifa_addr ||
+                ifa->ifa_addr->sa_family != AF_LINK) {
+                continue;
+            }
+            const auto* link = reinterpret_cast<const struct sockaddr_dl*>(ifa->ifa_addr);
+            if (link->sdl_alen != 6) {
+                break;  // no hardware address (e.g. loopback)
+            }
+            const auto* bytes = reinterpret_cast<const unsigned char*>(LLADDR(link));
+            char text[18];
+            snprintf(text, sizeof(text), "%02X-%02X-%02X-%02X-%02X-%02X", bytes[0], bytes[1], bytes[2], bytes[3],
+                     bytes[4], bytes[5]);
+            mac = text;
+            break;
+        }
+        freeifaddrs(ifaddrs_ptr);
+    }
+
+    return mac;
+}
+
+std::string NetworkInterfaceDetection::resolveIPv4Address(const std::string& interfaceSetting) {
+    if (interfaceSetting.empty()) {
+        return getInterfaceIPAddress(getPrimaryEthernetInterface());
+    }
+    struct in_addr probe {};
+    if (inet_pton(AF_INET, interfaceSetting.c_str(), &probe) == 1) {
+        return interfaceSetting;
+    }
+    return getInterfaceIPAddress(interfaceSetting);
 }
 
 bool NetworkInterfaceDetection::supportsMulticast(const std::string& interfaceName) {

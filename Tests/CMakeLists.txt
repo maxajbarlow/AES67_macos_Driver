@@ -283,6 +283,21 @@ target_include_directories(TestTxMediaClock PRIVATE
 
 target_compile_features(TestTxMediaClock PRIVATE cxx_std_17)
 
+# Test: SAP announcements (RFC 2974)
+add_executable(TestSAPAnnouncer
+    TestSAPAnnouncer.cpp
+    ../NetworkEngine/Discovery/SAPAnnouncer.cpp
+    ../NetworkEngine/Discovery/SAPListener.cpp
+    ../NetworkEngine/NetworkInterfaceDetection.cpp
+    ../Shared/Types.cpp
+)
+
+target_include_directories(TestSAPAnnouncer PRIVATE
+    ${CMAKE_SOURCE_DIR}
+)
+
+target_compile_features(TestSAPAnnouncer PRIVATE cxx_std_17)
+
 # Add tests to CTest
 enable_testing()
 add_test(NAME ClockRecovery COMMAND TestClockRecovery)
@@ -299,6 +314,7 @@ add_test(NAME StreamManager COMMAND TestStreamManager)
 add_test(NAME MultiStream COMMAND TestMultiStream)
 add_test(NAME IntegrationAudioPath COMMAND TestIntegrationAudioPath)
 add_test(NAME SAPListener COMMAND TestSAPListener)
+add_test(NAME SAPAnnouncer COMMAND TestSAPAnnouncer)
 add_test(NAME TxMediaClock COMMAND TestTxMediaClock)
 
 # The driver bundle must carry a valid signature over its resources: Core

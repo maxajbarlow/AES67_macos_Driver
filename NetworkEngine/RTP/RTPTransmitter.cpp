@@ -95,7 +95,7 @@ bool RTPTransmitter::start() {
 
     // Open RTP transmitter socket
     const char* ifaceIP = networkInterface_.empty() ? nullptr : networkInterface_.c_str();
-    if (!rtpSocket_.openTransmitter(sdp_.connectionAddress.c_str(), sdp_.port, ifaceIP)) {
+    if (!rtpSocket_.openTransmitter(sdp_.connectionAddress.c_str(), sdp_.port, ifaceIP, sdp_.ttl)) {
         AES67_LOGF("RTPTransmitter::start: socket open failed for %s:%u iface=%s (stream=%s)",
                    sdp_.connectionAddress.c_str(), sdp_.port,
                    networkInterface_.empty() ? "ANY" : networkInterface_.c_str(),

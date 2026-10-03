@@ -25,6 +25,7 @@ A work-in-progress open-source virtual audio driver for macOS that aims to provi
 **Implemented and tested, not yet verified in Core Audio:**
 
 - Transmit on the media clock: TX streams send continuously whenever configured (silence when no app is playing), follow the recovered clock, and loop back through the driver's own receiver sample-exact.
+- SAP announcements (RFC 2974): each TX stream is announced while configured and deleted when removed, so receivers that discover streams by SAP (Dante Controller among them) can list it. Until PTP (phase 4) the announcement signals the Mac's own clock (`ts-refclk:localmac=`), so PTP-aligned receivers such as Dante will list the stream but not play it yet.
 
 **Next:** repeat the RX test on the Riedel with the rebuilt path, for 1 hour with a test tone.
 
@@ -53,7 +54,7 @@ AES67 needs every device on one PTP-derived media clock. Step 2 replaces the dri
 | Phase 2: receive by RTP timestamp | Done | Received audio is placed by RTP timestamp at a fixed link offset (8 ms, matching the Riedel's 8 x packet time receive buffer), so latency is fixed and streams on one network timeline are sample-aligned. The jitter buffer, consume thread and rate controller are gone. In Core Audio: two streams sample-aligned and two apps receiving identical input, with no re-anchors or breaks. A re-anchor now needs a timeline change lasting 50 ms, so sender stalls no longer move the timeline |
 | Phase 3: clock recovered from a received stream | Done (Riedel test pending) | The device clock follows the first received stream, so a sender's drift no longer reaches the playout buffer. In simulation, 8 hours at +/-100 ppm: no re-anchors, no drops, latency constant to +/-1 sample. Over loopback, a 1500 ppm fast sender plays without a gap. In Core Audio, the device rate locked to a sender 200 ppm fast. Next: a 1-hour capture from the Riedel |
 | Phase 4: PTP slave and servo | Planned | Rewritten PTP slave driving the media clock |
-| Phase 5: transmit on the media clock | In progress | TX is now paced by the media clock and runs whenever a stream is configured, sending silence when no app is playing. Loopback through our own receiver is sample-exact, and TX follows the recovered clock. Still to come: PTP-derived timestamps for Dante and RAVENNA (needs phase 4) and verification in Core Audio |
+| Phase 5: transmit on the media clock | In progress | TX is now paced by the media clock and runs whenever a stream is configured, sending silence when no app is playing. Loopback through our own receiver is sample-exact, and TX follows the recovered clock. TX streams are announced over SAP while configured. Still to come: PTP-derived timestamps for Dante and RAVENNA (needs phase 4) and verification in Core Audio |
 | Phase 6: resampling for foreign-clock streams | Optional | |
 | Spike S3: PTP accuracy against a real grandmaster | Needs hardware | |
 
@@ -72,13 +73,14 @@ AES67 needs every device on one PTP-derived media clock. Step 2 replaces the dri
 - Received audio is placed by RTP timestamp at a fixed link offset, using kernel arrival timestamps (step 2, phase 2)
 - The device clock is recovered from a received stream (step 2, phase 3): a PI servo holds the stream's playout margin constant
 - Stream manager handles RX/TX stream lifecycle, channel mapping, and SDP import/export
+- TX streams are announced over SAP (RFC 2974) while configured, with a stable session ID, on the stream's own interface and TTL
 - Stream configurations load from `streams.json` (see the config search paths below); saving from inside coreaudiod does not work yet (see Known Limitations)
 - RT-safe interface boundary prevents accidental mutex access from the audio callback at compile time
 - Multicast receiver can bind to a specific network interface (prevents duplicate packets on multi-NIC machines)
 - Receive threads follow the Core Audio IO lifecycle (no receive work while no client is running); transmit threads run whenever a TX stream is configured
 - An earlier PTP slave implementation exists but is not functional (see Known Limitations); step 2 phase 4 replaces it
 - Test sender/receiver tools exercise the network path over loopback
-- 16 tests (SDP parser, channel mapper, ring buffer, RTP receiver, RTP transmitter, PTP clock, stream manager, multi-stream, integration audio path, critical-path regressions, clock foundations, RX timestamp placement, clock recovery, SAP listener, TX on the media clock, and a check of the driver bundle's code signature), all passing in Debug and Release builds. The clock, receive and transmit suites also run clean under ThreadSanitizer, and key tests are checked by mutation (deliberately breaking the code and confirming a test fails)
+- 17 tests (SDP parser, channel mapper, ring buffer, RTP receiver, RTP transmitter, PTP clock, stream manager, multi-stream, integration audio path, critical-path regressions, clock foundations, RX timestamp placement, clock recovery, SAP listener, SAP announcer, TX on the media clock, and a check of the driver bundle's code signature), all passing in Debug and Release builds. Tests that transmit or announce use TTL 0, so nothing leaves the machine. The clock, receive and transmit suites also run clean under ThreadSanitizer, and key tests are checked by mutation (deliberately breaking the code and confirming a test fails)
 - IO handler benchmark exists for real-time performance characterisation
 - Doxygen API documentation can be generated via `make docs`
 - Flexible configuration: supports interface name ("en0") or IP address, auto-detects if not specified
@@ -125,9 +127,8 @@ The SwiftUI Manager app renders its interface but does not control the driver. I
 The driver reads `streams.json` from `$AES67_CONFIG_PATH`, `~/Library/Application Support/AES67Driver/`, then `/Library/Application Support/AES67Driver/`. The installer creates the system directory owned by root, so the driver (running as `_coreaudiod`) cannot save changes there. Configurations written by an administrator are loaded at startup. Without a configuration, the driver creates one test RX stream (239.1.1.1:5004, 8 channels, L24) and no TX stream.
 
 ### Other Known Gaps
-- TX streams are not announced over SAP yet, so receivers that discover streams that way (Dante Controller among them) do not list them. SAP announcements are in progress.
+- Dante receivers subscribe only to AES67 multicast inside the prefix in their AES67 settings (default 239.69.0.0/16). The driver logs a warning for TX streams outside it.
 - A configured TX stream wakes its transmit thread once per packet (every 1 ms at the default packet time), even when no app is playing.
-- TX packets hold sample rate × ptime frames, but the TX stream's own SDP still states 48 frames per packet at other rates.
 - The SDP parser truncates fractional `a=ptime` values (0.125, 0.25, 0.333 ms) and defaults a missing channel count to 2 rather than 1.
 - The RTP parser ignores CSRC, header extension and padding fields.
 - The receive interface address is resolved once at load, so a DHCP renewal or Wi-Fi roam stops receivers until coreaudiod restarts.
@@ -160,7 +161,7 @@ AES67Driver/
 │   ├── PTP/                 # Earlier PTP code, not functional (to be replaced)
 │   │   └── ptpd/            # Vendored ptpd source (not used)
 │   ├── StreamManager        # RX/TX stream lifecycle: receivers follow Core Audio IO, transmitters run while configured
-│   └── Discovery/           # SAP stream discovery (RFC 2974)
+│   └── Discovery/           # SAP (RFC 2974): SAPListener discovers streams, SAPAnnouncer announces TX streams
 ├── Shared/                  # Common components
 │   ├── RingBuffer.hpp       # Lock-free SPSC ring buffer
 │   └── Types.h              # Common data structures

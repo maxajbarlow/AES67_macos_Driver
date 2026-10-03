@@ -6,6 +6,7 @@
 
 #include "StreamManager.h"
 #include "NetworkUtils.h"
+#include "NetworkInterfaceDetection.h"
 #include "../Driver/DebugLog.h"
 #include <algorithm>
 #include <fstream>
@@ -14,9 +15,10 @@
 
 namespace AES67 {
 
-StreamManager::StreamManager(RxContext rxContext, TxContext txContext)
+StreamManager::StreamManager(RxContext rxContext, TxContext txContext, SAPAnnouncer::Config sapConfig)
     : rxContext_(rxContext)
     , txContext_(txContext)
+    , announcer_(std::move(sapConfig))
     , configManager_(std::make_unique<StreamConfigManager>())
 {
 }
@@ -189,6 +191,7 @@ bool StreamManager::removeStream(const StreamID& id) {
     }
     if (it->second.transmitter) {
         it->second.transmitter->stop();
+        announcer_.withdraw(id);
     }
 
     // Remove from mapper
@@ -216,6 +219,7 @@ void StreamManager::removeAllStreams() {
         }
         if (pair.second.transmitter) {
             pair.second.transmitter->stop();
+            announcer_.withdraw(pair.first);
         }
 
         notifyStreamRemoved(pair.second.info);
@@ -236,6 +240,17 @@ StreamID StreamManager::createTxStream(
     uint16_t numChannels,
     const ChannelMapping& mapping
 ) {
+    return createTxStream(name, multicastIP, port, numChannels, mapping, TxOptions{});
+}
+
+StreamID StreamManager::createTxStream(
+    const std::string& name,
+    const std::string& multicastIP,
+    uint16_t port,
+    uint16_t numChannels,
+    const ChannelMapping& mapping,
+    const TxOptions& options
+) {
     std::lock_guard<std::mutex> lock(streamsMutex_);
 
     // Build SDP session for transmit stream
@@ -248,8 +263,22 @@ StreamID StreamManager::createTxStream(
     sdp.encoding = "L24"; // Use L24 for best quality
     sdp.payloadType = 97; // Dynamic payload type
     sdp.direction = "sendonly"; // loadSavedStreams() relies on this to recreate a transmitter
-    sdp.sessionID = static_cast<uint64_t>(std::time(nullptr));
+    // A random session ID, saved with the stream: unique even for streams
+    // created in the same second, and stable across reloads, so SAP receivers
+    // list each stream exactly once
+    sdp.sessionID = std::uniform_int_distribution<uint32_t>(1, UINT32_MAX)(sessionIdRandom_);
     sdp.sessionVersion = 1;
+    sdp.ttl = options.ttl;
+    sdp.framecount = static_cast<uint32_t>(sdp.sampleRate * sdp.ptime / 1000);
+
+    // Dante receivers only subscribe to AES67 multicast inside the prefix in
+    // their AES67 settings (default 239.69.0.0/16). Outside it a stream is
+    // listed in Dante Controller but never subscribes (seen with a Behringer
+    // WING); other AES67 receivers have no such limit, so warn, don't refuse.
+    if (multicastIP.rfind("239.69.", 0) != 0) {
+        AES67_LOGF("StreamManager::createTxStream: %s is outside 239.69.0.0/16; Dante receivers with the default "
+                   "AES67 prefix will list '%s' but not subscribe to it", multicastIP.c_str(), name.c_str());
+    }
 
     // Validate
     std::string error;
@@ -281,9 +310,10 @@ StreamID StreamManager::createTxStream(
     managed.sdp = sdp;
     managed.mapping = completeMapping;
     managed.isTransmit = true;
+    managed.networkInterface = options.networkInterface;
 
     // Create RTP transmitter
-    managed.transmitter = createTransmitter(sdp, completeMapping);
+    managed.transmitter = createTransmitter(sdp, completeMapping, options.networkInterface);
     if (!managed.transmitter) {
         AES67_LOGF("StreamManager::createTxStream: failed to create RTP transmitter for '%s'",
                    name.c_str());
@@ -313,6 +343,7 @@ StreamID StreamManager::createTxStream(
 
     // Store stream
     streams_[id] = std::move(managed);
+    announceTx(id, streams_[id]);
 
     // Notify callback
     notifyStreamAdded(streams_[id].info);
@@ -629,6 +660,35 @@ std::unique_ptr<RTPReceiver> StreamManager::createReceiver(
     return std::make_unique<RTPReceiver>(sdp, mapping, rxContext_, networkInterface);
 }
 
+void StreamManager::announceTx(const StreamID& id, const ManagedStream& managed) {
+    const std::string address = NetworkInterfaceDetection::resolveIPv4Address(managed.networkInterface);
+    if (address.empty()) {
+        AES67_LOGF("StreamManager: no IPv4 address for interface '%s'; '%s' is not announced",
+                   managed.networkInterface.c_str(), managed.sdp.sessionName.c_str());
+        return;
+    }
+
+    // The description receivers subscribe from
+    SDPSession sdp = managed.sdp;
+    sdp.direction = "recvonly";  // AES67: what a receiver does with the stream
+    sdp.originNetworkType = "IN";
+    sdp.originAddressType = "IP4";
+    sdp.originAddress = address;
+    sdp.framecount = managed.transmitter->framesPerPacket();
+
+    // Until PTP (step 2 phase 4) the media clock is this Mac's own: say so
+    // (RFC 7273 localmac) rather than claim a PTP reference
+    sdp.ptpDomain = -1;
+    sdp.ptpMasterMAC.clear();
+    const std::string mac = NetworkInterfaceDetection::getInterfaceMACAddress(
+        NetworkInterfaceDetection::getInterfaceForIPAddress(address));
+    if (!mac.empty()) {
+        sdp.customAttributes["ts-refclk"] = "localmac=" + mac;
+    }
+
+    announcer_.announce(id, SDPParser::generate(sdp), address, sdp.ttl);
+}
+
 std::unique_ptr<RTPTransmitter> StreamManager::createTransmitter(
     const SDPSession& sdp,
     const ChannelMapping& mapping,
@@ -726,6 +786,7 @@ bool StreamManager::loadSavedStreams() {
         managed.sdp = config.sdp;
         managed.mapping = config.mapping;
         managed.isTransmit = (config.sdp.direction == "sendonly" || config.sdp.direction == "sendrecv");
+        managed.networkInterface = config.networkInterface;
 
         // Transmitters start now; receivers start only if IO is active
         if (managed.isTransmit) {
@@ -784,6 +845,9 @@ bool StreamManager::loadSavedStreams() {
 
         // Store stream
         streams_[id] = std::move(managed);
+        if (streams_[id].transmitter) {
+            announceTx(id, streams_[id]);
+        }
 
         // Notify callback
         notifyStreamAdded(streams_[id].info);
@@ -820,6 +884,7 @@ bool StreamManager::saveAllStreamsInternal() {
             managed.mapping,
             managed.info.description
         );
+        config.networkInterface = managed.networkInterface;
 
         configs.push_back(config);
     }

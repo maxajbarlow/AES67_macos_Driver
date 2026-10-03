@@ -17,6 +17,9 @@
 //
 
 #include "RxTestSupport.h"
+#include "SapTestSupport.h"
+#include "../NetworkEngine/Discovery/SAPListener.h"
+#include "../NetworkEngine/NetworkInterfaceDetection.h"
 #include "../Driver/AES67Device.h"
 #include "../Driver/AES67IOHandler.h"
 #include "../NetworkEngine/StreamManager.h"
@@ -39,6 +42,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <iostream>
 #include <sstream>
 #include <thread>
@@ -65,6 +69,18 @@ int checksFailed = 0;
 
 constexpr size_t kNumChannels = 128;
 // Point the driver's config search at a fresh file containing no streams.
+// Test TX streams stay on this host: TTL 0, default interface
+const StreamManager::TxOptions kHostOnly{"", 0};
+
+// Test StreamManagers announce on a test port: even TTL 0 announcements on the
+// real port 9875 would reach SAP listeners on this Mac (Dante Controller)
+SAPAnnouncer::Config testSap() {
+    SAPAnnouncer::Config config;
+    config.port = kTestSapPort;
+    config.interval = std::chrono::milliseconds(500);
+    return config;
+}
+
 std::string useEmptyConfig(const std::string& name) {
     const char* tmp = std::getenv("TMPDIR");
     std::string path = std::string(tmp ? tmp : "/tmp/") + "aes67_regression_" + name + ".json";
@@ -419,12 +435,12 @@ void testTxStreamSurvivesReload() {
 
     StreamID txID;
     {
-        StreamManager manager(harness.context(), txContext);
-        txID = manager.createTxStream("Regression TX", kGroup, kPort, 8, makeMapping(8, 8));
+        StreamManager manager(harness.context(), txContext, testSap());
+        txID = manager.createTxStream("Regression TX", kGroup, kPort, 8, makeMapping(8, 8), kHostOnly);
         CHECK(!txID.isNull(), "TX stream should be created");
     }
 
-    StreamManager reloaded(harness.context(), txContext);
+    StreamManager reloaded(harness.context(), txContext, testSap());
     CHECK(reloaded.loadSavedStreams(), "saved TX stream should load");
 
     // AES67 senders send continuously: no Core Audio client is running here
@@ -435,6 +451,114 @@ void testTxStreamSurvivesReload() {
     reloaded.removeAllStreams();
     const size_t afterRemoval = listener.countPackets(std::chrono::milliseconds(100));
     CHECK(afterRemoval <= 1, "a removed TX stream should stop (saw " << afterRemoval << " packets)");
+}
+
+// ---------------------------------------------------------------------------
+// A TX stream's interface and TTL are part of its configuration: both must
+// survive a save (saving used to drop every stream's interface).
+// ---------------------------------------------------------------------------
+void testTxOptionsAreSaved() {
+    std::cout << "TX interface and TTL are saved" << std::endl;
+    const std::string path = useEmptyConfig("txoptions");
+    RxHarness harness;
+    TxRouting txRouting;
+    {
+        StreamManager manager(harness.context(), TxContext{harness.clock, txRouting}, testSap());
+        const StreamID id = manager.createTxStream("Options TX", "239.69.99.6", 55026, 2, makeMapping(2, 0),
+                                                   StreamManager::TxOptions{"127.0.0.1", 0});
+        CHECK(!id.isNull(), "TX stream should be created");
+    }
+    std::ifstream file(path);
+    const std::string json((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    CHECK(json.find("\"networkInterface\": \"127.0.0.1\"") != std::string::npos, "the TX stream's interface should be saved");
+    CHECK(json.find("\"ttl\": 0") != std::string::npos, "the TX stream's TTL should be saved");
+}
+
+// ---------------------------------------------------------------------------
+// SAP: a TX stream is announced while it is configured, with an SDP a
+// receiver can subscribe from, and deleted when it goes. Its session ID is
+// unique and survives a reload, so receivers do not list it twice.
+// ---------------------------------------------------------------------------
+std::vector<SDPSession> announcedSessions(const std::vector<Received>& packets, const std::string& name) {
+    std::vector<SDPSession> sessions;
+    for (const auto& p : packets) {
+        if (isDeletion(p)) continue;
+        const auto sap = SAPListener::parseAnnouncement(reinterpret_cast<const char*>(p.bytes.data()), p.bytes.size(), "");
+        auto sdp = SDPParser::parseString(sap.sessionDescription);
+        if (sdp && sdp->sessionName == name) sessions.push_back(*sdp);
+    }
+    return sessions;
+}
+
+void testTxStreamIsAnnounced() {
+    std::cout << "TX streams are announced over SAP while configured" << std::endl;
+    useEmptyConfig("sap");
+    const std::string address = NetworkInterfaceDetection::resolveIPv4Address("");
+    if (address.empty()) {
+        std::cout << "  skipped: no network interface" << std::endl;
+        return;
+    }
+    SapCapture capture("239.255.255.255", kTestSapPort, address);
+    RxHarness harness;
+    TxRouting txRouting;
+    const TxContext txContext{harness.clock, txRouting};
+    size_t deletionsWhileRunning = 0;
+    size_t announcementsOfBAfterRemoval = 0;
+    {
+        StreamManager manager(harness.context(), txContext, testSap());
+        CHECK(!manager.createTxStream("SAP TX A", "239.69.99.7", 55028, 2, makeMapping(2, 0), kHostOnly).isNull(),
+              "TX stream A should be created");
+        const StreamID idB = manager.createTxStream("SAP TX B", "239.69.99.8", 55030, 2, makeMapping(2, 2), kHostOnly);
+        CHECK(!idB.isNull(), "TX stream B should be created");
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+        // Removing a stream withdraws it at once, while the manager runs
+        const size_t before = capture.packets().size();
+        manager.removeStream(idB);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1200));  // over two re-announce intervals
+        const auto during = capture.packets();
+        for (size_t i = before; i < during.size(); ++i) {
+            deletionsWhileRunning += isDeletion(during[i]) ? 1 : 0;
+        }
+        announcementsOfBAfterRemoval =
+            announcedSessions(std::vector<Received>(during.begin() + static_cast<ptrdiff_t>(before), during.end()), "SAP TX B").size();
+    }
+    CHECK(deletionsWhileRunning == 1, "removing a stream should send its deletion (got " << deletionsWhileRunning << ")");
+    CHECK(announcementsOfBAfterRemoval == 0, "a removed stream should no longer be announced");
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const auto first = capture.packets();
+
+    const auto a = announcedSessions(first, "SAP TX A");
+    const auto b = announcedSessions(first, "SAP TX B");
+    CHECK(!a.empty() && !b.empty(), "both streams should be announced");
+    if (!a.empty() && !b.empty()) {
+        const SDPSession& sdp = a.front();
+        CHECK(sdp.connectionAddress == "239.69.99.7" && sdp.port == 55028, "the announcement carries the stream's group and port");
+        CHECK(sdp.direction == "recvonly", "receivers are told to receive (a=recvonly)");
+        CHECK(sdp.originNetworkType == "IN" && sdp.originAddressType == "IP4" && sdp.originAddress == address,
+              "o= names this Mac's address (got " << sdp.originAddress << ")");
+        CHECK(sdp.framecount == 48 && sdp.ptime == 1, "1 ms packets of 48 frames at 48 kHz");
+        CHECK(sdp.ptpDomain == -1, "no PTP reference is claimed before phase 4");
+        const auto refclk = sdp.customAttributes.find("ts-refclk");
+        CHECK(refclk != sdp.customAttributes.end() && refclk->second.rfind("localmac=", 0) == 0,
+              "the reference clock is signalled as this Mac's own (ts-refclk:localmac=)");
+        CHECK(a.front().sessionID != b.front().sessionID && a.front().sessionID != 0,
+              "each stream has its own session ID");
+    }
+    size_t deletions = 0;
+    for (const auto& p : first) deletions += isDeletion(p) ? 1 : 0;
+    CHECK(deletions == 2, "each stream is deleted exactly once (got " << deletions << ")");
+
+    {
+        StreamManager reloaded(harness.context(), txContext, testSap());
+        CHECK(reloaded.loadSavedStreams(), "saved TX streams should load");
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    const auto all = capture.packets();
+    const auto reloadedA = announcedSessions(std::vector<Received>(all.begin() + static_cast<ptrdiff_t>(first.size()), all.end()),
+                                             "SAP TX A");
+    CHECK(!reloadedA.empty() && !a.empty() && reloadedA.front().sessionID == a.front().sessionID,
+          "a reloaded stream keeps its session ID");
 }
 
 // ---------------------------------------------------------------------------
@@ -650,6 +774,8 @@ int main() {
     testRealTimePriorityReportsSuccess();
     testIOStartStopLeavesStreamActivityToHAL();
     testDeviceClockFollowsReceivedStream();
+    testTxOptionsAreSaved();
+    testTxStreamIsAnnounced();
     testTimelineRestartNeverReusesPositions();
     testNoDefaultTxStream();
     testTxStreamSurvivesReload();

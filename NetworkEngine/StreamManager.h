@@ -10,9 +10,11 @@
 #include "RTP/RTPReceiver.h"
 #include "RTP/RxContext.h"
 #include "RTP/TxContext.h"
+#include "Discovery/SAPAnnouncer.h"
 #include "RTP/RTPTransmitter.h"
 #include "PTP/PTPClock.h"
 #include <map>
+#include <random>
 #include <memory>
 #include <mutex>
 #include <functional>
@@ -28,13 +30,22 @@ class StreamManager {
 public:
     using StreamCallback = std::function<void(const StreamInfo&)>;
 
+    /// Where and how far a TX stream is sent.
+    struct TxOptions {
+        std::string networkInterface;  // name ("en0") or IP; empty = default route
+        uint8_t ttl{32};               // multicast TTL; 0 keeps the stream on this host
+    };
+
     /// @param rxContext Device state receivers place audio against (clock, routing, link offset).
     /// @param txContext Device state transmitters send from (clock, routing the IO thread writes).
     ///
+    /// @param sapConfig Where TX streams are announced (SAP, RFC 2974).
+    ///
     /// Receivers run only while Core Audio IO is active (setIOActive). Transmitters
     /// run whenever their stream is configured: AES67 senders send continuously,
-    /// silence included.
-    StreamManager(RxContext rxContext, TxContext txContext);
+    /// silence included, and each is announced over SAP while it runs.
+    StreamManager(RxContext rxContext, TxContext txContext,
+                  SAPAnnouncer::Config sapConfig = SAPAnnouncer::Config{});
     ~StreamManager();
 
     // Prevent copy/move
@@ -65,6 +76,17 @@ public:
     //
 
     /// Create a TX stream that reads from device output channels and sends RTP.
+    StreamID createTxStream(
+        const std::string& name,
+        const std::string& multicastIP,
+        uint16_t port,
+        uint16_t numChannels,
+        const ChannelMapping& mapping,
+        const TxOptions& options
+    );
+
+    /// As above with default options (default route, TTL 32). An overload, as
+    /// a nested struct's initialisers are not usable in a default argument.
     StreamID createTxStream(
         const std::string& name,
         const std::string& multicastIP,
@@ -179,6 +201,7 @@ private:
         std::unique_ptr<RTPTransmitter> transmitter;
         StreamInfo info;
         bool isTransmit{false};
+        std::string networkInterface;  // as configured (saved with the stream)
     };
 
     // Validation helpers
@@ -206,6 +229,10 @@ private:
     void notifyStreamRemoved(const StreamInfo& info);
     void notifyStreamStatusChanged(const StreamInfo& info);
 
+    // Announce a running TX stream over SAP (caller holds streamsMutex_)
+    void announceTx(const StreamID& id, const ManagedStream& managed);
+
+
     // Configuration helpers
     void autoSaveIfEnabled();
     bool saveAllStreamsInternal();  // Internal version without locking
@@ -213,6 +240,8 @@ private:
     // Data members
     RxContext rxContext_;                   // RTP receivers place audio here (Network → Core Audio)
     TxContext txContext_;                   // RTP transmitters send from here (Core Audio → Network)
+    SAPAnnouncer announcer_;                // announces TX streams while they run
+    std::mt19937 sessionIdRandom_{std::random_device{}()};  // guarded by streamsMutex_
     StreamChannelMapper mapper_;
     std::map<StreamID, ManagedStream> streams_;
     mutable std::mutex streamsMutex_;
