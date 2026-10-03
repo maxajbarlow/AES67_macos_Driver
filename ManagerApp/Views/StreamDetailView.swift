@@ -236,6 +236,8 @@ struct ChannelMapVisualization: View {
     }
 }
 
+#if DEBUG  // previews need Xcode: plain swiftc (build.sh) has no PreviewsMacros plugin
 #Preview {
     StreamDetailView(stream: StreamInfo.example)
 }
+#endif

@@ -767,7 +767,9 @@ struct LegendItem: View {
 
 // MARK: - Preview
 
+#if DEBUG  // previews need Xcode: plain swiftc (build.sh) has no PreviewsMacros plugin
 #Preview {
     ChannelMappingView(driverManager: DriverManager())
         .frame(width: 1200, height: 800)
 }
+#endif

@@ -45,7 +45,6 @@ Progress is tracked in the [step 2 plan](Docs/Step2-Clocking-Plan.md).
 - Dante only subscribes to multicast in its configured range (default 239.69.x.x). The driver warns about streams outside it.
 - If you set a stream's interface as an IP address, it breaks when the address changes. Use the interface name (e.g. `en0`).
 - Fractional packet times (e.g. 0.125 ms) aren't supported yet.
-- The Manager app build can fail on some setups because of SwiftUI `#Preview` blocks ([issue #3](https://github.com/maxajbarlow/AES67_macos_Driver/issues/3)). The driver doesn't need it.
 
 ## Building
 

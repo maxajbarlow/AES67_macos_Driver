@@ -493,6 +493,7 @@ extension StreamInfo {
 
 // MARK: - Previews
 
+#if DEBUG  // previews need Xcode: plain swiftc (build.sh) has no PreviewsMacros plugin
 #Preview("Level Meter") {
     VStack(spacing: 20) {
         LevelMeter(level: 0.3, peak: 0.4)
@@ -503,7 +504,9 @@ extension StreamInfo {
     .padding()
     .frame(width: 300)
 }
+#endif
 
+#if DEBUG  // previews need Xcode: plain swiftc (build.sh) has no PreviewsMacros plugin
 #Preview("Channel Meters") {
     ChannelMetersView(
         channelLevels: StreamAudioLevels.mockData(channelCount: 8).channelLevels
@@ -511,7 +514,9 @@ extension StreamInfo {
     .padding()
     .frame(width: 400)
 }
+#endif
 
+#if DEBUG  // previews need Xcode: plain swiftc (build.sh) has no PreviewsMacros plugin
 #Preview("Compact Meters") {
     CompactChannelMeters(
         channelLevels: StreamAudioLevels.mockData(channelCount: 8).channelLevels
@@ -519,7 +524,9 @@ extension StreamInfo {
     .padding()
     .frame(width: 200)
 }
+#endif
 
+#if DEBUG  // previews need Xcode: plain swiftc (build.sh) has no PreviewsMacros plugin
 #Preview("Signal Indicator") {
     VStack(spacing: 20) {
         SignalPresentIndicator(hasSignal: true)
@@ -528,13 +535,17 @@ extension StreamInfo {
     }
     .padding()
 }
+#endif
 
+#if DEBUG  // previews need Xcode: plain swiftc (build.sh) has no PreviewsMacros plugin
 #Preview("Stream Audio Panel") {
     StreamAudioStatusPanel(stream: StreamInfo.example)
         .padding()
         .frame(width: 400)
 }
+#endif
 
+#if DEBUG  // previews need Xcode: plain swiftc (build.sh) has no PreviewsMacros plugin
 #Preview("Legacy Views") {
     VStack {
         AudioStatusPanel()
@@ -552,3 +563,4 @@ extension StreamInfo {
     }
     .padding()
 }
+#endif

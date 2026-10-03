@@ -330,7 +330,9 @@ struct AboutSettings: View {
     }
 }
 
+#if DEBUG  // previews need Xcode: plain swiftc (build.sh) has no PreviewsMacros plugin
 #Preview {
     SettingsView()
         .environmentObject(DriverManager())
 }
+#endif

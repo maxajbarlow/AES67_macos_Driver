@@ -626,7 +626,9 @@ struct MiniLevelIndicator: View {
     }
 }
 
+#if DEBUG  // previews need Xcode: plain swiftc (build.sh) has no PreviewsMacros plugin
 #Preview {
     StreamListView(selectedStream: .constant(nil))
         .environmentObject(DriverManager())
 }
+#endif
