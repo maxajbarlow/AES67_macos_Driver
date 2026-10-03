@@ -2,7 +2,7 @@
 
 > **EXPERIMENTAL SOFTWARE — USE WITH CAUTION**
 >
-> This is a work-in-progress open-source AES67 audio driver for macOS. The RX (receive) path has been **verified working with real AES67 hardware** (Riedel Artist intercom system) and audio successfully flows into DAW software (Reaper). That verification used short captures and predates the October 2026 critical-path fixes (see [Recent Fixes](#recent-fixes)); it needs repeating over longer sessions. The TX (transmit) path has not yet been tested with real hardware.
+> This is a work-in-progress open-source AES67 audio driver for macOS. An earlier version of the RX (receive) path received audio from real AES67 hardware (a Riedel Artist intercom system) into Reaper in short tests. Since then, the receive path and device clock have been rebuilt around a single media clock ([step 2](#step-2-clocking-redesign-in-progress)). The rebuilt path is verified in Core Audio with test senders, but not yet with the Riedel. The TX (transmit) path has not been tested with real hardware.
 >
 > **Production use is not recommended without thorough testing in your environment.** This project is under active development.
 
@@ -10,22 +10,30 @@ A work-in-progress open-source virtual audio driver for macOS that aims to provi
 
 ## Current Status
 
-**Verified Working (Real Hardware):**
+**Verified with real hardware (before step 2):**
 
-- **RX Path Tested with Riedel Artist:** Audio successfully received from Riedel Artist intercom system via AES67 multicast and recorded in Reaper
-- Multicast interface binding verified on multi-NIC machine (correctly binds to specified interface)
-- L24 encoding at 48kHz, 1ms packet time verified working with professional broadcast hardware
+- RX from a Riedel Artist intercom system via AES67 multicast, recorded in Reaper
+- Multicast interface binding on a multi-NIC machine (binds to the specified interface)
+- L24 at 48 kHz with 1 ms packets
 
-## Recent Fixes
+**Verified in Core Audio with test senders (step 2, October 2026):**
 
-A full technical review in October 2026 found several defects on the critical audio path. These are fixed, each with a regression test in `Tests/TestCriticalPathRegressions.cpp` that failed before the fix:
+- Received audio is placed by RTP timestamp at a fixed 8 ms latency. Two streams arrive sample-aligned, and two apps recording at once receive identical input.
+- The device clock follows the received stream. With a sender 200 ppm fast, Core Audio's measured device rate locked to +200 ppm, with no breaks in the audio.
+- Sender stalls of up to 23 ms play as short silences without moving the timeline.
+
+**Next:** repeat the RX test on the Riedel with the rebuilt path, for 1 hour with a test tone.
+
+## Step 1: Critical-Path Fixes
+
+A full technical review in October 2026 found several defects on the critical audio path. These were fixed, each with a regression test in `Tests/TestCriticalPathRegressions.cpp` that failed before the fix. Step 2 then replaced the receive pacing machinery (consume thread, jitter buffer, rate controller) with timestamp placement. The receive fixes below keep their regression tests, rewritten against the new design:
 
 - **TX sent only silence.** libASPL delivers mixed output through `OnWriteMixedOutput` (`DeviceParameters::EnableMixing` defaults to true); the driver only implemented `OnWriteClientOutput`, which is never called in that mode.
 - **The device ran at 44.1 kHz.** libASPL's default nominal rate is 44.1 kHz while the streams declared 48 kHz, and rate changes from Audio MIDI Setup never reached the driver. The device now starts at 48 kHz, offers only rates the active streams can deliver, and applies rate changes to the driver, StreamManager and both streams' formats.
-- **The RX pacing loop ran away.** It measured the device ring buffer, which the consume thread cannot regulate, and ran itself to its +0.5% clamp within about 10 seconds, causing periodic underruns and steadily growing latency. It now holds the jitter buffer at its prefill depth, which locks consumption to the sender's packet rate.
-- **A sender restart caused up to 65 seconds of silence.** The receiver now follows a new source once 4 consecutive packets agree, and ignores single late packets and second senders on the same group.
+- **The RX pacing loop ran away.** It measured the device ring buffer, which the consume thread cannot regulate, and ran itself to its +0.5% clamp within about 10 seconds, causing periodic underruns and steadily growing latency. Step 1 fixed the loop; step 2 removed it, since latency is now fixed by timestamp placement.
+- **A sender restart caused up to 65 seconds of silence.** The receiver now follows a new source once its packets agree for 50 ms (step 2; step 1 used 4 packets, which a stalled sender could fake). It ignores single late packets and second senders on the same group.
 - **Lost packets shifted the timeline.** A lost packet now plays as one packet of silence, so streams stay sample-aligned with each other.
-- **Saved TX streams reloaded as RX streams**, and stale jitter buffer slots could block newer packets.
+- **Saved TX streams reloaded as RX streams.** Stale jitter buffer slots could also block newer packets; the jitter buffer is gone in step 2.
 - The plug-in now declares `AudioServerPlugIn_Network`, which Apple requires for network access from the sandboxed audio host.
 
 ## Step 2: Clocking Redesign (In Progress)
@@ -37,9 +45,9 @@ AES67 needs every device on one PTP-derived media clock. Step 2 replaces the dri
 | Spike S1: PTP inside the sandboxed driver host | Done | The driver host (`_coreaudiod`) can bind UDP 319/320, join the PTP group and get kernel receive timestamps in Core Audio's time base. Its threads can run ~30 ms late, so PTP must use kernel timestamps. [Write-up](Docs/Spikes/S1-PTP-Sandbox.md) |
 | Spike S2: Core Audio following a computed clock | Done | Core Audio tracked a model-driven clock to within 0.1 ppm (constant) and 3 ppm (ramp), and resynchronised cleanly on a phase step. [Write-up](Docs/Spikes/S2-HAL-Clock.md) |
 | Phase 0: clock foundations | Done | `NetworkEngine/Clock/`: lock-free `MediaClock`, exact host-time conversion, and a timestamp-indexed audio buffer, tested deterministically and under ThreadSanitizer |
-| Phase 1: device clock from the media clock | Done | The driver computes Core Audio's zero timestamps from its own media clock. Verified in the real HAL: +0.0 ppm, no timeline jumps or overloads, unbroken RX audio. The clock source is still the Mac's host clock |
-| Phase 2: receive by RTP timestamp | Implemented | Received audio is placed by RTP timestamp at a fixed link offset (8 ms, matching the Riedel's 8 x packet time receive buffer), so latency is fixed and streams on one network timeline are sample-aligned. The jitter buffer, consume thread and rate controller are gone. In Core Audio: two streams sample-aligned and two apps receiving identical input, with no re-anchors or breaks. A re-anchor now needs a timeline change lasting 50 ms, so sender stalls no longer move the timeline |
-| Phase 3: clock recovered from a received stream | Implemented | The device clock follows the first received stream, so a sender's drift no longer reaches the playout buffer. In simulation, 8 hours at +/-100 ppm: no re-anchors, no drops, latency constant to +/-1 sample. Over loopback, a 1500 ppm fast sender plays without a gap. In Core Audio, the device rate locked to a sender 200 ppm fast. Validation against the Riedel pending |
+| Phase 1: device clock from the media clock | Done | The driver computes Core Audio's zero timestamps from its own media clock. Verified in the real HAL: +0.0 ppm, no timeline jumps or overloads, unbroken RX audio. The clock then ran on the Mac's host clock; phase 3 adds a recovered source |
+| Phase 2: receive by RTP timestamp | Done | Received audio is placed by RTP timestamp at a fixed link offset (8 ms, matching the Riedel's 8 x packet time receive buffer), so latency is fixed and streams on one network timeline are sample-aligned. The jitter buffer, consume thread and rate controller are gone. In Core Audio: two streams sample-aligned and two apps receiving identical input, with no re-anchors or breaks. A re-anchor now needs a timeline change lasting 50 ms, so sender stalls no longer move the timeline |
+| Phase 3: clock recovered from a received stream | Done (Riedel test pending) | The device clock follows the first received stream, so a sender's drift no longer reaches the playout buffer. In simulation, 8 hours at +/-100 ppm: no re-anchors, no drops, latency constant to +/-1 sample. Over loopback, a 1500 ppm fast sender plays without a gap. In Core Audio, the device rate locked to a sender 200 ppm fast. Next: a 1-hour capture from the Riedel |
 | Phase 4: PTP slave and servo | Planned | Rewritten PTP slave driving the media clock |
 | Phase 5: transmit on the media clock | Planned | PTP-correct RTP timestamps for Dante and RAVENNA receivers |
 | Phase 6: resampling for foreign-clock streams | Optional | |
@@ -53,9 +61,8 @@ AES67 needs every device on one PTP-derived media clock. Step 2 replaces the dri
 - The driver installs and loads into coreaudiod without crashing
 - The device appears as "AES67 Device" in Audio MIDI Setup
 - 128 input + 128 output channels are reported to the system
-- RTP receiver: joins multicast, decodes L16/L24, writes to ring buffers
-- RTP transmitter: reads from ring buffers, encodes L16/L24, sends multicast
-- Lock-free SPSC ring buffers bridge network and Core Audio IO threads
+- RTP receiver: joins multicast, decodes L16/L24, and writes each packet into a buffer indexed by media position, which the IO thread reads lock-free
+- RTP transmitter: reads from lock-free SPSC ring buffers, encodes L16/L24, sends multicast
 - Core Audio's sample clock is computed by the driver from its own media clock (step 2, phase 1), verified in the real HAL
 - IO handler reads/writes Core Audio buffers in the real-time callback
 - Received audio is placed by RTP timestamp at a fixed link offset, using kernel arrival timestamps (step 2, phase 2)
@@ -67,7 +74,7 @@ AES67 needs every device on one PTP-derived media clock. Step 2 replaces the dri
 - RTP threads are deferred to Core Audio IO lifecycle (zero idle CPU when no client is running)
 - An earlier PTP slave implementation exists but is not functional (see Known Limitations); step 2 phase 4 replaces it
 - Test sender/receiver tools exercise the network path over loopback
-- 13 test suites (SDP parser, channel mapper, ring buffer, RTP receiver, RTP transmitter, PTP clock, stream manager, multi-stream, integration audio path, critical-path regressions, clock foundations, RX timestamp placement, clock recovery), all passing; the clock suites also run clean under ThreadSanitizer
+- 13 test suites (SDP parser, channel mapper, ring buffer, RTP receiver, RTP transmitter, PTP clock, stream manager, multi-stream, integration audio path, critical-path regressions, clock foundations, RX timestamp placement, clock recovery), all passing. The clock and receive suites also run clean under ThreadSanitizer, and key tests are checked by mutation (deliberately breaking the code and confirming a test fails)
 - IO handler benchmark exists for real-time performance characterisation
 - Doxygen API documentation can be generated via `make docs`
 - Flexible configuration: supports interface name ("en0") or IP address, auto-detects if not specified
@@ -77,7 +84,7 @@ AES67 needs every device on one PTP-derived media clock. Step 2 replaces the dri
 
 - TX path (sending audio to AES67 devices) — not verified with real hardware, and not yet interoperable with PTP-aligned receivers (see Known Limitations)
 - PTP synchronization with any real network clock source
-- Timestamp placement and clock recovery against real hardware over long sessions (simulation and loopback only so far)
+- Timestamp placement and clock recovery with real AES67 hardware (verified in Core Audio with test senders only)
 - Long-term stability under real workloads
 - Multi-device synchronisation
 - Sample rates beyond 48kHz in practice
@@ -104,8 +111,8 @@ The repository contains an earlier PTP implementation (`NetworkEngine/PTP/`) tha
 
 Step 2 phase 4 writes a new slave and servo, reusing only the socket setup and packet parsing. Multi-device synchronisation should not be relied upon until then.
 
-### Audio Path — Exercised Synthetically Only
-The RTP receiver/transmitter, timestamp placement, clock recovery, IO handler, and ring buffers have been exercised with test sender/receiver tools over loopback, but never with real audio content or real AES67 network traffic. Codec paths (L16/L24) are covered by unit tests but not verified for audible correctness.
+### Audio Path — Rebuilt Since the Hardware Test
+The Riedel test predates step 2. The rebuilt receive path (timestamp placement, clock recovery, IO routing) has been exercised in Core Audio with test senders on the same Mac, but not yet with real AES67 network traffic. The transmit path has only been exercised over loopback. Codec paths (L16/L24) are covered by unit tests but not verified for audible correctness.
 
 ### Manager App — Not Connected to the Driver
 The SwiftUI Manager app renders its interface but does not control the driver. It writes `~/Library/Application Support/AES67Driver/config.json` in a different schema from the `streams.json` the driver reads, and the driver runs as `_coreaudiod`, so per-user paths never apply. The PTP diagnostics screen shows placeholder data, not measurements. The planned fix is custom HAL properties plus the host's storage API.
@@ -117,6 +124,8 @@ The driver reads `streams.json` from `$AES67_CONFIG_PATH`, `~/Library/Applicatio
 - TX always sends 48 frames per 1 ms packet, so it is only correct at 48 kHz.
 - The SDP parser truncates fractional `a=ptime` values (0.125, 0.25, 0.333 ms), defaults a missing channel count to 2 rather than 1, and rejects some common `a=ts-refclk` forms.
 - The RTP parser ignores CSRC, header extension and padding fields.
+- The receive interface address is resolved once at load, so a DHCP renewal or Wi-Fi roam stops receivers until coreaudiod restarts.
+- `streams.json` still accepts a `jitterBufferDepth` field, which is now ignored.
 
 ## Architecture
 
@@ -129,20 +138,21 @@ AES67Driver/
 │   └── SDPParser            # SDP file parser (RFC 4566)
 ├── NetworkEngine/           # Network audio code
 │   ├── RTP/
-│   │   ├── SimpleRTP        # RTP socket layer (RFC 3550)
-│   │   ├── RTPReceiver      # Packet receive + decode
-│   │   ├── RateController   # Paces RX consumption to the sender's rate
-│   │   ├── RTPTransmitter   # Packet encode + send
-│   │   └── LockFreeCircularJitterBuffer
-│   ├── Clock/               # Step 2 timing foundations
+│   │   ├── SimpleRTP        # RTP socket layer (RFC 3550), kernel arrival timestamps
+│   │   ├── RTPReceiver      # Receive thread: decode, place, report clock margin
+│   │   ├── RtpPlacement     # RTP timestamp -> media position; re-anchor rules
+│   │   ├── RxRouting        # Lock-free table of receive buffers for the IO thread
+│   │   └── RTPTransmitter   # Packet encode + send
+│   ├── Clock/               # Step 2 media clock
 │   │   ├── HostTime         # mach tick <-> nanosecond conversion
 │   │   ├── MediaClock       # Lock-free host-time <-> media-sample clock
 │   │   ├── DeviceTimeline   # Core Audio zero timestamps from the media clock
-│   │   └── TimestampedAudioBuffer  # Audio stored by media position
+│   │   ├── TimestampedAudioBuffer  # Audio stored by media position
+│   │   ├── ClockServo       # PI servo holding a stream's playout margin constant
+│   │   └── RecoveredClockSource    # Reference stream selection; steers MediaClock
 │   ├── PTP/                 # Earlier PTP code, not functional (to be replaced)
-│   │   └── vendor/ptpd/     # Vendored ptpd source (not used)
+│   │   └── ptpd/            # Vendored ptpd source (not used)
 │   ├── StreamManager        # RX/TX stream lifecycle, IO-gated start/stop
-│   ├── Resampling/          # Sample rate conversion
 │   └── Discovery/           # SAP stream discovery (RFC 2974)
 ├── Shared/                  # Common components
 │   ├── RingBuffer.hpp       # Lock-free SPSC ring buffer
@@ -150,7 +160,8 @@ AES67Driver/
 ├── Tools/                   # Test utilities
 │   ├── AES67TestSender      # Sends RTP test packets over loopback
 │   ├── AES67TestReceiver    # Receives and validates RTP packets
-│   ├── ClockProbe/          # Spike S2 probe + client that measures a device's clock
+│   ├── QuickCapture         # Records from a Core Audio device, reports non-silence
+│   ├── ClockProbe/          # Spike S2 probe; client measures a device's clock and checks input continuity
 │   └── SandboxProbe/        # Spike S1 probe (PTP inside the driver host)
 ├── Docs/                    # Step 2 plan and spike write-ups
 ├── ManagerApp/              # SwiftUI configuration app
@@ -166,14 +177,14 @@ These describe what the code is written to target, not what has been verified wi
 | Channels | 128 in/out | Reported to system |
 | Sample Rates | 44.1kHz - 384kHz | Starts at 48kHz; offers only rates the active streams use; 48kHz verified |
 | Bit Depths | L16, L24 | L24 verified with real hardware |
-| RTP RX Path | Multicast join, decode, jitter buffer | **Verified with Riedel Artist** |
+| RTP RX Path | Multicast join, decode, placement by RTP timestamp | Verified in Core Audio with test senders; earlier design verified with Riedel Artist |
 | RTP TX Path | Encode, multicast send | Audio path fixed Oct 2026; 48kHz only; not hardware-verified |
-| Jitter Buffer | Configurable 32–4096 slots, lock-free | Default 256; consumption paced to sender rate |
+| Playout Latency | Fixed link offset, 8 x packet time (8 ms) | Implemented; reported to Core Audio as input latency |
 | Multicast Binding | Interface-specific via IP_MULTICAST_IF | **Verified working on multi-NIC** |
 | IO Lifecycle | RTP threads start/stop with Core Audio IO | Implemented, verified in DAW |
 | RT-Safe Boundary | Compile-time separation of RT/non-RT paths | Implemented |
-| Device Clock | Zero timestamps from the driver's media clock | **Implemented (step 2 phase 1)**, verified in the real HAL; host clock source |
-| Media Clock Recovery | From PTP or a received stream | Planned (step 2 phases 3-4); earlier code not functional |
+| Device Clock | Zero timestamps from the driver's media clock | **Implemented (step 2 phase 1)**, verified in the real HAL |
+| Media Clock Recovery | From a received stream, later from PTP | **From a received stream: implemented (step 2 phase 3)**, verified in the real HAL with a test sender. From PTP: planned (phase 4) |
 | PTP Network Sync | IEEE 1588 slave-only | Planned rewrite (step 2 phase 4); earlier code not functional |
 | Stream Persistence | JSON config in /Library/Application Support/ | Loads at startup; saving from coreaudiod not working |
 | Interface Config | Name ("en0"), IP, or auto-detect | **Implemented** |
@@ -217,6 +228,8 @@ sudo launchctl kickstart -k system/com.apple.audio.coreaudiod
 system_profiler SPAudioDataType | grep -A 5 "AES67"
 ```
 
+Restart Core Audio once per install. On macOS 26.0.1, many restarts in a row (about 20 in one night of testing) left system audio clients such as `loginwindow` and `ControlCenter` spinning at high CPU until the user logged out. This happens with or without this driver installed.
+
 ### Checking the Device Clock
 
 `AES67ClockProbeClient` runs IO on a device and measures what Core Audio does with its clock: rate against an expected value, timeline continuity and overloads. It is built with the investigation spikes:
@@ -225,6 +238,8 @@ system_profiler SPAudioDataType | grep -A 5 "AES67"
 cmake .. -DBUILD_SPIKES=ON && make AES67ClockProbeClient
 ./Tools/AES67ClockProbeClient --uid com.aes67.driver.device --seconds 25 --constant 0 --no-ramp
 ```
+
+With `--sawtooth <period> <amplitude>` it also checks that input channel 0 carries an unbroken test sawtooth. `--compare <a> <b>` counts frames where two channels differ, and `--dump <file>` writes per-cycle checksums so two clients' input can be compared.
 
 ### Build Manager App
 
@@ -260,8 +275,7 @@ Contributions welcome, especially:
 
 - **Hardware testing reports** (most needed)
 - Bug fixes with reproduction steps
-- Locking the device clock to the PTP media clock (see Known Limitations)
-- Testing PTPSlave against a real IEEE 1588 grandmaster
+- Access to a PTP grandmaster for spike S3 (measuring PTP accuracy from inside the driver host), ahead of the step 2 phase 4 PTP rewrite
 - Testing multicast interface binding on multi-NIC setups
 - DAW compatibility testing (Logic Pro, Pro Tools, Ableton, etc.)
 
@@ -287,4 +301,4 @@ GPL-3.0 - See LICENSE file.
 
 ---
 
-*This is experimental software. The driver compiles, loads and passes synthetic tests, and the RX path has received audio from real AES67 hardware in short tests. Long-session stability, TX interoperability and multi-device synchronisation have not been verified.*
+*This is experimental software. The driver compiles, loads and passes its tests, and its rebuilt receive path and recovered clock are verified in Core Audio with test senders. An earlier RX path received audio from real AES67 hardware in short tests. Long sessions with real hardware, TX interoperability and multi-device synchronisation have not been verified.*
