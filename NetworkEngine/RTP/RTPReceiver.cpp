@@ -119,6 +119,8 @@ bool RTPReceiver::start() {
     RtpPlacement::Config placementConfig;
     placementConfig.mediaClockOffset = parseMediaClockOffset(sdp_.mediaClockType);
     placementConfig.linkOffsetFrames = linkOffset;
+    placementConfig.sourceSwitchFrames =
+        static_cast<int64_t>(std::llround(sdp_.sampleRate * RtpPlacement::kSourceSwitchSeconds));
     placement_ = std::make_unique<RtpPlacement>(placementConfig, context_.networkTime);
     lastClockGeneration_ = 0;
     decodeBuffer_.assign(kMaxFramesPerPacket * sdp_.numChannels, 0.0f);

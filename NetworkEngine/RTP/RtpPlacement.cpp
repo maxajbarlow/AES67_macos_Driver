@@ -1,6 +1,7 @@
 /// @file RtpPlacement.cpp
 
 #include "RtpPlacement.h"
+#include <algorithm>
 #include <cstdlib>
 
 namespace AES67 {
@@ -87,7 +88,7 @@ RtpPlacement::Result RtpPlacement::place(uint32_t rtpTimestamp, uint32_t ssrc, u
     candidateTimestamp_ = networkTimestamp;
 
     const bool confirmed = candidateCount_ >= kSourceSwitchPackets &&
-                           candidateFrames_ >= config_.linkOffsetFrames / 2;
+                           candidateFrames_ >= std::max(config_.sourceSwitchFrames, config_.linkOffsetFrames / 2);
     if (!confirmed) {
         if (ssrc != ssrc_) {
             ++foreignDrops_;

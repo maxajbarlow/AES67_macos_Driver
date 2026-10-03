@@ -48,18 +48,21 @@ private:
 /// sustained run agrees with itself, which marks a sender restart or clock
 /// drift rather than a stray packet; the stream then follows the new source,
 /// re-anchoring if its timestamps do not fit. A run must hold at least
-/// kSourceSwitchPackets packets covering half a link offset, with margins
-/// within a quarter of a link offset of each other. A catch-up burst after a
-/// stall fails the last test (its packets arrive together while their
-/// timestamps advance), so a transient stall drops its late packets but never
-/// moves the timeline.
+/// kSourceSwitchPackets packets covering Config::sourceSwitchFrames (50 ms by
+/// default) and half a link offset, with margins within a quarter of a link
+/// offset of each other. A timeline change persists while a stall does not:
+/// a stalled sender's late packets can keep pace for a few packets before
+/// its catch-up burst (whose margins then grow by a packet each), so a
+/// transient stall drops its late packets but never moves the timeline.
 class RtpPlacement {
 public:
     static constexpr int kSourceSwitchPackets = 4;
+    static constexpr double kSourceSwitchSeconds = 0.05;
 
     struct Config {
         uint32_t mediaClockOffset{0};  // from the SDP a=mediaclk:direct=
         int64_t linkOffsetFrames{384};
+        int64_t sourceSwitchFrames{2400};  // kSourceSwitchSeconds at the stream's rate (48 kHz here)
     };
 
     enum class Verdict { Accepted, Late, Early, Foreign };

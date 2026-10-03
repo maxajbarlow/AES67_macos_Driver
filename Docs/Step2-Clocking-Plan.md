@@ -213,13 +213,20 @@ Each phase is a separate PR, test-first, and leaves the driver working.
 - Burst finding:
   - **What the real HAL showed:** a sender stall followed by a catch-up burst re-anchored the timeline twice: late, then early.
   - **Fix:** a re-anchor now needs a run of at least half a link offset whose margins agree to within a quarter of a link offset. A burst's margins grow by a packet each, so it fails that test. Transient stalls drop their late packets but no longer move the timeline.
+  - **Second finding (2026-10-03):** the HAL check still re-anchored about twice a minute with the Python test sender. Recording its packets' kernel arrival times showed why. After a 15 ms stall, the sender sent its next 4 packets at normal pace, all 15 ms late, before bursting the rest. Four packets with agreeing margins passed the rule above, so the timeline moved, and the catch-up then moved it back. With a real-time priority sender, the same run had no re-anchors.
+  - **Fix:** a timeline change persists; a stall does not. A confirming run must now also cover 50 ms of media (`RtpPlacement::kSourceSwitchSeconds`). A sender restart or SSRC change now plays up to 50 ms more silence before it is followed. `TestRxTimestamp` replays the observed stall (15 ms, 4 steady packets) and a 22 ms, 10-packet stall; both re-anchored twice before the fix.
 - Real HAL so far (installed driver, two host-only streams, two client processes):
   - input latency reported as 384 frames (8 ms)
   - +0.0 ppm, 0 timeline jumps, 0 overloads
   - **identical input for two simultaneous clients in all 1876 shared IO cycles**
   - streams sample-aligned except around the burst events above
+- Real HAL, 2026-10-03, phase 3 build (which includes this phase), two host-only streams from a sender 200 ppm fast, two clients, real-time priority sender:
+  - 0 re-anchors, 0 timeline jumps, 0 overloads
+  - test sawtooth continuous: 0 breaks in 2.88 M samples
+  - two streams sample-aligned: 0 of 2.88 M frames differ
+  - two clients identical in all 1876 shared IO cycles
 - Pending:
-  - **Final HAL rerun after the burst fix.** It was blocked when the development Mac became overloaded (load average 60-150, with coreaudiod spinning even without this driver installed).
+  - **HAL rerun with the 50 ms rule,** using the Python sender as a natural stall generator. It needs one coreaudiod restart to load the new build.
   - **Interface re-resolution.** The receive interface address is resolved once, so a DHCP renewal or Wi-Fi roam breaks receivers until coreaudiod restarts.
 
 ### Phase 3: Stream-recovered clock

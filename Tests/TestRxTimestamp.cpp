@@ -39,6 +39,8 @@ int checksFailed = 0;
 
 constexpr uint32_t kFrames = 48;           // 1 ms packets at 48 kHz
 constexpr int64_t kLinkOffset = 8 * 48;    // 8 x packet time
+// Packets in a run that confirms a timeline change (50 ms at 1 ms packets)
+constexpr int kSwitchPackets = static_cast<int>(RtpPlacement::Config{}.sourceSwitchFrames / kFrames);
 constexpr uint32_t kSsrcA = 0xAAAA0001;
 constexpr uint32_t kSsrcB = 0xBBBB0002;
 
@@ -166,12 +168,13 @@ void testRestartWithNewTimestampsReanchors() {
     uint32_t restartTs = 3000000000u;
     RtpPlacement::Result r{};
     int dropped = 0;
-    for (int i = 0; i < 4; ++i, restartTs += kFrames, now += kFrames) {
+    for (int i = 0; i < kSwitchPackets; ++i, restartTs += kFrames, now += kFrames) {
         r = stream.place(restartTs, kSsrcA, kFrames, now);
         if (r.verdict != RtpPlacement::Verdict::Accepted) ++dropped;
     }
-    CHECK(dropped == 3, "the first three packets of the new run should be dropped (got " << dropped << ")");
-    CHECK(r.verdict == RtpPlacement::Verdict::Accepted && r.reanchored, "the fourth should re-anchor and play");
+    CHECK(dropped == kSwitchPackets - 1,
+          "the new run should be dropped until it has lasted 50 ms (dropped " << dropped << ")");
+    CHECK(r.verdict == RtpPlacement::Verdict::Accepted && r.reanchored, "the packet completing 50 ms should re-anchor and play");
     CHECK(r.position == now - kFrames - kFrames, "the re-anchored packet should end at its arrival");
     const auto next = stream.place(restartTs, kSsrcA, kFrames, now);
     CHECK(next.verdict == RtpPlacement::Verdict::Accepted && next.position == r.position + kFrames,
@@ -191,9 +194,9 @@ void testNewSourceOnSameTimelineKeepsPlacement() {
     // A PTP-locked sender restarts with a new SSRC but its timestamps still
     // follow network time, so placement must not move
     RtpPlacement::Result r{};
-    for (int i = 0; i < 4; ++i, ts += kFrames, now += kFrames) r = stream.place(ts, kSsrcB, kFrames, now);
+    for (int i = 0; i < kSwitchPackets; ++i, ts += kFrames, now += kFrames) r = stream.place(ts, kSsrcB, kFrames, now);
     CHECK(r.verdict == RtpPlacement::Verdict::Accepted && !r.reanchored, "the new source should be adopted without re-anchoring");
-    CHECK(r.position == last.position + 4 * kFrames, "positions should continue on the same timeline");
+    CHECK(r.position == last.position + kSwitchPackets * kFrames, "positions should continue on the same timeline");
     CHECK(stream.place(ts, kSsrcA, kFrames, now).verdict == RtpPlacement::Verdict::Foreign, "the old SSRC is now foreign");
 }
 
@@ -262,9 +265,10 @@ void simulateDrift(double senderPpm) {
     CHECK(marginsInWindow, senderPpm << " ppm: every accepted packet should land inside the playout window");
     CHECK(stream.reanchors() >= 0.8 * expected && stream.reanchors() <= 1.25 * expected + 1,
           senderPpm << " ppm: re-anchors should match the drift (got " << stream.reanchors() << ", expected ~" << expected << ")");
-    CHECK(stream.lateDrops() + stream.earlyDrops() <= 3 * stream.reanchors(),
+    const uint64_t confirming = static_cast<uint64_t>(kSwitchPackets - 1) * stream.reanchors();
+    CHECK(stream.lateDrops() + stream.earlyDrops() <= confirming,
           senderPpm << " ppm: only the packets confirming each re-anchor may be dropped");
-    CHECK(accepted >= static_cast<size_t>(packets) - 3 * stream.reanchors(), senderPpm << " ppm: everything else should play");
+    CHECK(accepted >= static_cast<size_t>(packets) - confirming, senderPpm << " ppm: everything else should play");
 }
 
 void testDriftIsBounded() {
@@ -386,6 +390,45 @@ void testStallAndBurstDoesNotReanchor() {
     runStallAndBurst(48, 12, "1 ms packets, 12 ms stall");
 }
 
+// A stalled sender need not burst at once: in the real HAL a sender stalled
+// 15 ms, then sent its next 4 packets at normal pace (all 15 ms late, so their
+// margins agreed) before bursting the rest. Those 4 packets looked exactly like
+// a timeline change and re-anchored, and the catch-up then re-anchored back.
+// A real timeline change persists; a stall does not.
+void runStallWithSteadyLateRun(int stallPackets, int steadyPackets, const char* label) {
+    NetworkTimeMapping mapping;
+    RtpPlacement stream(config(), mapping);
+    const uint32_t frames = kFrames;
+    const int64_t stall = static_cast<int64_t>(stallPackets) * frames;
+    uint32_t ts = 4000;
+    int64_t now = 200000;  // when the next packet is due
+    RtpPlacement::Result before{};
+    for (int i = 0; i < 100; ++i, ts += frames, now += frames) before = stream.place(ts, kSsrcA, frames, now);
+
+    // The next packets arrive at the normal pace, each `stall` late
+    for (int i = 0; i < steadyPackets; ++i, ts += frames, now += frames) stream.place(ts, kSsrcA, frames, now + stall);
+    // The rest of the backlog arrives at once, then back on schedule
+    const int64_t burstArrival = now + stall;
+    int packets = 100 + steadyPackets;
+    for (; now < burstArrival; ts += frames, now += frames, ++packets) stream.place(ts, kSsrcA, frames, burstArrival);
+    RtpPlacement::Result after{};
+    bool allAccepted = true;
+    for (int i = 0; i < 50; ++i, ts += frames, now += frames, ++packets) {
+        after = stream.place(ts, kSsrcA, frames, now);
+        allAccepted = allAccepted && after.verdict == RtpPlacement::Verdict::Accepted;
+    }
+    CHECK(stream.reanchors() == 0, label << ": a stall must not re-anchor (got " << stream.reanchors() << ")");
+    CHECK(allAccepted, label << ": packets after the stall should all play");
+    CHECK(after.position == before.position + static_cast<int64_t>(packets - 100) * frames,
+          label << ": the timeline should be unchanged");
+}
+
+void testStallWithSteadyLateRunDoesNotReanchor() {
+    std::cout << "A stall whose first late packets keep pace does not re-anchor" << std::endl;
+    runStallWithSteadyLateRun(15, 4, "15 ms stall, 4 steady late packets (seen in the HAL)");
+    runStallWithSteadyLateRun(22, 10, "22 ms stall, 10 steady late packets");
+}
+
 } // namespace
 
 int main() {
@@ -400,6 +443,7 @@ int main() {
     testUnrelatedClockGetsOwnAnchor();
     testDriftIsBounded();
     testStallAndBurstDoesNotReanchor();
+    testStallWithSteadyLateRunDoesNotReanchor();
     testRoutingPublishAndRead();
     testRoutingReclamationUnderLoad();
 
