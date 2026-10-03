@@ -1,5 +1,5 @@
 /// @file RxRouting.h
-/// @brief The IO thread's lock-free view of which receive buffers feed which device channels.
+/// @brief The IO thread's lock-free view of which stream buffers map to which device channels.
 
 #pragma once
 
@@ -12,25 +12,30 @@
 
 namespace AES67 {
 
-/// Fixed table of routes from a stream's TimestampedAudioBuffer to a block of
-/// device input channels. The IO thread reads it without locks; receivers
+/// Fixed table of routes between a stream's TimestampedAudioBuffer and a
+/// block of device channels. The IO thread reads it without locks; streams
 /// publish and unpublish their buffer from non-real-time threads.
+///
+/// RxRouting maps receive buffers to input channels (the IO thread reads
+/// them); TxRouting maps transmit buffers to output channels (the IO thread
+/// writes the output mix into them).
 ///
 /// Reclamation: unpublish() returns only once no read that could have seen
 /// the route is still running, so the caller may then free the buffer.
 /// Publishers must be serialised by the caller (StreamManager's mutex).
-class RxRouting {
+template<typename Buffer>
+class AudioRouting {
 public:
     static constexpr size_t kMaxRoutes = 64;
     static constexpr uint32_t kDeviceChannels = 128;
 
     struct Route {
-        const TimestampedAudioBuffer* buffer;
+        Buffer* buffer;
         uint32_t deviceChannelStart;
     };
 
     /// @return false if the table is full or the channels do not fit the device.
-    bool publish(const TimestampedAudioBuffer* buffer, uint32_t deviceChannelStart) noexcept {
+    bool publish(Buffer* buffer, uint32_t deviceChannelStart) noexcept {
         if (!buffer || deviceChannelStart + buffer->channels() > kDeviceChannels) {
             return false;
         }
@@ -45,7 +50,7 @@ public:
     }
 
     /// Remove `buffer`'s route and wait until no in-flight read can use it.
-    void unpublish(const TimestampedAudioBuffer* buffer) noexcept {
+    void unpublish(const Buffer* buffer) noexcept {
         for (auto& slot : slots_) {
             if (slot.buffer.load(std::memory_order_relaxed) == buffer) {
                 slot.buffer.store(nullptr, std::memory_order_seq_cst);
@@ -63,7 +68,7 @@ public:
     void read(Visitor&& visit) const noexcept {
         readsStarted_.fetch_add(1, std::memory_order_seq_cst);
         for (const auto& slot : slots_) {
-            const TimestampedAudioBuffer* buffer = slot.buffer.load(std::memory_order_seq_cst);
+            Buffer* buffer = slot.buffer.load(std::memory_order_seq_cst);
             if (buffer) {
                 visit(Route{buffer, slot.deviceChannelStart.load(std::memory_order_relaxed)});
             }
@@ -73,7 +78,7 @@ public:
 
 private:
     struct Slot {
-        std::atomic<const TimestampedAudioBuffer*> buffer{nullptr};
+        std::atomic<Buffer*> buffer{nullptr};
         std::atomic<uint32_t> deviceChannelStart{0};
     };
 
@@ -81,5 +86,8 @@ private:
     mutable std::atomic<uint64_t> readsStarted_{0};
     mutable std::atomic<uint64_t> readsFinished_{0};
 };
+
+using RxRouting = AudioRouting<const TimestampedAudioBuffer>;
+using TxRouting = AudioRouting<TimestampedAudioBuffer>;
 
 } // namespace AES67

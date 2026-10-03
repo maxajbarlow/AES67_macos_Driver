@@ -31,29 +31,13 @@ struct BenchmarkResult {
     size_t iterations;
 };
 
-// Helper to create initialized ring buffer array
-namespace {
-    template<size_t... Is>
-    auto MakeRingBufferArray(size_t bufferSize, std::index_sequence<Is...>) {
-        return std::array<SPSCRingBuffer<float>, sizeof...(Is)>{
-            ((void)Is, SPSCRingBuffer<float>(bufferSize))...
-        };
-    }
-
-    template<size_t N>
-    auto MakeRingBufferArray(size_t bufferSize) {
-        return MakeRingBufferArray(bufferSize, std::make_index_sequence<N>{});
-    }
-}
-
 class IOHandlerBenchmark {
 public:
     IOHandlerBenchmark()
-        : outputBuffers_(MakeRingBufferArray<kNumChannels>(512))
-        , inputUnderruns_(0)
+        : inputUnderruns_(0)
         , outputUnderruns_(0)
         , ioRunning_(false)
-        , rtInterface_(rxRouting_, mediaClock_, linkOffsetFrames_, outputBuffers_,
+        , rtInterface_(rxRouting_, mediaClock_, linkOffsetFrames_, txRouting_,
                        inputUnderruns_, outputUnderruns_, ioRunning_)
     {
         // Worst case for input: 16 streams of 8 channels routed onto all 128
@@ -68,12 +52,20 @@ public:
             streams_.push_back(std::move(stream));
         }
 
+        // Worst case for output: 16 TX streams of 8 channels taking all 128
+        for (size_t s = 0; s < kNumChannels / kStreamChannels; ++s) {
+            auto stream = std::make_unique<TimestampedAudioBuffer>(kStreamChannels, 8192);
+            txRouting_.publish(stream.get(), static_cast<uint32_t>(s * kStreamChannels));
+            txStreams_.push_back(std::move(stream));
+        }
+
         // Create I/O handler using RT-safe interface
         ioHandler_ = std::make_unique<AES67IOHandler>(rtInterface_);
     }
 
     ~IOHandlerBenchmark() {
         for (auto& stream : streams_) rxRouting_.unpublish(stream.get());
+        for (auto& stream : txStreams_) txRouting_.unpublish(stream.get());
     }
 
     BenchmarkResult benchmarkInputProcessing(UInt32 frameCount, size_t iterations) {
@@ -114,27 +106,18 @@ public:
 
         // Warmup
         for (int i = 0; i < 10; ++i) {
-            ioHandler_->processOutput(inputBuffer.data(), frameCount, kNumChannels);
-            // Clear buffers
-            for (size_t ch = 0; ch < kNumChannels; ++ch) {
-                outputBuffers_[ch].reset();
-            }
+            ioHandler_->processOutput(inputBuffer.data(), frameCount, kNumChannels, 0.0);
         }
 
         // Benchmark
         for (size_t i = 0; i < iterations; ++i) {
             auto start = high_resolution_clock::now();
 
-            ioHandler_->processOutput(inputBuffer.data(), frameCount, kNumChannels);
+            ioHandler_->processOutput(inputBuffer.data(), frameCount, kNumChannels, static_cast<Float64>(i) * frameCount);
 
             auto end = high_resolution_clock::now();
             auto duration = duration_cast<nanoseconds>(end - start);
             timings.push_back(duration.count() / 1000.0);
-
-            // Clear buffers for next iteration
-            for (size_t ch = 0; ch < kNumChannels; ++ch) {
-                outputBuffers_[ch].reset();
-            }
         }
 
         return calculateStatistics("Output Processing", timings, frameCount);
@@ -206,7 +189,6 @@ private:
         return result;
     }
 
-    using DeviceChannelBuffers = std::array<SPSCRingBuffer<float>, kNumChannels>;
 
     static constexpr size_t kStreamChannels = 8;
     static constexpr UInt32 kMaxBenchmarkFrames = 4096;
@@ -215,7 +197,8 @@ private:
     RxRouting rxRouting_;
     std::atomic<int64_t> linkOffsetFrames_{384};
     std::vector<std::unique_ptr<TimestampedAudioBuffer>> streams_;
-    DeviceChannelBuffers outputBuffers_;
+    TxRouting txRouting_;
+    std::vector<std::unique_ptr<TimestampedAudioBuffer>> txStreams_;
     std::atomic<uint64_t> inputUnderruns_;
     std::atomic<uint64_t> outputUnderruns_;
     std::atomic<bool> ioRunning_;

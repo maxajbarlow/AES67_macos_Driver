@@ -4,12 +4,12 @@
 #pragma once
 
 #include "../Shared/Types.h"
-#include "../Shared/RingBuffer.hpp"
 #include "../Driver/SDPParser.h"
 #include "StreamChannelMapper.h"
 #include "StreamConfig.h"
 #include "RTP/RTPReceiver.h"
 #include "RTP/RxContext.h"
+#include "RTP/TxContext.h"
 #include "RTP/RTPTransmitter.h"
 #include "PTP/PTPClock.h"
 #include <map>
@@ -26,14 +26,15 @@ namespace AES67 {
 /// initialization, UI/manager app, or control threads.
 class StreamManager {
 public:
-    using DeviceChannelBuffers = std::array<SPSCRingBuffer<float>, 128>;
     using StreamCallback = std::function<void(const StreamInfo&)>;
 
-    /// @param inputChannels  Ring buffers written by RTP receivers (RX path).
-    /// @param outputChannels Ring buffers read by RTP transmitters (TX path).
     /// @param rxContext Device state receivers place audio against (clock, routing, link offset).
-    /// @param outputChannels Ring buffers transmitters read (Core Audio → Network).
-    StreamManager(RxContext rxContext, DeviceChannelBuffers& outputChannels);
+    /// @param txContext Device state transmitters send from (clock, routing the IO thread writes).
+    ///
+    /// Receivers run only while Core Audio IO is active (setIOActive). Transmitters
+    /// run whenever their stream is configured: AES67 senders send continuously,
+    /// silence included.
+    StreamManager(RxContext rxContext, TxContext txContext);
     ~StreamManager();
 
     // Prevent copy/move
@@ -211,7 +212,7 @@ private:
 
     // Data members
     RxContext rxContext_;                   // RTP receivers place audio here (Network → Core Audio)
-    DeviceChannelBuffers& outputChannels_;  // RTP transmitters read here (Core Audio → Network)
+    TxContext txContext_;                   // RTP transmitters send from here (Core Audio → Network)
     StreamChannelMapper mapper_;
     std::map<StreamID, ManagedStream> streams_;
     mutable std::mutex streamsMutex_;

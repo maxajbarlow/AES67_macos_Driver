@@ -240,7 +240,7 @@ Each phase is a separate PR, test-first, and leaves the driver working.
   - **Measurement.** Each accepted packet's margin is how far ahead of the read point its end landed: `position + frames - (arrival - link offset)`, using the kernel arrival time and the sub-sample clock position. If the local clock is fast relative to the sender, margins shrink; if slow, they grow.
   - **`ClockServo`** (`NetworkEngine/Clock/ClockServo.h`) is a PI loop on that margin. Jitter only ever delays packets, so it measures the largest margin in each 100 ms window, then takes the median of the last 5 windows: under heavy jitter a window can hold no undelayed packet, and one such window must not kick the rate. It is critically damped at 0.1 rad/s (settles in about 40 s), clamped to +/-2000 ppm, and integrates over the nominal window period so an outage does not weigh one stale error by its length.
   - **`RecoveredClockSource`** chooses the reference: the first stream to report. Other streams are ignored until the reference has been silent for 1 s, when the next one takes over at the current rate. A stopped reference is released with the rate held. When a stream's margins jump (its placement re-anchored, the shared network mapping moved, or the timeline restarted), the servo re-learns its reference margin bumplessly, folding the proportional term into the integral so the rate does not step.
-  - **Device.** `AES67Device` owns the source. Rate updates call `MediaClock::setRate` at the current host time, under the clock write lock. A timeline restart (IO start, sample rate change) resets the source first, so no rate steered against the old timeline lands on the new one. TX runs on the same clock, so it is frequency-locked to the received stream, which may be what the Riedel's "synton" play mode needs.
+  - **Device.** `AES67Device` owns the source. Rate updates call `MediaClock::setRate` at the current host time, under the clock write lock. A timeline restart (IO start, sample rate change) resets the source first, so no rate steered against the old timeline lands on the new one. Correction (2026-10-03): this originally said TX runs on the same clock and so is frequency-locked to the received stream. It did not: TX was still paced by the host clock and read Core Audio's output first-in-first-out, so with a drifting sender the output rings would slowly fill or drain. Phase 5's media-paced transmitter (below) makes it true, which may be what the Riedel's "synton" play mode needs.
 - Result:
   - `Tests/TestClockRecovery.cpp` runs the real `RtpPlacement` against a simulated drifting sender. Without the servo, a 100 ppm sender re-anchors repeatedly. With it, 8 hours at +/-100 ppm gave no re-anchors and no drops, latency constant to +/-1 sample once settled, the rate within 0.5 ppm of the sender's, and no rate step above 5 ppm. A 1000 ppm sender acquired without leaving the window; 3 ms of jitter stayed locked.
   - Over multicast loopback through a real `RTPReceiver`, with a faster test servo (1 rad/s), a sender 1500 ppm fast re-anchored without recovery. With recovery it played with 0 re-anchors and 0 silent samples, and the clock ran at the sender's rate to within about 40 ppm averaged over 3 s. `TestCriticalPathRegressions` checks the real device steers its clock and returns to nominal on an IO restart.
@@ -259,10 +259,29 @@ Each phase is a separate PR, test-first, and leaves the driver working.
   - Hardware run against the Riedel or a Dante device as grandmaster.
 - Exit: frequency lock within about 30 s and phase settled within about 2 minutes at a 1 Hz Sync rate (faster on faster networks); hybrid-mode unicast Delay_Req verified against the target network; criterion 2.
 
-### Phase 5: TX on the media clock
+### Phase 5: TX on the media clock (in progress)
 
 - TxBuffer, media-paced sender, RTP timestamps from media time, ptime and framecount from the rate, compliant SDP.
 - Exit: TX to RX loopback sample-exact; criterion 4 with a Dante or RAVENNA receiver.
+- Brought forward (2026-10-03) so TX streams can be announced over SAP whenever configured, which needs TX to run continuously. Implemented so far:
+  - **TxBuffer.** Each TX stream owns a `TimestampedAudioBuffer`, published through `TxRouting` (the same lock-free table as `RxRouting`). `OnWriteMixedOutput` writes the mix into it at media position `origin + sampleTime`. The 128 SPSC output rings are gone.
+  - **Media-paced sender.** The packet holding `[M, M + F)` is sent at `hostAt(M + F)` (`mach_wait_until`), with `F` = sample rate × ptime. Unwritten positions go out as silence. A thread that falls more than 4 packets behind skips to the current packet rather than bursting late packets.
+  - **RTP timestamps.** `ts = M + offset`, starting at a random value (RFC 3550). On a timeline restart the offset is adjusted so timestamps and sequence numbers continue without a jump. With PTP (phase 4), the offset becomes the SDP mediaclk offset.
+  - **Continuous.** Transmitters run whenever their stream is configured, not just while Core Audio IO runs. The built-in TX test stream is no longer created, so nothing transmits unasked.
+  - **Media positions are never reused.** A timeline restart starts 2^20 frames beyond the old position, so no buffer slot from an earlier timeline can read as current. Device sample time still restarts at 0.
+- Result:
+  - `Tests/TestTxMediaClock.cpp` writes samples whose values are their own media positions:
+    - every packet holds the next F positions, at a fixed offset from its RTP timestamp
+    - packets leave a median of about 0.2 ms after their last sample's media time (p99 under 0.3 ms), never early
+    - with the clock at +1000 ppm, the packet rate measured +998 to +1000 ppm
+    - silence flows when nothing is written
+    - a timeline restart leaves RTP continuous
+    - TX into our own receiver on one clock was sample-exact: 72,000 samples with 0 discontinuities
+  - Clean under ThreadSanitizer.
+- Pending:
+  - **The real HAL.** In particular, check whether coreaudiod's background timer coalescing delays TX while no client is running. marcnnn's fork measured 15-37 ms send stalls in that state, fixed only by clearing the process's Darwin background classification.
+  - **PTP-derived timestamps and a compliant SDP** (`ts-refclk`, `mediaclk`, framecount from the rate).
+  - **Criterion 4** with a Dante or RAVENNA receiver.
 
 ### Phase 6 (optional): ASRC for foreign-clock streams
 

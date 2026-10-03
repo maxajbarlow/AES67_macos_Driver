@@ -71,6 +71,7 @@ target_compile_features(TestRTPReceiver PRIVATE cxx_std_17)
 add_executable(TestRTPTransmitter
     TestRTPTransmitter.cpp
     ../NetworkEngine/RTP/RTPTransmitter.cpp
+    ../NetworkEngine/Clock/TimestampedAudioBuffer.cpp
     ../NetworkEngine/RTP/SimpleRTP.cpp
     ../Driver/SDPParser.cpp
     ../Driver/AudioThreadPriority.cpp
@@ -260,6 +261,28 @@ target_include_directories(TestSAPListener PRIVATE
 
 target_compile_features(TestSAPListener PRIVATE cxx_std_17)
 
+# Test: Transmit on the media clock (step 2 phase 5 core)
+add_executable(TestTxMediaClock
+    TestTxMediaClock.cpp
+    ../NetworkEngine/RTP/RTPTransmitter.cpp
+    ../NetworkEngine/RTP/RTPReceiver.cpp
+    ../NetworkEngine/RTP/SimpleRTP.cpp
+    ../NetworkEngine/RTP/RtpPlacement.cpp
+    ../NetworkEngine/Clock/TimestampedAudioBuffer.cpp
+    ../NetworkEngine/Clock/RecoveredClockSource.cpp
+    ../Driver/SDPParser.cpp
+    ../Driver/AudioThreadPriority.cpp
+    ../NetworkEngine/StreamChannelMapper.cpp
+    ../NetworkEngine/NetworkInterfaceDetection.cpp
+    ../Shared/Types.cpp
+)
+
+target_include_directories(TestTxMediaClock PRIVATE
+    ${CMAKE_SOURCE_DIR}
+)
+
+target_compile_features(TestTxMediaClock PRIVATE cxx_std_17)
+
 # Add tests to CTest
 enable_testing()
 add_test(NAME ClockRecovery COMMAND TestClockRecovery)
@@ -276,6 +299,7 @@ add_test(NAME StreamManager COMMAND TestStreamManager)
 add_test(NAME MultiStream COMMAND TestMultiStream)
 add_test(NAME IntegrationAudioPath COMMAND TestIntegrationAudioPath)
 add_test(NAME SAPListener COMMAND TestSAPListener)
+add_test(NAME TxMediaClock COMMAND TestTxMediaClock)
 
 # The driver bundle must carry a valid signature over its resources: Core
 # Audio loads plug-ins from /Library/Audio/Plug-Ins/HAL, and the linker's

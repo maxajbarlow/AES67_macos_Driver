@@ -71,7 +71,7 @@ void AES67IOHandler::OnWriteMixedOutput(
     const void* bytes,
     UInt32 bytesCount
 ) {
-    // RT-SAFE: Write to ring buffers (Core Audio → Network)
+    // RT-SAFE: write into the TX buffers (Core Audio → Network)
     // This receives the mixed OUTPUT audio of all clients (DAWs, system audio)
     //
     // libASPL provides raw bytes in the stream's native format, which is
@@ -90,17 +90,16 @@ void AES67IOHandler::OnWriteMixedOutput(
         return;
     }
 
-    // Process in chunks that fit processOutput's stack scratch buffer
+    // Process in chunks (bounds the work per route visit)
     const float* input = static_cast<const float*>(bytes);
     for (UInt32 done = 0; done < frameCount;) {
         const UInt32 chunk = std::min(frameCount - done, kMaxFramesPerChunk);
-        processOutput(input + static_cast<size_t>(done) * channelCount, chunk, channelCount);
+        processOutput(input + static_cast<size_t>(done) * channelCount, chunk, channelCount, timestamp + done);
         done += chunk;
     }
 
     (void)stream;
     (void)zeroTimestamp;
-    (void)timestamp;
 }
 
 void AES67IOHandler::processInput(float* outputData, UInt32 frameCount, UInt32 channelCount,
@@ -130,32 +129,19 @@ void AES67IOHandler::processInput(float* outputData, UInt32 frameCount, UInt32 c
     }
 }
 
-void AES67IOHandler::processOutput(const float* inputData, UInt32 frameCount, UInt32 channelCount) noexcept {
-    // RT-SAFE: Write to output ring buffers (Core Audio → Network)
-
-    float channelBuffer[kMaxFramesPerChunk];
-
-    if (frameCount > kMaxFramesPerChunk) {
+void AES67IOHandler::processOutput(const float* inputData, UInt32 frameCount, UInt32 channelCount,
+                                   Float64 sampleTime) noexcept {
+    // RT-SAFE: no allocation, no locks. Output sample time T is media position
+    // origin + T; each TX stream takes its device channels from the mix.
+    const MediaClock::Snapshot clock = rtInterface_.mediaClock().snapshot();
+    if (!clock.valid()) {
         return;
     }
+    const int64_t position = clock.origin + static_cast<int64_t>(std::floor(sampleTime));
 
-    bool hadOverrun = false;
-    auto& outputBuffers = rtInterface_.outputBuffers();
-
-    for (size_t ch = 0; ch < channelCount; ++ch) {
-        for (UInt32 frame = 0; frame < frameCount; ++frame) {
-            channelBuffer[frame] = inputData[frame * channelCount + ch];
-        }
-
-        const size_t samplesWritten = outputBuffers[ch].write(channelBuffer, frameCount);
-
-        if (samplesWritten < frameCount) {
-            if (!hadOverrun) {
-                rtInterface_.recordOutputOverrun();
-                hadOverrun = true;
-            }
-        }
-    }
+    rtInterface_.txRouting().read([&](const TxRouting::Route& route) {
+        route.buffer->write(position, frameCount, inputData, channelCount, route.deviceChannelStart);
+    });
 }
 
 } // namespace AES67

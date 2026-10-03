@@ -14,9 +14,9 @@
 
 namespace AES67 {
 
-StreamManager::StreamManager(RxContext rxContext, DeviceChannelBuffers& outputChannels)
+StreamManager::StreamManager(RxContext rxContext, TxContext txContext)
     : rxContext_(rxContext)
-    , outputChannels_(outputChannels)
+    , txContext_(txContext)
     , configManager_(std::make_unique<StreamConfigManager>())
 {
 }
@@ -291,15 +291,12 @@ StreamID StreamManager::createTxStream(
         return StreamID::null();
     }
 
-    // Only start transmitter if IO is active (a Core Audio client has called StartIO).
-    // Otherwise the stream is created dormant and will be started by setIOActive(true).
-    if (ioActive_.load()) {
-        if (!managed.transmitter->start()) {
-            AES67_LOGF("StreamManager::createTxStream: failed to start RTP transmitter for '%s' (%s:%u)",
-                       name.c_str(), multicastIP.c_str(), port);
-            mapper_.removeMapping(id);
-            return StreamID::null();
-        }
+    // Transmit continuously from now on, whether or not Core Audio IO runs
+    if (!managed.transmitter->start()) {
+        AES67_LOGF("StreamManager::createTxStream: failed to start RTP transmitter for '%s' (%s:%u)",
+                   name.c_str(), multicastIP.c_str(), port);
+        mapper_.removeMapping(id);
+        return StreamID::null();
     }
 
     // Build stream info
@@ -479,24 +476,19 @@ void StreamManager::setIOActive(bool active) {
         return; // No state change
     }
 
+    // Receivers follow Core Audio IO; transmitters run whenever configured
     if (active) {
-        AES67_LOGF("StreamManager::setIOActive: Starting %zu stream(s)", streams_.size());
+        AES67_LOGF("StreamManager::setIOActive: Starting receivers (%zu stream(s))", streams_.size());
         for (auto& [id, managed] : streams_) {
             if (managed.receiver) {
                 managed.receiver->start();
             }
-            if (managed.transmitter) {
-                managed.transmitter->start();
-            }
         }
     } else {
-        AES67_LOGF("StreamManager::setIOActive: Stopping %zu stream(s)", streams_.size());
+        AES67_LOGF("StreamManager::setIOActive: Stopping receivers (%zu stream(s))", streams_.size());
         for (auto& [id, managed] : streams_) {
             if (managed.receiver) {
                 managed.receiver->stop();
-            }
-            if (managed.transmitter) {
-                managed.transmitter->stop();
             }
         }
     }
@@ -643,7 +635,7 @@ std::unique_ptr<RTPTransmitter> StreamManager::createTransmitter(
     const std::string& networkInterface
 ) {
     // Transmitters read audio from OUTPUT buffers (Core Audio → Network)
-    return std::make_unique<RTPTransmitter>(sdp, mapping, outputChannels_, networkInterface);
+    return std::make_unique<RTPTransmitter>(sdp, mapping, txContext_, networkInterface);
 }
 
 //
@@ -735,7 +727,7 @@ bool StreamManager::loadSavedStreams() {
         managed.mapping = config.mapping;
         managed.isTransmit = (config.sdp.direction == "sendonly" || config.sdp.direction == "sendrecv");
 
-        // Create RTP receiver or transmitter (only start if IO is active)
+        // Transmitters start now; receivers start only if IO is active
         if (managed.isTransmit) {
             managed.transmitter = createTransmitter(config.sdp, config.mapping, config.networkInterface);
             if (!managed.transmitter) {
@@ -743,7 +735,7 @@ bool StreamManager::loadSavedStreams() {
                 failedCount++;
                 continue;
             }
-            if (ioActive_.load() && !managed.transmitter->start()) {
+            if (!managed.transmitter->start()) {
                 mapper_.removeMapping(id);
                 failedCount++;
                 continue;

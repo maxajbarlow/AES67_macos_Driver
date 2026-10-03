@@ -1,12 +1,15 @@
 //
 // RTPTransmitter.cpp
-// AES67 macOS Driver - Build #9
-// RTP packet transmitter with L16/L24 encoding and channel mapping
+// AES67 macOS Driver
+// RTP packet transmitter with L16/L24 encoding, paced by the media clock
 //
 
 #include "RTPTransmitter.h"
 #include "SimpleRTP.h"
 #include "../../Driver/DebugLog.h"
+#include "../Clock/HostTime.h"
+#include <mach/mach_time.h>
+#include <algorithm>
 #include <cstring>
 #include <random>
 #include <chrono>
@@ -14,39 +17,56 @@
 
 namespace AES67 {
 
+namespace {
+
+uint32_t framesPerPacketFor(const SDPSession& sdp) {
+    // ptime is whole milliseconds (SDPSession); framecount is the fallback
+    const uint64_t frames = static_cast<uint64_t>(sdp.sampleRate) * sdp.ptime / 1000;
+    return frames > 0 ? static_cast<uint32_t>(frames) : std::max<uint32_t>(sdp.framecount, 1);
+}
+
+size_t nextPowerOfTwo(size_t value) {
+    size_t power = 1;
+    while (power < value) power <<= 1;
+    return power;
+}
+
+int64_t floorDiv(int64_t value, int64_t divisor) {
+    const int64_t quotient = value / divisor;
+    return (value % divisor != 0 && (value < 0) != (divisor < 0)) ? quotient - 1 : quotient;
+}
+
+// Core Audio writes output ahead of its media time by up to its IO buffer and
+// safety offset; the buffer must also hold the packet being sent
+constexpr size_t kMinBufferFrames = 16384;
+
+} // namespace
+
 RTPTransmitter::RTPTransmitter(
     const SDPSession& sdp,
     const ChannelMapping& mapping,
-    DeviceChannelBuffers& deviceChannels,
+    TxContext context,
     const std::string& networkInterface
 )
     : sdp_(sdp)
     , mapping_(mapping)
-    , deviceChannels_(deviceChannels)
+    , context_(context)
     , networkInterface_(networkInterface)
+    , framesPerPacket_(framesPerPacketFor(sdp))
 {
     std::memset(&stats_, 0, sizeof(stats_));
 
-    // Generate random SSRC
     std::random_device rd;
     ssrc_ = rd();
+    nextTimestamp_ = rd();  // RFC 3550: start the RTP timeline at a random value
 
-    // Pre-allocate buffers to avoid allocations in transmitLoop()
-    // Audio buffer: max 512 frames × stream channels
-    const size_t maxFrames = 512;
-    const size_t maxAudioSamples = maxFrames * sdp_.numChannels;
-    audioBuffer_.resize(maxAudioSamples);
+    const size_t channels = std::max<size_t>(sdp_.numChannels, 1);
+    buffer_ = std::make_unique<TimestampedAudioBuffer>(
+        channels, nextPowerOfTwo(std::max<size_t>(kMinBufferFrames, 8 * static_cast<size_t>(framesPerPacket_))));
 
-    // Payload buffer: RTP header (12 bytes) + max audio payload
-    // L24 is largest: 3 bytes/sample × channels × frames
-    const size_t maxPayloadSize = 3 * sdp_.numChannels * maxFrames;
-    payloadBuffer_.resize(12 + maxPayloadSize);
-
-    // Calculate packet interval based on sample rate
-    // AES67 standard: 1ms packets = sample_rate / 1000 samples per packet
-    // Example: 48000 Hz → 48 samples/packet → 1ms interval
-    const uint64_t intervalUs = 1000; // 1ms in microseconds
-    packetInterval_ = std::chrono::microseconds(intervalUs);
+    // Pre-allocate so the transmit thread never allocates
+    audioBuffer_.resize(static_cast<size_t>(framesPerPacket_) * channels);
+    payloadBuffer_.resize(3 * static_cast<size_t>(framesPerPacket_) * channels);
 }
 
 RTPTransmitter::~RTPTransmitter() {
@@ -83,14 +103,16 @@ bool RTPTransmitter::start() {
         return false;
     }
 
-    // Initialize timestamp and sequence number
-    timestamp_ = 0;
-    sequenceNumber_ = 0;
+    // The IO thread writes this stream's output channels into the buffer
+    if (!context_.routing.publish(buffer_.get(), static_cast<uint32_t>(mapping_.deviceChannelStart))) {
+        AES67_LOGF("RTPTransmitter::start: no route for device channels %zu-%zu (stream=%s)",
+                   mapping_.deviceChannelStart, mapping_.deviceChannelStart + sdp_.numChannels - 1,
+                   sdp_.sessionName.c_str());
+        rtpSocket_.close();
+        return false;
+    }
+    published_ = true;
 
-    // Record start time for precise packet timing
-    startTime_ = std::chrono::steady_clock::now();
-
-    // Start transmit thread (elevated priority to prevent audio dropouts)
     running_ = true;
     transmitThread_ = std::thread([this]() {
         if (!AudioThreadPriority::configureForRealTime()) {
@@ -100,6 +122,8 @@ bool RTPTransmitter::start() {
         transmitLoop();
     });
 
+    AES67_LOGF("RTPTransmitter::start: %s:%u, %u frames per packet (stream=%s)",
+               sdp_.connectionAddress.c_str(), sdp_.port, framesPerPacket_, sdp_.sessionName.c_str());
     return true;
 }
 
@@ -114,7 +138,116 @@ void RTPTransmitter::stop() {
         transmitThread_.join();
     }
 
+    // After this returns no IO write can still be using the buffer
+    if (published_) {
+        context_.routing.unpublish(buffer_.get());
+        published_ = false;
+    }
+
     rtpSocket_.close();
+}
+
+void RTPTransmitter::transmitLoop() {
+    const auto frames = static_cast<int64_t>(framesPerPacket_);
+    const auto pollTicks = static_cast<uint64_t>(HostTimebase::current().ticksPerSecond() * 0.001);
+
+    uint32_t generation = 0;
+    bool haveTimeline = false;
+    int64_t position = 0;     // media position of the next packet's first frame
+    uint32_t rtpOffset = 0;   // RTP timestamp = position + rtpOffset (mod 2^32)
+
+    while (running_) {
+        const MediaClock::Snapshot clock = context_.clock.snapshot();
+        if (!clock.valid()) {
+            mach_wait_until(hostTimeNow() + pollTicks);
+            continue;
+        }
+
+        if (!haveTimeline || clock.generation != generation) {
+            // Start at the packet now in progress; keep the RTP timeline
+            // continuous across the media clock's restarts
+            position = floorDiv(clock.sampleAt(hostTimeNow()), frames) * frames;
+            rtpOffset = nextTimestamp_ - static_cast<uint32_t>(position);
+            if (haveTimeline) {
+                timelineRestarts_.fetch_add(1, std::memory_order_relaxed);
+            }
+            generation = clock.generation;
+            haveTimeline = true;
+        }
+
+        // Due when the media clock reaches the packet's end. Wait in short
+        // steps so stop() and clock changes are noticed promptly.
+        const uint64_t due = clock.hostAt(position + frames);
+        const uint64_t now = hostTimeNow();
+        if (due > now) {
+            mach_wait_until(std::min(due, now + pollTicks));
+            continue;
+        }
+
+        // Too far behind (the thread was descheduled): skip to the packet in
+        // progress rather than bursting late packets at receivers
+        const int64_t current = floorDiv(clock.sampleAt(now), frames) * frames;
+        if (current - position > kMaxLatePackets * frames) {
+            packetsSkipped_.fetch_add(static_cast<uint64_t>((current - position) / frames), std::memory_order_relaxed);
+            position = current;
+            continue;
+        }
+
+        sendPosition(position, static_cast<uint32_t>(position) + rtpOffset);
+        position += frames;
+    }
+}
+
+void RTPTransmitter::sendPosition(int64_t position, uint32_t timestamp) {
+    const size_t frames = framesPerPacket_;
+    // Unwritten positions (no client running, or not yet written) read as silence
+    buffer_->read(position, frames, audioBuffer_.data(), sdp_.numChannels, 0);
+
+    uint8_t* payload = payloadBuffer_.data();
+    size_t payloadSize = 0;
+    if (sdp_.encoding == "L16") {
+        encodeL16(audioBuffer_.data(), frames, payload);
+        payloadSize = frames * sdp_.numChannels * 2;
+    } else if (sdp_.encoding == "L24") {
+        encodeL24(audioBuffer_.data(), frames, payload);
+        payloadSize = frames * sdp_.numChannels * 3;
+    } else {
+        return;  // rejected at start-up by StreamManager validation
+    }
+
+    sendPacket(payload, payloadSize, timestamp);
+    nextTimestamp_ = timestamp + framesPerPacket_;
+    packetsSent_.fetch_add(1, std::memory_order_relaxed);
+    stats_.bytesSent.fetch_add(payloadSize, std::memory_order_relaxed);
+}
+
+RTPTransmitter::TransmitStatistics RTPTransmitter::getTransmitStatistics() const {
+    TransmitStatistics s;
+    s.packetsSent = packetsSent_.load(std::memory_order_relaxed);
+    s.packetsSkipped = packetsSkipped_.load(std::memory_order_relaxed);
+    s.timelineRestarts = timelineRestarts_.load(std::memory_order_relaxed);
+    return s;
+}
+
+bool RTPTransmitter::updateMapping(const ChannelMapping& newMapping) {
+    // Validate mapping
+    if (newMapping.deviceChannelStart + sdp_.numChannels > 128) {
+        return false;
+    }
+
+    // Stop, update, restart (republishes the buffer on the new channels)
+    const bool wasRunning = running_;
+    if (wasRunning) {
+        stop();
+    }
+
+    mapping_ = newMapping;
+
+    if (wasRunning) {
+        return start();
+    }
+
+    return true;
 }
 
 StatisticsSnapshot RTPTransmitter::getStatistics() const {
@@ -134,115 +267,6 @@ void RTPTransmitter::resetStatistics() {
     stats_.latencyNs.store(0, std::memory_order_relaxed);
     stats_.bytesReceived.store(0, std::memory_order_relaxed);
     stats_.bytesSent.store(0, std::memory_order_relaxed);
-}
-
-bool RTPTransmitter::updateMapping(const ChannelMapping& newMapping) {
-    // Validate mapping
-    if (newMapping.deviceChannelStart + sdp_.numChannels > 128) {
-        return false;
-    }
-
-    // Stop, update, restart
-    const bool wasRunning = running_;
-    if (wasRunning) {
-        stop();
-    }
-
-    mapping_ = newMapping;
-
-    if (wasRunning) {
-        return start();
-    }
-
-    return true;
-}
-
-void RTPTransmitter::transmitLoop() {
-    // Calculate samples per packet (typically 48 for 48kHz @ 1ms)
-    const size_t samplesPerPacket = sdp_.framecount;
-
-    auto nextTransmitTime = startTime_;
-    bool unsupportedEncodingLogged = false;
-
-    while (running_) {
-        // Wait until next transmit time (precise 1ms intervals)
-        std::this_thread::sleep_until(nextTransmitTime);
-        nextTransmitTime += packetInterval_;
-
-        // Read audio from device channels (silence-fills on underrun)
-        // Always send packets even with empty ring buffers — AES67 requires
-        // continuous packet flow for receiver clock recovery
-        readDeviceChannels(audioBuffer_.data(), samplesPerPacket);
-
-        // Encode payload based on encoding type
-        uint8_t* payload = payloadBuffer_.data();
-        size_t payloadSize = 0;
-
-        if (sdp_.encoding == "L16") {
-            encodeL16(audioBuffer_.data(), samplesPerPacket, payload);
-            payloadSize = samplesPerPacket * sdp_.numChannels * 2; // 2 bytes/sample
-        } else if (sdp_.encoding == "L24") {
-            encodeL24(audioBuffer_.data(), samplesPerPacket, payload);
-            payloadSize = samplesPerPacket * sdp_.numChannels * 3; // 3 bytes/sample
-        } else {
-            if (!unsupportedEncodingLogged) {
-                AES67_LOGF("RTPTransmitter::transmitLoop: unsupported encoding '%s' - no packets will be sent (stream=%s)",
-                           sdp_.encoding.c_str(), sdp_.sessionName.c_str());
-                unsupportedEncodingLogged = true;
-            }
-            continue; // Unsupported encoding
-        }
-
-        // Send RTP packet
-        sendPacket(payload, payloadSize, timestamp_);
-
-        // Update timestamp (increment by samples per packet)
-        timestamp_ += samplesPerPacket;
-
-        // Update statistics
-        stats_.bytesSent.fetch_add(payloadSize, std::memory_order_relaxed);
-    }
-}
-
-bool RTPTransmitter::readDeviceChannels(float* interleavedAudio, size_t frameCount) {
-    // Validate mapping
-    const size_t deviceChannelEnd = mapping_.deviceChannelStart + sdp_.numChannels;
-    if (deviceChannelEnd > 128) {
-        return false;
-    }
-
-    // Stack-allocated temporary buffer for reading each channel
-    constexpr size_t kMaxFrames = 512;
-    if (frameCount > kMaxFrames) {
-        return false;
-    }
-
-    float channelBuffer[kMaxFrames];
-    bool hadUnderrun = false;
-
-    // Read each device channel and interleave into output
-    // Result: [ch0_f0, ch1_f0, ch0_f1, ch1_f1, ...]
-    for (size_t streamChannel = 0; streamChannel < sdp_.numChannels; ++streamChannel) {
-        const size_t deviceChannel = mapping_.deviceChannelStart + streamChannel;
-
-        // Batch read from ring buffer
-        const size_t samplesRead = deviceChannels_[deviceChannel].read(channelBuffer, frameCount);
-
-        if (samplesRead < frameCount) {
-            // Ring buffer underrun - fill remainder with silence
-            std::memset(&channelBuffer[samplesRead], 0,
-                       (frameCount - samplesRead) * sizeof(float));
-            hadUnderrun = true;
-        }
-
-        // Interleave this channel into output
-        for (size_t frame = 0; frame < frameCount; ++frame) {
-            interleavedAudio[frame * sdp_.numChannels + streamChannel] = channelBuffer[frame];
-        }
-    }
-
-    // Return false if we had underrun (indicates audio not ready)
-    return !hadUnderrun;
 }
 
 void RTPTransmitter::encodeL16(const float* audio, size_t frameCount, uint8_t* payload) {
@@ -309,5 +333,6 @@ void RTPTransmitter::sendPacket(const uint8_t* payload, size_t payloadSize, uint
         }
     }
 }
+
 
 } // namespace AES67

@@ -13,6 +13,7 @@
 #include "../NetworkEngine/RTP/SimpleRTP.h"
 #include "../NetworkEngine/RTP/RTPReceiver.h"
 #include "../NetworkEngine/RTP/RTPTransmitter.h"
+#include "../NetworkEngine/RTP/TxContext.h"
 #include "../NetworkEngine/StreamChannelMapper.h"
 #include "../Driver/SDPParser.h"
 #include "../Shared/RingBuffer.hpp"
@@ -66,6 +67,27 @@ namespace {
 
     constexpr size_t kNumChannels = 128;
     constexpr size_t kRingBufferSize = 4096;
+
+    // Plays Core Audio's output write: puts `frames` frames of a 128-channel
+    // mix (value per device channel) into every published TX buffer, starting
+    // at a packet boundary `aheadFrames` ahead of now. Returns that position.
+    int64_t writeOutputAhead(TxRouting& routing, const MediaClock& clock, size_t frames,
+                             const std::array<float, kNumChannels>& valueByChannel, int64_t aheadFrames) {
+        const int64_t now = clock.snapshot().sampleAt(hostTimeNow());
+        const int64_t start = (now / 48) * 48 + aheadFrames;
+        std::vector<float> mix(frames * kNumChannels);
+        for (size_t f = 0; f < frames; ++f) {
+            std::copy(valueByChannel.begin(), valueByChannel.end(), mix.begin() + static_cast<ptrdiff_t>(f * kNumChannels));
+        }
+        routing.read([&](const TxRouting::Route& route) {
+            route.buffer->write(start, frames, mix.data(), kNumChannels, route.deviceChannelStart);
+        });
+        return start;
+    }
+
+    void resetClock(MediaClock& clock) {
+        clock.reset(hostTimeNow(), 0, MediaClock::samplesPerTick(48000.0, 1.0, HostTimebase::current()));
+    }
 }
 
 // ============================================================================
@@ -261,12 +283,13 @@ bool testRTPReceiveToRingBuffer() {
 // ============================================================================
 
 bool testRingBufferToRTPTransmit() {
-    std::cout << "Test: Ring Buffer -> RTP Transmit... ";
+    std::cout << "Test: TX buffer -> RTP Transmit... ";
 
-    // Create ring buffers
-    auto deviceBuffers = MakeRingBufferArray<kNumChannels>(kRingBufferSize);
+    MediaClock clock;
+    resetClock(clock);
+    TxRouting routing;
 
-    // Configure a 2-channel L16 TX stream on 239.69.69.2:15006
+    // Configure a 2-channel L16 TX stream on 239.69.69.2:15006, device channels 8-9
     const uint16_t txChannels = 2;
     const uint16_t txPort = 15006;
     const char* txAddr = "239.69.69.2";
@@ -275,29 +298,19 @@ bool testRingBufferToRTPTransmit() {
     StreamID txID = StreamID::generate();
     ChannelMapping txMapping = createTestMapping(txID, "TX Test", txChannels, 8);
 
-    // Pre-fill the output ring buffers with known data at device channels 8-9
-    // Channel 8: sine wave at 0.75f amplitude
-    // Channel 9: constant -0.25f
-    const size_t prefillFrames = 480; // 10 packets worth @ 48 samples
-    std::vector<float> ch8Data(prefillFrames);
-    std::vector<float> ch9Data(prefillFrames);
-    for (size_t i = 0; i < prefillFrames; ++i) {
-        ch8Data[i] = 0.75f * std::sin(2.0f * M_PI * 1000.0f * i / 48000.0f);
-        ch9Data[i] = -0.25f;
-    }
-
-    size_t written8 = deviceBuffers[8].write(ch8Data.data(), prefillFrames);
-    size_t written9 = deviceBuffers[9].write(ch9Data.data(), prefillFrames);
-    TEST_ASSERT(written8 == prefillFrames, "Should write all frames to channel 8");
-    TEST_ASSERT(written9 == prefillFrames, "Should write all frames to channel 9");
-
-    // Create transmitter
-    RTPTransmitter transmitter(txSDP, txMapping, deviceBuffers);
+    RTPTransmitter transmitter(txSDP, txMapping, TxContext{clock, routing});
     TEST_ASSERT(!transmitter.isRunning(), "Transmitter should not be running before start");
+    TEST_ASSERT(transmitter.framesPerPacket() == 48, "48 kHz at 1 ms should be 48 frames per packet");
 
     bool started = transmitter.start();
     TEST_ASSERT(started, "Transmitter should start successfully");
     TEST_ASSERT(transmitter.isRunning(), "Transmitter should be running after start");
+
+    // Core Audio writes 10 packets of output: channel 8 at 0.75, channel 9 at -0.25
+    std::array<float, kNumChannels> values{};
+    values[8] = 0.75f;
+    values[9] = -0.25f;
+    writeOutputAhead(routing, clock, 480, values, 96);
 
     // Let the transmitter send packets for a brief period
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -305,15 +318,10 @@ bool testRingBufferToRTPTransmit() {
     transmitter.stop();
     TEST_ASSERT(!transmitter.isRunning(), "Transmitter should stop");
 
-    // Verify transmitter sent packets
     StatisticsSnapshot stats = transmitter.getStatistics();
     TEST_ASSERT(stats.bytesSent > 0, "Transmitter should have sent bytes");
-
-    // Verify the ring buffers were consumed
-    size_t remaining8 = deviceBuffers[8].available();
-    size_t remaining9 = deviceBuffers[9].available();
-    TEST_ASSERT(remaining8 < prefillFrames, "Channel 8 buffer should be partially consumed");
-    TEST_ASSERT(remaining9 < prefillFrames, "Channel 9 buffer should be partially consumed");
+    const auto sent = transmitter.getTransmitStatistics().packetsSent;
+    TEST_ASSERT(sent >= 90 && sent <= 110, "about 100 packets should be sent in 100 ms");
 
     std::cout << "PASS" << std::endl;
     return true;
@@ -326,9 +334,9 @@ bool testRingBufferToRTPTransmit() {
 bool testFullLoopback() {
     std::cout << "Test: Full Loopback (TX -> Network -> RX)... ";
 
-    // TX reads its ring buffers; RX places by timestamp
-    auto txBuffers = MakeRingBufferArray<kNumChannels>(kRingBufferSize);
+    // TX and RX on one media clock: TX sends by media position, RX places by timestamp
     TestSupport::RxHarness harness;
+    TxRouting txRouting;
 
     const char* loopAddr = "239.69.69.3";
     const uint16_t loopPort = 15008;
@@ -339,22 +347,24 @@ bool testFullLoopback() {
     SDPSession rxSDP = createTestSDP("Loopback RX", loopAddr, loopPort, channels, "L24");
     ChannelMapping rxMapping = createTestMapping(StreamID::generate(), "Loopback RX", channels, 0);
 
-    // 20 packets of a recognisable pattern; after that the transmitter
-    // underruns and sends silence (AES67 requires continuous packets)
-    const size_t prefillFrames = 960;
-    std::vector<float> txCh0(prefillFrames, 0.25f);
-    std::vector<float> txCh1(prefillFrames, -0.75f);
-    txBuffers[0].write(txCh0.data(), prefillFrames);
-    txBuffers[1].write(txCh1.data(), prefillFrames);
-
     RTPReceiver receiver(rxSDP, rxMapping, harness.context());
     TEST_ASSERT(receiver.start(), "Loopback receiver should start");
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     TestSupport::PlayoutReader reader(harness, {0, 1});
 
-    RTPTransmitter transmitter(txSDP, txMapping, txBuffers);
+    RTPTransmitter transmitter(txSDP, txMapping, TxContext{harness.clock, txRouting});
     TEST_ASSERT(transmitter.start(), "Loopback transmitter should start");
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // 20 packets of a recognisable pattern; around it the transmitter sends
+    // silence (AES67 requires continuous packets)
+    const size_t patternFrames = 960;
+    std::array<float, kNumChannels> values{};
+    values[0] = 0.25f;
+    values[1] = -0.75f;
+    writeOutputAhead(txRouting, harness.clock, patternFrames, values, 480);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
     transmitter.stop();
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
@@ -365,11 +375,11 @@ bool testFullLoopback() {
     TEST_ASSERT(receiver.getStatistics().packetsReceived > 0, "RX should have received packets");
 
     // The pattern must arrive intact and in one piece: exactly the 960
-    // pre-filled frames, then the transmitter's silence
+    // written frames, with the transmitter's silence around them
     const auto ch0 = TestSupport::heardRegion(heard[0]);
     const auto ch1 = TestSupport::heardRegion(heard[1]);
-    TEST_ASSERT(ch0.size() == prefillFrames && ch1.size() == prefillFrames,
-                "Loopback should deliver exactly the 960 pre-filled frames");
+    TEST_ASSERT(ch0.size() == patternFrames && ch1.size() == patternFrames,
+                "Loopback should deliver exactly the 960 written frames");
     TEST_ASSERT(std::all_of(ch0.begin(), ch0.end(), [](float v) { return std::abs(v - 0.25f) < 0.001f; }),
                 "Loopback channel 0 data should match (~0.25f)");
     TEST_ASSERT(std::all_of(ch1.begin(), ch1.end(), [](float v) { return std::abs(v + 0.75f) < 0.001f; }),
@@ -722,28 +732,28 @@ bool testReceiverStatistics() {
 // ============================================================================
 
 bool testTransmitterContinuousFlow() {
-    std::cout << "Test: Transmitter Continuous Packet Flow (silence on empty)... ";
+    std::cout << "Test: Transmitter Continuous Packet Flow (silence when nothing is written)... ";
 
-    // AES67 requires continuous packets even when ring buffers are empty.
+    // AES67 requires continuous packets even when Core Audio writes nothing.
     // The transmitter should send silence-filled packets in that case.
+    MediaClock clock;
+    resetClock(clock);
+    TxRouting routing;
 
-    auto deviceBuffers = MakeRingBufferArray<kNumChannels>(kRingBufferSize);
-
-    // Do NOT pre-fill the ring buffers -- they start empty
     SDPSession sdp = createTestSDP("Continuous TX", "239.69.69.9", 15020, 2, "L16");
     StreamID id = StreamID::generate();
     ChannelMapping mapping = createTestMapping(id, "Continuous TX", 2, 0);
 
-    RTPTransmitter transmitter(sdp, mapping, deviceBuffers);
+    RTPTransmitter transmitter(sdp, mapping, TxContext{clock, routing});
     bool started = transmitter.start();
-    TEST_ASSERT(started, "Transmitter should start even with empty buffers");
+    TEST_ASSERT(started, "Transmitter should start with nothing written");
 
     // Let it run for 50ms -- it should still be sending packets (silence)
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     StatisticsSnapshot stats = transmitter.getStatistics();
     TEST_ASSERT(stats.bytesSent > 0,
-                "Transmitter should send silence packets even with empty buffers");
+                "Transmitter should send silence packets when nothing is written");
 
     transmitter.stop();
 
