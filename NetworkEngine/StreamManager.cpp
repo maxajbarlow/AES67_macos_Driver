@@ -15,15 +15,19 @@
 
 namespace AES67 {
 
-StreamManager::StreamManager(RxContext rxContext, TxContext txContext, SAPAnnouncer::Config sapConfig)
+StreamManager::StreamManager(RxContext rxContext, TxContext txContext, SAPAnnouncer::Config sapConfig,
+                             NetworkMonitor::Config networkConfig)
     : rxContext_(rxContext)
     , txContext_(txContext)
     , announcer_(std::move(sapConfig))
     , configManager_(std::make_unique<StreamConfigManager>())
 {
+    networkMonitor_ = std::make_unique<NetworkMonitor>(
+        std::move(networkConfig), [this](const std::string& networkInterface) { onInterfaceChanged(networkInterface); });
 }
 
 StreamManager::~StreamManager() {
+    networkMonitor_.reset();  // no interface change may be handled from here on
     removeAllStreams();
 }
 
@@ -44,6 +48,11 @@ StreamID StreamManager::addStream(const SDPSession& sdp) {
 }
 
 StreamID StreamManager::addStream(const SDPSession& announced, const ChannelMapping& mapping) {
+    return addStream(announced, mapping, std::string{});
+}
+
+StreamID StreamManager::addStream(const SDPSession& announced, const ChannelMapping& mapping,
+                                  const std::string& networkInterface) {
     std::lock_guard<std::mutex> lock(streamsMutex_);
 
     // A stored stream's direction is our role: the sender's SDP may say
@@ -89,9 +98,10 @@ StreamID StreamManager::addStream(const SDPSession& announced, const ChannelMapp
     managed.sdp = sdp;
     managed.mapping = completeMapping;
     managed.isTransmit = false;
+    managed.networkInterface = networkInterface;
 
     // Create RTP receiver
-    managed.receiver = createReceiver(sdp, completeMapping);
+    managed.receiver = createReceiver(sdp, completeMapping, 0, networkInterface);
     if (!managed.receiver) {
         AES67_LOGF("StreamManager::addStream: failed to create RTP receiver for '%s'",
                    sdp.sessionName.c_str());
@@ -149,6 +159,7 @@ StreamID StreamManager::addStream(const SDPSession& announced, const ChannelMapp
 
     // Store stream
     streams_[id] = std::move(managed);
+    networkMonitor_->watch(streams_[id].networkInterface);
 
     // Notify callback
     notifyStreamAdded(streams_[id].info);
@@ -350,6 +361,7 @@ StreamID StreamManager::createTxStream(
 
     // Store stream
     streams_[id] = std::move(managed);
+    networkMonitor_->watch(streams_[id].networkInterface);
     announceTx(id, streams_[id]);
 
     // Notify callback
@@ -703,6 +715,53 @@ void StreamManager::announceTx(const StreamID& id, const ManagedStream& managed)
     announcer_.announce(id, SDPParser::generate(sdp), address, sdp.ttl);
 }
 
+void StreamManager::onInterfaceChanged(const std::string& networkInterface) {
+    std::lock_guard<std::mutex> lock(streamsMutex_);
+    for (auto& [id, managed] : streams_) {
+        if (managed.networkInterface != networkInterface) {
+            continue;
+        }
+        // Rejoin (a fresh IGMP report, so switches forward at once) and
+        // resend on the interface as it is now
+        if (managed.receiver && ioActive_.load()) {
+            managed.receiver->stop();
+            if (!managed.receiver->start()) {
+                AES67_LOGF("StreamManager: '%s' could not rejoin on interface '%s'; retried on its next change",
+                           managed.sdp.sessionName.c_str(), networkInterface.c_str());
+            }
+            networkRestarts_.fetch_add(1);
+        }
+        if (managed.transmitter) {
+            managed.transmitter->stop();
+            if (managed.transmitter->start()) {
+                announceTx(id, managed);  // its address may have changed
+            } else {
+                announcer_.withdraw(id);
+                AES67_LOGF("StreamManager: '%s' could not restart on interface '%s'; retried on its next change",
+                           managed.sdp.sessionName.c_str(), networkInterface.c_str());
+            }
+            networkRestarts_.fetch_add(1);
+        }
+    }
+    AES67_LOGF("StreamManager: interface '%s' changed; its streams restarted",
+               networkInterface.empty() ? "auto" : networkInterface.c_str());
+}
+
+std::optional<StatisticsSnapshot> StreamManager::getStreamStatistics(const StreamID& id) const {
+    std::lock_guard<std::mutex> lock(streamsMutex_);
+    auto it = streams_.find(id);
+    if (it == streams_.end()) {
+        return std::nullopt;
+    }
+    if (it->second.receiver) {
+        return it->second.receiver->getStatistics();
+    }
+    if (it->second.transmitter) {
+        return it->second.transmitter->getStatistics();
+    }
+    return std::nullopt;
+}
+
 std::unique_ptr<RTPTransmitter> StreamManager::createTransmitter(
     const SDPSession& sdp,
     const ChannelMapping& mapping,
@@ -860,6 +919,7 @@ bool StreamManager::loadSavedStreams() {
 
         // Store stream
         streams_[id] = std::move(managed);
+        networkMonitor_->watch(streams_[id].networkInterface);
         if (streams_[id].transmitter) {
             announceTx(id, streams_[id]);
         }

@@ -119,11 +119,13 @@ public:
     ~RTPSocket();
 
     // Receiver setup
-    bool openReceiver(const char* multicastIP, uint16_t port, const char* interfaceIP = nullptr);
+    /// @param interfaceIndex Interface to join on (if_nametoindex); 0 lets the kernel choose.
+    bool openReceiver(const char* multicastIP, uint16_t port, unsigned interfaceIndex = 0);
 
     // Transmitter setup
+    /// @param interfaceIndex Interface to send on (if_nametoindex); 0 lets the routing table choose.
     /// @param ttl Multicast TTL. 0 keeps packets on this host (loopback only).
-    bool openTransmitter(const char* multicastIP, uint16_t port, const char* interfaceIP = nullptr, uint8_t ttl = 32);
+    bool openTransmitter(const char* multicastIP, uint16_t port, unsigned interfaceIndex = 0, uint8_t ttl = 32);
 
     /// The socket's multicast TTL as the kernel reports it (0 if not open).
     uint8_t multicastTTL() const;
@@ -150,7 +152,7 @@ private:
     int sockfd_;
     struct sockaddr_in multicastAddr_;
     bool isReceiver_;
-    struct in_addr boundInterfaceAddr_;  // Interface used for multicast join (for proper leave)
+    unsigned joinedInterfaceIndex_{0};  // interface the group was joined on (for the leave)
 };
 
 //

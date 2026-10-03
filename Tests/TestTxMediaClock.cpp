@@ -394,6 +394,43 @@ void testMulticastTtlFollowsTheSdp() {
     network.stop();
 }
 
+// Streams bind to an interface by name, joining and sending by its index, so
+// a new address (DHCP) cannot break them. Uses lo0, which carries multicast.
+void testStreamsBindByInterfaceName() {
+    std::cout << "TX and RX bind to an interface by name" << std::endl;
+    RxHarness rx;
+    TxRouting txRouting;
+    PositionWriter writer(rx.clock, txRouting);
+    SDPSession rxSdp = txSdp("239.69.99.46", 55082);
+    rxSdp.direction = "recvonly";
+
+    {
+        RTPReceiver receiver(rxSdp, txMapping(0), rx.context(), "lo0");
+        CHECK(receiver.start(), "a receiver on lo0 should start");
+        PlayoutReader reader(rx, 0);
+        RTPTransmitter tx(txSdp("239.69.99.46", 55082), txMapping(0), TxContext{rx.clock, txRouting}, "lo0");
+        CHECK(tx.start(), "a transmitter on lo0 (by name) should start");
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        tx.stop();
+        const auto heard = heardRegion(reader.stop());
+        receiver.stop();
+        CHECK(heard.size() > 9600, "a receiver on lo0 hears a transmitter on lo0 (heard " << heard.size() << " samples)");
+    }
+    {
+        RTPReceiver receiver(rxSdp, txMapping(0), rx.context(), "lo0");
+        CHECK(receiver.start(), "a receiver on lo0 should start");
+        RTPTransmitter tx(txSdp("239.69.99.46", 55082), txMapping(0), TxContext{rx.clock, txRouting});
+        CHECK(tx.start(), "a transmitter on the default interface should start");
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        tx.stop();
+        receiver.stop();
+        CHECK(receiver.getStatistics().packetsReceived == 0,
+              "a receiver on lo0 hears nothing sent on another interface (got "
+                  << receiver.getStatistics().packetsReceived << " packets)");
+    }
+    writer.stop();
+}
+
 } // namespace
 
 int main() {
@@ -403,6 +440,7 @@ int main() {
     testTimelineRestartKeepsRtpContinuous();
     testLoopbackThroughOurReceiverIsSampleExact();
     testMulticastTtlFollowsTheSdp();
+    testStreamsBindByInterfaceName();
 
     std::cout << "\nTX media clock: " << checksPassed << " passed, " << checksFailed << " failed" << std::endl;
     return checksFailed == 0 ? 0 : 1;

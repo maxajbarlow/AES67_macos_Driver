@@ -142,6 +142,7 @@ set(NETWORK_SOURCES
     NetworkEngine/NetworkUtils.cpp
     NetworkEngine/NetworkErrorHandler.cpp
     NetworkEngine/NetworkInterfaceDetection.cpp
+    NetworkEngine/NetworkMonitor.cpp
     NetworkEngine/DoPDecoder.cpp
     NetworkEngine/Discovery/SAPListener.cpp
     NetworkEngine/Discovery/SAPAnnouncer.cpp

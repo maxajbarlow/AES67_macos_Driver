@@ -76,14 +76,14 @@ AES67 needs every device on one PTP-derived media clock. Step 2 replaces the dri
 - TX streams are announced over SAP (RFC 2974) while configured, with a stable session ID, on the stream's own interface and TTL
 - Stream configurations load from `streams.json` (see the config search paths below); saving from inside coreaudiod does not work yet (see Known Limitations)
 - RT-safe interface boundary prevents accidental mutex access from the audio callback at compile time
-- Multicast receiver can bind to a specific network interface (prevents duplicate packets on multi-NIC machines)
+- Streams bind to a specific network interface (prevents duplicate packets on multi-NIC machines), joining and sending by interface index so a new address does not break them
 - Receive threads follow the Core Audio IO lifecycle (no receive work while no client is running); transmit threads run whenever a TX stream is configured
 - An earlier PTP slave implementation exists but is not functional (see Known Limitations); step 2 phase 4 replaces it
 - Test sender/receiver tools exercise the network path over loopback
-- 17 tests (SDP parser, channel mapper, ring buffer, RTP receiver, RTP transmitter, PTP clock, stream manager, multi-stream, integration audio path, critical-path regressions, clock foundations, RX timestamp placement, clock recovery, SAP listener, SAP announcer, TX on the media clock, and a check of the driver bundle's code signature), all passing in Debug and Release builds. Tests that transmit or announce use TTL 0, so nothing leaves the machine. The clock, receive and transmit suites also run clean under ThreadSanitizer, and key tests are checked by mutation (deliberately breaking the code and confirming a test fails)
+- 18 tests (SDP parser, channel mapper, ring buffer, RTP receiver, RTP transmitter, PTP clock, stream manager, multi-stream, integration audio path, critical-path regressions, clock foundations, RX timestamp placement, clock recovery, SAP listener, SAP announcer, network monitor, TX on the media clock, and a check of the driver bundle's code signature), all passing in Debug and Release builds. Tests that transmit or announce use TTL 0, so nothing leaves the machine. The clock, receive and transmit suites also run clean under ThreadSanitizer, and key tests are checked by mutation (deliberately breaking the code and confirming a test fails)
 - IO handler benchmark exists for real-time performance characterisation
 - Doxygen API documentation can be generated via `make docs`
-- Flexible configuration: supports interface name ("en0") or IP address, auto-detects if not specified
+- Flexible configuration: supports interface name ("en0") or IP address, auto-detects if not specified. The setting is kept as written and resolved each time a stream starts, and streams rejoin within about a second when their interface changes (new DHCP address, link down and up, a replugged adapter, or a different primary interface)
 - Multiple config search paths: environment variable, user-level, and system-wide
 
 **What has NOT been tested:**
@@ -131,7 +131,6 @@ The driver reads `streams.json` from `$AES67_CONFIG_PATH`, `~/Library/Applicatio
 - A configured TX stream wakes its transmit thread once per packet (every 1 ms at the default packet time), even when no app is playing.
 - The SDP parser truncates fractional `a=ptime` values (0.125, 0.25, 0.333 ms) and defaults a missing channel count to 2 rather than 1.
 - The RTP parser ignores CSRC, header extension and padding fields.
-- The receive interface address is resolved once at load, so a DHCP renewal or Wi-Fi roam stops receivers until coreaudiod restarts.
 - `streams.json` still accepts a `jitterBufferDepth` field, which is now ignored.
 - The Manager app is part of the default build and compiles with `swiftc`. On some setups its SwiftUI `#Preview` blocks fail to compile ("plugin for module 'PreviewsMacros' not found"), which stops the build; removing the `#Preview` blocks works around it ([issue #3](https://github.com/maxajbarlow/AES67_macos_Driver/issues/3)). The driver itself does not need the app.
 

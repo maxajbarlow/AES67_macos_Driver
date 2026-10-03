@@ -71,6 +71,7 @@ target_compile_features(TestRTPReceiver PRIVATE cxx_std_17)
 add_executable(TestRTPTransmitter
     TestRTPTransmitter.cpp
     ../NetworkEngine/RTP/RTPTransmitter.cpp
+    ../NetworkEngine/NetworkInterfaceDetection.cpp
     ../NetworkEngine/Clock/TimestampedAudioBuffer.cpp
     ../NetworkEngine/RTP/SimpleRTP.cpp
     ../Driver/SDPParser.cpp
@@ -298,6 +299,19 @@ target_include_directories(TestSAPAnnouncer PRIVATE
 
 target_compile_features(TestSAPAnnouncer PRIVATE cxx_std_17)
 
+# Test: network interface state and change monitoring
+add_executable(TestNetworkMonitor
+    TestNetworkMonitor.cpp
+    ../NetworkEngine/NetworkMonitor.cpp
+    ../NetworkEngine/NetworkInterfaceDetection.cpp
+)
+
+target_include_directories(TestNetworkMonitor PRIVATE
+    ${CMAKE_SOURCE_DIR}
+)
+
+target_compile_features(TestNetworkMonitor PRIVATE cxx_std_17)
+
 # Add tests to CTest
 enable_testing()
 add_test(NAME ClockRecovery COMMAND TestClockRecovery)
@@ -315,6 +329,7 @@ add_test(NAME MultiStream COMMAND TestMultiStream)
 add_test(NAME IntegrationAudioPath COMMAND TestIntegrationAudioPath)
 add_test(NAME SAPListener COMMAND TestSAPListener)
 add_test(NAME SAPAnnouncer COMMAND TestSAPAnnouncer)
+add_test(NAME NetworkMonitor COMMAND TestNetworkMonitor)
 add_test(NAME TxMediaClock COMMAND TestTxMediaClock)
 
 # The driver bundle must carry a valid signature over its resources: Core
