@@ -33,7 +33,7 @@ StreamManager::~StreamManager() {
 
 StreamID StreamManager::addStream(const SDPSession& sdp) {
     // Auto-create channel mapping
-    auto optMapping = mapper_.createDefaultMapping(sdp);
+    auto optMapping = inputMapper_.createDefaultMapping(sdp);
     if (!optMapping) {
         AES67_LOGF("StreamManager::addStream: failed to create default mapping for '%s' (%u channels)",
                    sdp.sessionName.c_str(), sdp.numChannels);
@@ -43,8 +43,14 @@ StreamID StreamManager::addStream(const SDPSession& sdp) {
     return addStream(sdp, *optMapping);
 }
 
-StreamID StreamManager::addStream(const SDPSession& sdp, const ChannelMapping& mapping) {
+StreamID StreamManager::addStream(const SDPSession& announced, const ChannelMapping& mapping) {
     std::lock_guard<std::mutex> lock(streamsMutex_);
+
+    // A stored stream's direction is our role: the sender's SDP may say
+    // sendonly (its own view), which would otherwise make this a transmitter
+    // on reload, sending to the sender's group
+    SDPSession sdp = announced;
+    sdp.direction = "recvonly";
 
     // Validate stream can be added
     std::string error;
@@ -72,7 +78,7 @@ StreamID StreamManager::addStream(const SDPSession& sdp, const ChannelMapping& m
     completeMapping.deviceChannelCount = sdp.numChannels;
 
     // Add mapping to mapper
-    if (!mapper_.addMapping(completeMapping)) {
+    if (!inputMapper_.addMapping(completeMapping)) {
         AES67_LOGF("StreamManager::addStream: mapper rejected mapping for '%s' (devCh=%zu, count=%u)",
                    sdp.sessionName.c_str(), mapping.deviceChannelStart, sdp.numChannels);
         return StreamID::null();
@@ -89,7 +95,7 @@ StreamID StreamManager::addStream(const SDPSession& sdp, const ChannelMapping& m
     if (!managed.receiver) {
         AES67_LOGF("StreamManager::addStream: failed to create RTP receiver for '%s'",
                    sdp.sessionName.c_str());
-        mapper_.removeMapping(id);
+        inputMapper_.removeMapping(id);
         return StreamID::null();
     }
 
@@ -99,7 +105,7 @@ StreamID StreamManager::addStream(const SDPSession& sdp, const ChannelMapping& m
         if (!managed.receiver->start()) {
             AES67_LOGF("StreamManager::addStream: failed to start RTP receiver for '%s' (%s:%u)",
                        sdp.sessionName.c_str(), sdp.connectionAddress.c_str(), sdp.port);
-            mapper_.removeMapping(id);
+            inputMapper_.removeMapping(id);
             return StreamID::null();
         }
     }
@@ -195,7 +201,7 @@ bool StreamManager::removeStream(const StreamID& id) {
     }
 
     // Remove from mapper
-    mapper_.removeMapping(id);
+    mapperFor(it->second).removeMapping(id);
 
     // Remove from map
     streams_.erase(it);
@@ -226,7 +232,8 @@ void StreamManager::removeAllStreams() {
     }
 
     streams_.clear();
-    mapper_.clearAll();
+    inputMapper_.clearAll();
+    outputMapper_.clearAll();
 }
 
 //
@@ -299,7 +306,7 @@ StreamID StreamManager::createTxStream(
     completeMapping.deviceChannelCount = numChannels;
 
     // Add mapping
-    if (!mapper_.addMapping(completeMapping)) {
+    if (!outputMapper_.addMapping(completeMapping)) {
         AES67_LOGF("StreamManager::createTxStream: mapper rejected mapping for '%s' (devCh=%zu, count=%u)",
                    name.c_str(), mapping.deviceChannelStart, numChannels);
         return StreamID::null();
@@ -317,7 +324,7 @@ StreamID StreamManager::createTxStream(
     if (!managed.transmitter) {
         AES67_LOGF("StreamManager::createTxStream: failed to create RTP transmitter for '%s'",
                    name.c_str());
-        mapper_.removeMapping(id);
+        outputMapper_.removeMapping(id);
         return StreamID::null();
     }
 
@@ -325,7 +332,7 @@ StreamID StreamManager::createTxStream(
     if (!managed.transmitter->start()) {
         AES67_LOGF("StreamManager::createTxStream: failed to start RTP transmitter for '%s' (%s:%u)",
                    name.c_str(), multicastIP.c_str(), port);
-        mapper_.removeMapping(id);
+        outputMapper_.removeMapping(id);
         return StreamID::null();
     }
 
@@ -396,7 +403,7 @@ bool StreamManager::updateMapping(const StreamID& id, const ChannelMapping& newM
     completeMapping.streamName = it->second.mapping.streamName;
     completeMapping.streamChannelCount = it->second.sdp.numChannels;
 
-    if (!mapper_.updateMapping(completeMapping)) {
+    if (!mapperFor(it->second).updateMapping(completeMapping)) {
         return false;
     }
 
@@ -423,12 +430,15 @@ bool StreamManager::updateMapping(const StreamID& id, const ChannelMapping& newM
 
 std::optional<ChannelMapping> StreamManager::getMapping(const StreamID& id) const {
     std::lock_guard<std::mutex> lock(streamsMutex_);
-    return mapper_.getMapping(id);
+    if (auto mapping = inputMapper_.getMapping(id)) {
+        return mapping;
+    }
+    return outputMapper_.getMapping(id);
 }
 
-std::vector<ChannelMapping> StreamManager::getAllMappings() const {
+std::vector<ChannelMapping> StreamManager::getAllMappings(Direction direction) const {
     std::lock_guard<std::mutex> lock(streamsMutex_);
-    return mapper_.getAllMappings();
+    return mapperFor(direction).getAllMappings();
 }
 
 //
@@ -478,7 +488,7 @@ bool StreamManager::canAddStream(const SDPSession& sdp, std::string* errorOut) c
         return false;
     }
 
-    if (!validateChannelAvailability(sdp.numChannels, errorOut)) {
+    if (!validateChannelAvailability(sdp.numChannels, directionOf(sdp), errorOut)) {
         return false;
     }
 
@@ -554,9 +564,13 @@ bool StreamManager::streamsSupportSampleRate(double sampleRate) const {
     return true;
 }
 
-size_t StreamManager::getAvailableChannelCount() const {
+size_t StreamManager::getAvailableChannelCount(Direction direction) const {
     std::lock_guard<std::mutex> lock(streamsMutex_);
-    return mapper_.getAvailableChannelCount();
+    return mapperFor(direction).getAvailableChannelCount();
+}
+
+StreamManager::Direction StreamManager::directionOf(const SDPSession& sdp) {
+    return (sdp.direction == "sendonly" || sdp.direction == "sendrecv") ? Direction::Transmit : Direction::Receive;
 }
 
 //
@@ -577,7 +591,7 @@ bool StreamManager::validateSampleRate(const SDPSession& sdp, std::string* error
     return true;
 }
 
-bool StreamManager::validateChannelAvailability(uint16_t numChannels, std::string* errorOut) const {
+bool StreamManager::validateChannelAvailability(uint16_t numChannels, Direction direction, std::string* errorOut) const {
     if (numChannels == 0 || numChannels > 128) {
         if (errorOut) {
             *errorOut = "Invalid channel count: " + std::to_string(numChannels) + " (must be 1-128)";
@@ -585,7 +599,7 @@ bool StreamManager::validateChannelAvailability(uint16_t numChannels, std::strin
         return false;
     }
 
-    size_t available = mapper_.getAvailableChannelCount();
+    size_t available = mapperFor(direction).getAvailableChannelCount();
     if (numChannels > available) {
         if (errorOut) {
             *errorOut = "Insufficient channels: need " + std::to_string(numChannels) +
@@ -774,7 +788,8 @@ bool StreamManager::loadSavedStreams() {
         }
 
         // Add mapping to mapper
-        if (!mapper_.addMapping(config.mapping)) {
+        StreamChannelMapper& mapper = mapperFor(directionOf(config.sdp));
+        if (!mapper.addMapping(config.mapping)) {
             AES67_LOGF("StreamManager: Failed to add mapping for stream: %s",
                       config.sdp.sessionName.c_str());
             failedCount++;
@@ -792,24 +807,24 @@ bool StreamManager::loadSavedStreams() {
         if (managed.isTransmit) {
             managed.transmitter = createTransmitter(config.sdp, config.mapping, config.networkInterface);
             if (!managed.transmitter) {
-                mapper_.removeMapping(id);
+                mapper.removeMapping(id);
                 failedCount++;
                 continue;
             }
             if (!managed.transmitter->start()) {
-                mapper_.removeMapping(id);
+                mapper.removeMapping(id);
                 failedCount++;
                 continue;
             }
         } else {
             managed.receiver = createReceiver(config.sdp, config.mapping, config.jitterBufferDepth, config.networkInterface);
             if (!managed.receiver) {
-                mapper_.removeMapping(id);
+                mapper.removeMapping(id);
                 failedCount++;
                 continue;
             }
             if (ioActive_.load() && !managed.receiver->start()) {
-                mapper_.removeMapping(id);
+                mapper.removeMapping(id);
                 failedCount++;
                 continue;
             }

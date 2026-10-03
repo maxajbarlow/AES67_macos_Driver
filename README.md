@@ -72,7 +72,7 @@ AES67 needs every device on one PTP-derived media clock. Step 2 replaces the dri
 - IO handler reads/writes Core Audio buffers in the real-time callback
 - Received audio is placed by RTP timestamp at a fixed link offset, using kernel arrival timestamps (step 2, phase 2)
 - The device clock is recovered from a received stream (step 2, phase 3): a PI servo holds the stream's playout margin constant
-- Stream manager handles RX/TX stream lifecycle, channel mapping, and SDP import/export
+- Stream manager handles RX/TX stream lifecycle, channel mapping (receive streams on input channels and transmit streams on output channels, allocated separately), and SDP import/export
 - TX streams are announced over SAP (RFC 2974) while configured, with a stable session ID, on the stream's own interface and TTL
 - Stream configurations load from `streams.json` (see the config search paths below); saving from inside coreaudiod does not work yet (see Known Limitations)
 - RT-safe interface boundary prevents accidental mutex access from the audio callback at compile time

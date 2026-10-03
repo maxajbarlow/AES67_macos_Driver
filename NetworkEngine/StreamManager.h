@@ -30,6 +30,13 @@ class StreamManager {
 public:
     using StreamCallback = std::function<void(const StreamInfo&)>;
 
+    /// Receive streams map to the device's input channels and transmit streams
+    /// to its output channels: separate sets of 128, allocated independently.
+    enum class Direction { Receive, Transmit };
+
+    /// Transmit for SDPs saying sendonly or sendrecv (how TX streams are stored).
+    static Direction directionOf(const SDPSession& sdp);
+
     /// Where and how far a TX stream is sent.
     struct TxOptions {
         std::string networkInterface;  // name ("en0") or IP; empty = default route
@@ -109,7 +116,7 @@ public:
     std::optional<ChannelMapping> getMapping(const StreamID& id) const;
 
     // Get all mappings
-    std::vector<ChannelMapping> getAllMappings() const;
+    std::vector<ChannelMapping> getAllMappings(Direction direction) const;
 
     //
     // Query
@@ -155,7 +162,7 @@ public:
     double getDeviceSampleRate() const { return currentDeviceSampleRate_; }
 
     // Get available channel count
-    size_t getAvailableChannelCount() const;
+    size_t getAvailableChannelCount(Direction direction) const;
 
     //
     // Configuration Persistence
@@ -206,7 +213,7 @@ private:
 
     // Validation helpers
     bool validateSampleRate(const SDPSession& sdp, std::string* errorOut) const;
-    bool validateChannelAvailability(uint16_t numChannels, std::string* errorOut) const;
+    bool validateChannelAvailability(uint16_t numChannels, Direction direction, std::string* errorOut) const;
     bool validateNetworkConfig(const SDPSession& sdp, std::string* errorOut) const;
     bool streamsSupportSampleRate(double sampleRate) const;  // Caller must hold streamsMutex_
 
@@ -242,7 +249,17 @@ private:
     TxContext txContext_;                   // RTP transmitters send from here (Core Audio → Network)
     SAPAnnouncer announcer_;                // announces TX streams while they run
     std::mt19937 sessionIdRandom_{std::random_device{}()};  // guarded by streamsMutex_
-    StreamChannelMapper mapper_;
+    StreamChannelMapper inputMapper_;   // RX streams -> device input channels
+    StreamChannelMapper outputMapper_;  // TX streams <- device output channels
+    StreamChannelMapper& mapperFor(Direction direction) {
+        return direction == Direction::Transmit ? outputMapper_ : inputMapper_;
+    }
+    const StreamChannelMapper& mapperFor(Direction direction) const {
+        return direction == Direction::Transmit ? outputMapper_ : inputMapper_;
+    }
+    StreamChannelMapper& mapperFor(const ManagedStream& managed) {
+        return mapperFor(managed.isTransmit ? Direction::Transmit : Direction::Receive);
+    }
     std::map<StreamID, ManagedStream> streams_;
     mutable std::mutex streamsMutex_;
 
