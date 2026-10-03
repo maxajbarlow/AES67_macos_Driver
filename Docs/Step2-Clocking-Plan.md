@@ -156,6 +156,21 @@ The card also has an NMOS tab, so streams there may be managed through NMOS (IS-
 - Holdover on master loss keeps the last rate; re-acquisition slews if the error is small, otherwise steps (new seed).
 - Diagnostics snapshot (state, master, offset, rate, path delay, counters) for the Manager app once the control path exists.
 
+#### Lessons from marcnnn's fork (reviewed October 2026)
+
+marcnnn's `feat/aes67-wing-interop` branch ran a PTP slave against a Behringer WING (Dante) for several days. None of its PTP code is being ported: the slave and the agent have defects listed below. These findings shape the rewrite:
+
+- **Offset: take the least-delayed sample, after detrending.** Software timestamps are only ever late, so the minimum offset over a window tracks the clocks rather than the queueing. Take it after removing the fitted slope; otherwise it lags by drift × window (about 8 µs at 4 ppm over 2 s). This is the same argument as phase 3's `ClockServo`.
+- **Frequency: a windowed least-squares slope, not a fast integrator.** Against the WING, a fast integrator swung between 328 and 2444 ppb; a least-squares fit over 256 samples (about 64 s at the WING's 4 Sync/s) held a 1450-1850 ppb band.
+- **Time base: host ticks only, never `CLOCK_REALTIME`.** macOS `timed` slews and steps the wall clock. The fork timed everything on it, so an NTP step inside the fit window biases the slope by about 1.5 × step / window (50 ms gives about 1200 ppm).
+- **Judge lock independently.** The fork declared lock when the residual against its own correction was under 10 ms, which its P term guarantees, so it reported lock even on mixed masters.
+- **Delay_Resp arrives on the general port, 320.** The fork listened for it only on 319, never measured path delay, and blamed the master for not answering. It also added the Delay_Resp correction field to t4 (it must be subtracted) and ignored the correction field on one-step Sync.
+- **Filter by the master's port identity.** The fork matched Follow_Up to Sync by sequence ID alone and accepted Sync from any source on the domain, so two masters or a BMCA change interleave t1 and t2 from different clocks. Its BMCA compared only priority1, class and priority2; one stray Announce switched master.
+- **Announce timeout from the master's `logMessageInterval`.** It confirms the requirement already in the target-network table.
+- **Grandmasters may use an arbitrary epoch.** The WING's PTP time is uptime-based, about 261,432 s from zero. Media position comes straight from PTP time, so nothing needs normalising, but diagnostics should show it, and it is a good test vector. The WING's grandmaster identity is `00-1D-C1-FF-FE-D1-7B-F3`.
+- **Run PTP in-process (spike S1), not in a helper.** The fork's LaunchAgent shared time through a world-writable file in `/tmp` that coreaudiod maps. That allows a symlink attack on the user's files, lets any local process crash the driver host (truncate it and the next read faults) or forge grandmaster time, and has two writers when two users are logged in. The reason given for the helper ("the sandbox blocks PTP") was never root-caused, and contradicts S1. If a helper is ever needed, use a root LaunchDaemon with XPC.
+- **Frequency range seen in practice:** the WING ran at -42.7 ppm against a Mac mini, well inside the phase 3 servo's +/-2000 ppm.
+
 ### ASRC (optional, last)
 
 Only needed for streams not on the device's clock: a different PTP domain, or several unsynchronised senders without PTP. Use an established variable-ratio library rather than the existing linear resampler:
@@ -253,8 +268,8 @@ Each phase is a separate PR, test-first, and leaves the driver working.
 
 - New slave and servo as the PTP clock source, source selection, clock domain, diagnostics.
 - Tests:
-  - Golden-vector message parsing.
-  - Servo simulation with jittered, skewed timestamps.
+  - Golden-vector message parsing, including the WING's grandmaster identity and uptime-based epoch.
+  - Servo simulation with jittered, skewed timestamps, including a wall-clock step (which a host-tick servo must not see) and two masters on one domain.
   - Loopback against a scripted PTP master.
   - Hardware run against the Riedel or a Dante device as grandmaster.
 - Exit: frequency lock within about 30 s and phase settled within about 2 minutes at a 1 Hz Sync rate (faster on faster networks); hybrid-mode unicast Delay_Req verified against the target network; criterion 2.
@@ -284,8 +299,22 @@ Each phase is a separate PR, test-first, and leaves the driver working.
   - **Clock reference.** Until PTP, it signals the Mac's own clock with `ts-refclk:localmac=<interface MAC>` (RFC 7273) rather than claiming a PTP reference.
   - **Dante prefix.** TX groups outside Dante's default AES67 prefix (239.69.0.0/16) are logged: marcnnn found with a WING that Dante lists such streams but never subscribes.
   - **Tests.** Live tests announce on a test port with TTL 0. A capture on en0 during the full suite sees no test traffic leave the Mac. Earlier TX tests used TTL 32 and did reach the LAN; that is fixed.
+- Lessons from marcnnn's fork, which transmitted to a WING (Dante):
+  - **Background timer coalescing.**
+    - **Symptom:** with no Core Audio client running, coreaudiod is classified as a Darwin background process and the kernel coalesces its timers by up to 100 ms (`kern.timer_coalesce_bg_ns_max`). A 1 ms send loop then leaves the wire in bursts of about a dozen packets with 15-37 ms stalls, while the average rate stays exactly right.
+    - **What didn't work:** deadline (time-constraint) scheduling and an `NSActivityLatencyCritical` activity.
+    - **What did:** clearing the Darwin background classification (`setpriority(PRIO_DARWIN_PROCESS/THREAD, 0, 0)`).
+    - **Why it matters now:** our TX runs without IO, so it applies to us.
+    - **The plan:** measure first. If needed, clear the classification only while at least one TX stream exists, and restore it when none does. The fork held a latency-critical activity from plug-in load forever, for every user.
+  - **Anchor the send schedule inside the TX thread.** Anchoring before the thread started cost the fork 3.2 ms of constant lateness. Done here: the transmitter anchors in its loop.
+  - **Re-anchor on a media-time discontinuity; never slew across it.** The fork used `mediaTicks_ == 0` as "unanchored" while also counting with it. A stream started before PTP lock never anchored, then sent about 1.45x too fast indefinitely. Done here: a generation change re-anchors, and positions never repeat.
+  - **Acceptance targets from the fork's measurements:**
+    - packets leave within one packet of their media time
+    - none miss a 2 ms Dante receive window over 120,000 packets
+    - the stream is stable across driver restarts
+  - **`ts-refclk` must follow the live grandmaster.** Bump the SDP version and re-announce when the grandmaster changes.
 - Pending:
-  - **The real HAL.** In particular, check whether coreaudiod's background timer coalescing delays TX while no client is running. marcnnn's fork measured 15-37 ms send stalls in that state, fixed only by clearing the process's Darwin background classification.
+  - **The real HAL.** In particular, measure the background coalescing above while no client is running.
   - **PTP-derived timestamps**, with `ts-refclk:ptp=` and a real `mediaclk` offset (phase 4).
   - **Criterion 4** with a Dante or RAVENNA receiver.
 
@@ -297,11 +326,28 @@ Each phase is a separate PR, test-first, and leaves the driver working.
 - **S2, HAL acceptance: resolved, Core Audio follows the model exactly.** With the Raw algorithm and a 16384-frame period, the measured rate matched a +300 ppm model to 0.1 ppm, tracked a +300 to -300 ppm ramp within 3 ppm (re-anchoring every 100 ms), and a phase step with a new seed produced exactly one clean timeline jump with no overloads in 3284 IO cycles. Core Audio adds no smoothing under Raw, so the servo must publish a smooth rate and slew small phase errors rather than step. Details: [Spikes/S2-HAL-Clock.md](Spikes/S2-HAL-Clock.md).
 - **S3, PTP accuracy.** Log offset and path-delay statistics against a real grandmaster to set link offset defaults and lock thresholds. On the target network this means the network's grandmaster, not the Riedel (a TimeReceiver). Also measure the actual Sync, Announce and Delay_Resp rates, and confirm the master answers unicast Delay_Req (hybrid mode).
 
+## Prior work reviewed
+
+marcnnn's fork (`feat/aes67-wing-interop`, 33 commits, September 2026) was reviewed in October 2026, with each commit compared against step 1 and step 2 and three reviews covering PTP, transmit and SAP, and device and streams. It was tested against a Behringer WING, and its measurements are recorded in phases 4 and 5 above.
+
+- **Ported** (rewritten against this design, with tests, credited):
+  - SDP fixes: `ts-refclk` forms, origin order, SAP payload type (#11)
+  - Release-build test fix and bundle signing (#11)
+  - SAP announcements, with jitter, stable session IDs, per-stream interface and an honest `ts-refclk` (#14)
+  - the Dante AES67 prefix warning (#14)
+  - separate input and output channel allocation (#15)
+- **Not ported:**
+  - **The PTP slave and helper agent:** the defects and security issues in phase 4's lessons.
+  - **Transmit timing:** superseded by phase 5's media-paced transmitter; its startup bug is described above.
+  - **Clock steering from buffer fill:** superseded by phase 3. Its gains assumed one update per second where the HAL calls once per IO cycle, an underrun threw the lock away, and an unread buffer could pin the clock at its limit.
+  - **One Core Audio device per configured device:** a good fit for a per-device `MediaClock`, but saving from one device deleted the other devices' streams. Left for later, with the save path fixed.
+
 ## Risks
 
 - **Software timestamp asymmetry biases phase.** Mitigation: minimum-delay filtering, a calibration offset, and a generous default link offset.
 - **Other PTP software on the same Mac** (another AoIP driver) contends for ports 319/320. Mitigation: `SO_REUSEPORT` and a documented limitation.
 - **Sample rate changes mid-stream.** Mitigation: rebase `mediaBase`, flush buffers, bump the seed.
+- **Background timer coalescing delays continuous TX.** With no client running, coreaudiod's timers may be coalesced by up to 100 ms (measured by marcnnn as 15-37 ms send stalls). Mitigation: measure in the real HAL; if needed, leave the Darwin background class only while a TX stream exists.
 - **Scope.** This is the largest change in the project. Mitigation: phased PRs, each independently shippable, with deterministic virtual-time tests so timing does not make the suite flaky.
 
 ## Decisions needed
