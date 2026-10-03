@@ -330,18 +330,32 @@ bool SDPParser::parseSourceFilterAttribute(const std::string& value, SDPSession&
 }
 
 bool SDPParser::parsePTPRefClockAttribute(const std::string& value, SDPSession& session) {
-    // Format: ptp=IEEE1588-2008:<mac-address>:domain-nmbr=<domain>
-    // Example: ptp=IEEE1588-2008:00-1B-21-AC-B5-4F:domain-nmbr=0
-    std::regex ptpRegex(R"(ptp=IEEE1588-2008:([0-9A-Fa-f\-:]+):domain-nmbr=(\d+))");
+    // RFC 7273: ptp=IEEE1588-2008:<EUI-64 grandmaster>[:domain-nmbr=<n>].
+    // Riedel writes "domain-nmbr=0"; Dante devices (e.g. Behringer WING)
+    // write a bare ":0"; some senders omit the domain (it is then 0).
+    //   ptp=IEEE1588-2008:00-1D-C1-FF-FE-D1-7B-F3:domain-nmbr=0
+    //   ptp=IEEE1588-2008:00-1D-C1-FF-FE-D1-7B-F3:0
+    // The identity is a dash-separated EUI-64 (some senders write a 6-byte
+    // MAC), so ':' only ever starts the domain.
+    static const std::regex ptpRegex(
+        R"(ptp=IEEE1588-2008:((?:[0-9A-Fa-f]{2}-){5,7}[0-9A-Fa-f]{2})(?::(?:domain-nmbr=)?(\d{1,3}))?\s*$)");
     std::smatch match;
 
     if (std::regex_search(value, match, ptpRegex)) {
         session.ptpMasterMAC = match[1];
-        session.ptpDomain = std::stoi(match[2]);
+        session.ptpDomain = match[2].matched ? std::stoi(match[2]) : 0;
         return true;
     }
 
-    return false;
+    // Any other reference (localmac=, ptp=...:traceable, vendor forms) leaves
+    // the stream receivable: unless a PTP reference was already found (RFC
+    // 7273 allows several), record that there is none rather than rejecting
+    // the whole description over one attribute
+    if (session.ptpMasterMAC.empty()) {
+        session.ptpDomain = -1;
+    }
+    session.customAttributes["ts-refclk"] = value;
+    return true;
 }
 
 bool SDPParser::parseMediaClockAttribute(const std::string& value, SDPSession& session) {

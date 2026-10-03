@@ -55,8 +55,9 @@ bool AudioThreadPriority::configureThreadForRealTime(pthread_t thread) {
         return false;
     }
 
-    // Optionally set affinity policy (could be used to pin to specific cores)
-    // This is optional and may not be needed for basic real-time audio
+    // Affinity is only a hint, and Apple Silicon does not support it at all
+    // (KERN_NOT_SUPPORTED), so it never decides success: the extended and
+    // precedence policies above are what make the thread real-time
     affinityPolicy.affinity_tag = 0; // Use default affinity
 
     result = thread_policy_set(
@@ -66,12 +67,12 @@ bool AudioThreadPriority::configureThreadForRealTime(pthread_t thread) {
         THREAD_AFFINITY_POLICY_COUNT
     );
 
-    if (result != KERN_SUCCESS) {
+    if (result != KERN_SUCCESS && result != KERN_NOT_SUPPORTED) {
         fprintf(stderr, "AES67 AudioThreadPriority: THREAD_AFFINITY_POLICY failed (kern_return=%d: %s) - non-critical\n",
                 result, mach_error_string(result));
     }
 
-    return result == KERN_SUCCESS;
+    return true;
 }
 
 void AudioThreadPriority::restoreNormalPriority() {

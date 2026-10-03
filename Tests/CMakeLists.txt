@@ -4,6 +4,11 @@
 
 cmake_minimum_required(VERSION 3.15)
 
+# Tests keep assert() in every build type. Release defines NDEBUG, which would
+# compile the assert-based suites' checks away; -UNDEBUG comes after the
+# configuration flags on the command line, so it wins.
+add_compile_options(-UNDEBUG)
+
 # Test: SDP Parser
 add_executable(TestSDPParser
     TestSDPParser.cpp
@@ -243,6 +248,18 @@ target_include_directories(TestClockRecovery PRIVATE
 
 target_compile_features(TestClockRecovery PRIVATE cxx_std_17)
 
+# Test: SAP announcement parsing (RFC 2974)
+add_executable(TestSAPListener
+    TestSAPListener.cpp
+    ../NetworkEngine/Discovery/SAPListener.cpp
+)
+
+target_include_directories(TestSAPListener PRIVATE
+    ${CMAKE_SOURCE_DIR}
+)
+
+target_compile_features(TestSAPListener PRIVATE cxx_std_17)
+
 # Add tests to CTest
 enable_testing()
 add_test(NAME ClockRecovery COMMAND TestClockRecovery)
@@ -258,6 +275,15 @@ add_test(NAME PTPClock COMMAND TestPTPClock)
 add_test(NAME StreamManager COMMAND TestStreamManager)
 add_test(NAME MultiStream COMMAND TestMultiStream)
 add_test(NAME IntegrationAudioPath COMMAND TestIntegrationAudioPath)
+add_test(NAME SAPListener COMMAND TestSAPListener)
+
+# The driver bundle must carry a valid signature over its resources: Core
+# Audio loads plug-ins from /Library/Audio/Plug-Ins/HAL, and the linker's
+# ad-hoc signature alone leaves Info.plist unsealed
+if(TARGET AES67Driver)
+    add_test(NAME DriverBundleSignature
+             COMMAND codesign --verify --strict $<TARGET_BUNDLE_DIR:AES67Driver>)
+endif()
 
 message(STATUS "Tests configured:")
 message(STATUS "  - TestSDPParser")

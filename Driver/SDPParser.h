@@ -30,8 +30,8 @@ struct SDPSession {
     // Origin
     std::string originUsername{"-"};       // o= (username, usually "-")
     std::string originAddress;             // o= (unicast address)
-    std::string originAddressType{"IN"};   // o= (usually "IN")
-    std::string originNetworkType{"IP4"};  // o= (usually "IP4")
+    std::string originAddressType{"IP4"};  // o= addrtype (RFC 4566: "IP4")
+    std::string originNetworkType{"IN"};   // o= nettype (RFC 4566: "IN")
 
     // Connection (c=)
     std::string connectionAddress;   // Usually multicast IP

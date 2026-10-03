@@ -7,6 +7,12 @@
 #include "../NetworkEngine/StreamChannelMapper.h"
 #include <iostream>
 #include <cassert>
+
+// These tests check with assert(). Release builds define NDEBUG, which would
+// compile every check away and let the suite pass without testing anything.
+#ifdef NDEBUG
+#error "TestChannelMapper needs assert(): build tests without NDEBUG (see Tests/CMakeLists.txt)"
+#endif
 #include <algorithm>
 
 namespace AES67 {
