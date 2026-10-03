@@ -394,11 +394,14 @@ struct AddStreamView: View {
 
 // MARK: - Preview
 
+#if DEBUG  // previews need Xcode: plain swiftc (build.sh) has no PreviewsMacros plugin
 #Preview("Add Stream View") {
     AddStreamView()
         .environmentObject(DriverManager())
 }
+#endif
 
+#if DEBUG  // previews need Xcode: plain swiftc (build.sh) has no PreviewsMacros plugin
 #Preview("Sample Rate Mismatch Alert") {
     SampleRateMismatchAlert(
         streamRate: 96000,
@@ -409,3 +412,4 @@ struct AddStreamView: View {
     .padding()
     .background(Color.gray.opacity(0.3))
 }
+#endif

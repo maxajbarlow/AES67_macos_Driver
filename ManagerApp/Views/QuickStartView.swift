@@ -895,7 +895,9 @@ struct TipRow: View {
 
 // MARK: - Preview
 
+#if DEBUG  // previews need Xcode: plain swiftc (build.sh) has no PreviewsMacros plugin
 #Preview {
     QuickStartView(isPresented: .constant(true))
         .environmentObject(DriverManager())
 }
+#endif

@@ -758,20 +758,26 @@ struct ConnectivityTestResult {
     let timestamp: Date
 }
 
+#if DEBUG  // previews need Xcode: plain swiftc (build.sh) has no PreviewsMacros plugin
 #Preview("Healthy State") {
     PTPDiagnosticView()
         .environmentObject(DriverManager())
 }
+#endif
 
+#if DEBUG  // previews need Xcode: plain swiftc (build.sh) has no PreviewsMacros plugin
 #Preview("No Master") {
     let view = PTPDiagnosticView()
     return view
         .environmentObject(DriverManager())
 }
+#endif
 
+#if DEBUG  // previews need Xcode: plain swiftc (build.sh) has no PreviewsMacros plugin
 #Preview("Firewall Blocked") {
     // Note: In real usage, this preview would need a mock DriverManager
     // that provides ptpDiagnostics with firewallBlockingPTP = true
     PTPDiagnosticView()
         .environmentObject(DriverManager())
 }
+#endif
