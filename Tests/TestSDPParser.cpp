@@ -8,6 +8,12 @@
 #include <iostream>
 #include <fstream>
 #include <cassert>
+
+// These tests check with assert(). Release builds define NDEBUG, which would
+// compile every check away and let the suite pass without testing anything.
+#ifdef NDEBUG
+#error "TestSDPParser needs assert(): build tests without NDEBUG (see Tests/CMakeLists.txt)"
+#endif
 #include <sstream>
 
 namespace AES67 {
@@ -229,6 +235,87 @@ a=rtpmap:96 L24/48000/8
     std::cout << "✓ PASSED\n";
 }
 
+// The o= line is "<user> <id> <version> <nettype> <addrtype> <address>", with
+// nettype IN and addrtype IP4 (RFC 4566). A session built from defaults, as
+// runtime-created TX streams are, must not swap them.
+void testOriginLineFromDefaults() {
+    std::cout << "Test: o= line from default session fields... ";
+
+    SDPSession session;
+    session.sessionName = "Defaults";
+    session.originAddress = "10.0.0.5";
+    session.connectionAddress = "239.69.100.2";
+    session.port = 5004;
+
+    const std::string generated = SDPParser::generate(session);
+    const size_t origin = generated.find("o=");
+    assert(origin != std::string::npos);
+    const std::string line = generated.substr(origin, generated.find('\n', origin) - origin);
+    const std::string expectedEnd = " IN IP4 10.0.0.5";
+    assert(line.size() > expectedEnd.size() &&
+           line.compare(line.size() - expectedEnd.size(), expectedEnd.size(), expectedEnd) == 0);
+
+    auto reparsed = SDPParser::parseString(generated);
+    assert(reparsed.has_value());
+    assert(reparsed->originNetworkType == "IN");
+    assert(reparsed->originAddressType == "IP4");
+
+    std::cout << "PASSED\n";
+}
+
+std::string sdpWithRefclk(const std::string& refclk) {
+    // The form a Behringer WING (Dante) announces; its real ts-refclk line
+    // writes the PTP domain as a bare trailing number
+    return "v=0\n"
+           "o=- 1 1 IN IP4 10.46.70.20\n"
+           "s=WING\n"
+           "c=IN IP4 239.69.218.192/32\n"
+           "t=0 0\n"
+           "a=recvonly\n"
+           "m=audio 5004 RTP/AVP 103\n"
+           "a=rtpmap:103 L24/48000/8\n"
+           "a=ptime:1\n" +
+           refclk +
+           "a=mediaclk:direct=0\n";
+}
+
+// RFC 7273 spells the domain "domain-nmbr=0" (Riedel does); Dante devices
+// write a bare ":0", and some senders give no domain or a non-PTP reference.
+// None of these may reject an otherwise valid stream.
+void testTsRefclkForms() {
+    std::cout << "Test: ts-refclk forms seen in the wild... ";
+
+    auto wing = SDPParser::parseString(sdpWithRefclk("a=ts-refclk:ptp=IEEE1588-2008:00-1D-C1-FF-FE-D1-7B-F3:0\n"));
+    assert(wing.has_value());
+    assert(wing->encoding == "L24" && wing->sampleRate == 48000 && wing->numChannels == 8);
+    assert(wing->connectionAddress == "239.69.218.192" && wing->port == 5004 && wing->payloadType == 103);
+    assert(wing->ptpMasterMAC == "00-1D-C1-FF-FE-D1-7B-F3");
+    assert(wing->ptpDomain == 0);
+
+    auto bareDomain = SDPParser::parseString(sdpWithRefclk("a=ts-refclk:ptp=IEEE1588-2008:00-1D-C1-FF-FE-D1-7B-F3:5\n"));
+    assert(bareDomain.has_value() && bareDomain->ptpDomain == 5);
+
+    auto rfc = SDPParser::parseString(sdpWithRefclk("a=ts-refclk:ptp=IEEE1588-2008:00-1D-C1-FF-FE-D1-7B-F3:domain-nmbr=7\n"));
+    assert(rfc.has_value() && rfc->ptpDomain == 7 && rfc->ptpMasterMAC == "00-1D-C1-FF-FE-D1-7B-F3");
+
+    auto noDomain = SDPParser::parseString(sdpWithRefclk("a=ts-refclk:ptp=IEEE1588-2008:00-1D-C1-FF-FE-D1-7B-F3\n"));
+    assert(noDomain.has_value() && noDomain->ptpDomain == 0 && noDomain->ptpMasterMAC == "00-1D-C1-FF-FE-D1-7B-F3");
+
+    auto localMac = SDPParser::parseString(sdpWithRefclk("a=ts-refclk:localmac=00-1D-C1-D1-7B-F3\n"));
+    assert(localMac.has_value() && localMac->ptpDomain == -1 && localMac->ptpMasterMAC.empty());
+
+    auto traceable = SDPParser::parseString(sdpWithRefclk("a=ts-refclk:ptp=IEEE1588-2008:traceable\n"));
+    assert(traceable.has_value() && traceable->ptpDomain == -1);
+
+    // RFC 7273 allows several references; an unrecognised one must not erase
+    // a PTP reference already found
+    auto both = SDPParser::parseString(sdpWithRefclk("a=ts-refclk:ptp=IEEE1588-2008:00-1D-C1-FF-FE-D1-7B-F3:0\n"
+                                                     "a=ts-refclk:localmac=00-1D-C1-D1-7B-F3\n"));
+    assert(both.has_value() && both->ptpDomain == 0 && both->ptpMasterMAC == "00-1D-C1-FF-FE-D1-7B-F3");
+
+    std::cout << "PASSED\n";
+}
+
 void runAllTests() {
     std::cout << "\n=== AES67 SDP Parser Test Suite ===\n\n";
 
@@ -238,6 +325,8 @@ void runAllTests() {
     testHighSampleRates();
     testMultiChannelConfigurations();
     testSDPGeneration();
+    testOriginLineFromDefaults();
+    testTsRefclkForms();
     testInvalidSDP();
     testFileOperations();
 

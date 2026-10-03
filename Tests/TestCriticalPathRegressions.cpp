@@ -26,6 +26,8 @@
 #include "../NetworkEngine/Clock/HostTime.h"
 #include "../NetworkEngine/Clock/TimestampedAudioBuffer.h"
 #include "../Shared/RingBuffer.hpp"
+#include <mach/mach.h>
+#include <mach/thread_policy.h>
 #include <aspl/Context.hpp>
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -579,11 +581,32 @@ void testIOStartStopLeavesStreamActivityToHAL() {
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// configureForRealTime must report success when the real-time policies are
+// applied. It used to return the result of THREAD_AFFINITY_POLICY, which Apple
+// Silicon never supports, so every receive thread logged a false failure.
+// ---------------------------------------------------------------------------
+void testRealTimePriorityReportsSuccess() {
+    std::cout << "Real-time thread priority reports success when applied" << std::endl;
+    bool reported = false;
+    boolean_t getDefault = FALSE;
+    thread_extended_policy_data_t extended{TRUE};
+    mach_msg_type_number_t count = THREAD_EXTENDED_POLICY_COUNT;
+    std::thread([&] {
+        reported = AudioThreadPriority::configureForRealTime();
+        thread_policy_get(mach_thread_self(), THREAD_EXTENDED_POLICY,
+                          reinterpret_cast<thread_policy_t>(&extended), &count, &getDefault);
+    }).join();
+    CHECK(!extended.timeshare, "the thread should have left time-sharing");
+    CHECK(reported, "configureForRealTime should report the success");
+}
+
 int main() {
     testMixedOutputReachesOutputBuffers();
     testInputReadsByDeviceTime();
     testDeviceSampleRate();
     testDeviceClockFromMediaClock();
+    testRealTimePriorityReportsSuccess();
     testIOStartStopLeavesStreamActivityToHAL();
     testDeviceClockFollowsReceivedStream();
     testTxStreamSurvivesReload();

@@ -13,6 +13,8 @@ namespace AES67 {
 
 // PIMPL idiom to hide platform-specific implementation details
 class SAPListener::Impl {
+    friend class SAPListener;  // parseAnnouncement() exposes the packet parser
+
 public:
     Impl() : running_(false), sockFd_(-1) {
     }
@@ -157,8 +159,8 @@ private:
         }
     }
     
-    SAPAnnouncement parseSAPAnnouncement(const char* data, size_t length,
-                                       const std::string& sourceAddress) {
+    static SAPAnnouncement parseSAPAnnouncement(const char* data, size_t length,
+                                                const std::string& sourceAddress) {
         SAPAnnouncement announcement;
         announcement.sourceAddress = sourceAddress;
 
@@ -197,10 +199,28 @@ private:
         // Auth length (number of 32-bit words of authentication data)
         uint8_t authLen = static_cast<uint8_t>(data[1]);
 
-        // Calculate payload offset: 4 (base header) + 4 (originating source) + authLen*4
-        size_t payloadStart = 8 + (static_cast<size_t>(authLen) * 4);
+        // Payload offset: 4 (base header) + originating source (4 bytes, or
+        // 16 when the A bit marks an IPv6 address) + authLen*4
+        const size_t originLength = ((sapHeader >> 4) & 0x01) ? 16 : 4;
+        size_t payloadStart = 4 + originLength + (static_cast<size_t>(authLen) * 4);
         if (payloadStart >= length) {
             return announcement; // No room for payload
+        }
+
+        // Optional payload type: a null-terminated MIME type before the
+        // payload. It is absent when the payload starts directly with "v=0".
+        static constexpr char kSdpPrefix[] = "v=0";
+        static constexpr char kSdpPayloadType[] = "application/sdp";
+        if (length - payloadStart < 3 || std::memcmp(data + payloadStart, kSdpPrefix, 3) != 0) {
+            const void* terminator = std::memchr(data + payloadStart, '\0', length - payloadStart);
+            if (terminator == nullptr) {
+                return announcement; // No payload type terminator
+            }
+            const size_t typeLength = static_cast<const char*>(terminator) - (data + payloadStart);
+            if (std::string(data + payloadStart, typeLength) != kSdpPayloadType) {
+                return announcement; // Not an SDP announcement
+            }
+            payloadStart += typeLength + 1;
         }
 
         // Payload must contain printable text (SDP). Reject binary garbage.
@@ -212,8 +232,8 @@ private:
         // The payload should be an SDP description
         std::string sdpContent(data + payloadStart, payloadLen);
 
-        // Basic SDP sanity check: must start with "v=0" or contain "v=0"
-        if (sdpContent.find("v=0") == std::string::npos) {
+        // The SDP starts here, with its version line
+        if (sdpContent.compare(0, 3, kSdpPrefix) != 0) {
             return announcement; // Not valid SDP
         }
 
@@ -225,7 +245,7 @@ private:
         return announcement;
     }
     
-    void parseSDPInfo(const std::string& sdp, SAPAnnouncement& announcement) {
+    static void parseSDPInfo(const std::string& sdp, SAPAnnouncement& announcement) {
         // Parse the SDP content to extract stream information
         size_t lastPos = 0;
         size_t pos = 0;
@@ -345,6 +365,10 @@ void SAPListener::registerAnnouncementCallback(const SAPAnnouncementCallback& ca
 
 std::vector<SAPAnnouncement> SAPListener::getDiscoveredStreams() const {
     return pimpl_->getDiscoveredStreams();
+}
+
+SAPAnnouncement SAPListener::parseAnnouncement(const char* data, size_t length, const std::string& sourceAddress) {
+    return Impl::parseSAPAnnouncement(data, length, sourceAddress);
 }
 
 } // namespace AES67

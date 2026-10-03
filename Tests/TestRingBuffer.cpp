@@ -226,20 +226,26 @@ bool testBatchPerformance() {
         writeData[i] = static_cast<float>(i);
     }
 
-    auto start = std::chrono::high_resolution_clock::now();
+    // Consume what the loops read. Otherwise nothing observes their results
+    // and a Release build deletes both loops: each then times as 0 and the
+    // speedup below is NaN (0/0).
+    double checksum = 0.0;
+
+    auto start = std::chrono::steady_clock::now();
 
     // Batch processing (what we do now)
     for (size_t i = 0; i < kNumIterations; ++i) {
         buffer.write(writeData, kBatchSize);
         buffer.read(readData, kBatchSize);
+        checksum += readData[i % kBatchSize];
     }
 
-    auto end = std::chrono::high_resolution_clock::now();
-    auto batchDuration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    auto end = std::chrono::steady_clock::now();
+    auto batchDuration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
 
     // Compare to per-sample processing (old way)
     buffer.reset();
-    start = std::chrono::high_resolution_clock::now();
+    start = std::chrono::steady_clock::now();
 
     for (size_t i = 0; i < kNumIterations; ++i) {
         for (size_t j = 0; j < kBatchSize; ++j) {
@@ -248,16 +254,24 @@ bool testBatchPerformance() {
         for (size_t j = 0; j < kBatchSize; ++j) {
             buffer.read(&readData[j], 1);
         }
+        checksum += readData[i % kBatchSize];
     }
 
-    end = std::chrono::high_resolution_clock::now();
-    auto singleDuration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    end = std::chrono::steady_clock::now();
+    auto singleDuration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+
+    // Each run reads back writeData, so each adds sum(i % kBatchSize)
+    double expectedChecksum = 0.0;
+    for (size_t i = 0; i < kNumIterations; ++i) expectedChecksum += static_cast<double>(i % kBatchSize);
+    expectedChecksum *= 2.0;
+    TEST_ASSERT(checksum == expectedChecksum, "Benchmark loops should read back what they wrote");
+    TEST_ASSERT(batchDuration.count() > 0 && singleDuration.count() > 0, "Both loops should take measurable time");
 
     double speedup = static_cast<double>(singleDuration.count()) / batchDuration.count();
 
     std::cout << "PASS (Speedup: " << speedup << "x)" << std::endl;
-    std::cout << "  Batch:  " << batchDuration.count() << " μs" << std::endl;
-    std::cout << "  Single: " << singleDuration.count() << " μs" << std::endl;
+    std::cout << "  Batch:  " << batchDuration.count() / 1000 << " us" << std::endl;
+    std::cout << "  Single: " << singleDuration.count() / 1000 << " us" << std::endl;
 
     TEST_ASSERT(speedup > 1.5, "Batch should be at least 1.5x faster");
 

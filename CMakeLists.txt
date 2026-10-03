@@ -192,6 +192,16 @@ if(APPLE)
         OSX_DEPLOYMENT_TARGET "13.0"
     )
 
+    # Seal the whole bundle. The linker signs only the binary, ad hoc, which
+    # leaves Info.plist outside the signature ("code has no resources but
+    # signature indicates they must be present"), so the bundle does not pass
+    # codesign --verify. Re-sign the bundle, still ad hoc, after every link.
+    add_custom_command(TARGET AES67Driver POST_BUILD
+        COMMAND codesign --force --sign - "$<TARGET_BUNDLE_DIR:AES67Driver>"
+        COMMENT "Ad-hoc signing AES67Driver.driver"
+        VERBATIM
+    )
+
     # Install to standard location
     install(TARGETS AES67Driver
         LIBRARY DESTINATION "/Library/Audio/Plug-Ins/HAL"

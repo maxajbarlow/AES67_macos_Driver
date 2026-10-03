@@ -42,6 +42,10 @@ public:
     
     // Get the list of recently discovered streams
     std::vector<SAPAnnouncement> getDiscoveredStreams() const;
+
+    // Parse one SAP packet (RFC 2974). Returns an announcement with an empty
+    // sessionDescription if the packet is not an SDP announcement we support.
+    static SAPAnnouncement parseAnnouncement(const char* data, size_t length, const std::string& sourceAddress);
     
 private:
     class Impl;
