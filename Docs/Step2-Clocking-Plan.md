@@ -198,7 +198,7 @@ Each phase is a separate PR, test-first, and leaves the driver working.
   - **Real HAL:** with the installed driver, the client (`AES67ClockProbeClient --uid com.aes67.driver.device --constant 0 --no-ramp --expect-level 0.25`) measured the rate at +0.0 ppm (HAL actual rate 48000.000 Hz), with 0 timeline jumps and 0 overloads in 2345 callbacks.
   - **Receive audio:** host-only test packets through a receive-only config arrived unbroken: 100.0% of 1,200,640 input samples were at the expected level.
 
-### Phase 2: RX by timestamp (implemented; final HAL confirmation pending)
+### Phase 2: RX by timestamp (done; verified in the real HAL)
 
 - Receive thread decodes into PlayoutBuffers; IO handler reads by sample time with link offset; consume thread and jitter buffer deleted; link offset reported as latency.
 - Add a tone-continuity analyser tool (extend `QuickCapture`) for long hardware captures.
@@ -225,8 +225,10 @@ Each phase is a separate PR, test-first, and leaves the driver working.
   - test sawtooth continuous: 0 breaks in 2.88 M samples
   - two streams sample-aligned: 0 of 2.88 M frames differ
   - two clients identical in all 1876 shared IO cycles
+- Real HAL with the 50 ms rule, 2026-10-03, using the Python sender as a natural stall generator:
+  - 120 s run: 0 re-anchors, 0 sawtooth breaks, 0 timeline jumps, two clients identical in all 1878 shared cycles
+  - 60 s run with kernel arrival timestamps recorded: the sender stalled beyond the 8 ms link offset 14 times (worst 23.5 ms), still with 0 re-anchors and 0 breaks. Packets later than the link offset play as silence. The two streams differ in a few hundred frames, consistent with a stall falling between the sender's packets for the two streams.
 - Pending:
-  - **HAL rerun with the 50 ms rule,** using the Python sender as a natural stall generator. It needs one coreaudiod restart to load the new build.
   - **Interface re-resolution.** The receive interface address is resolved once, so a DHCP renewal or Wi-Fi roam breaks receivers until coreaudiod restarts.
 
 ### Phase 3: Stream-recovered clock
