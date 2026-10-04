@@ -27,15 +27,7 @@ Progress is tracked in the [step 2 plan](Docs/Step2-Clocking-Plan.md).
 
 ## Roadmap
 
-| Stage | Status |
-|---|---|
-| Media clock and Core Audio timing | Done |
-| Receive by RTP timestamp | Done |
-| Clock recovered from a received stream | Done, hardware test pending |
-| PTP | Planned |
-| Transmit on the media clock | Mostly done; needs PTP for Dante/RAVENNA |
-| Resampling for streams on other clocks | Optional |
-| Implementing Manager app | Parked |
+Next up is PTP, then a signed installer, a Manager app that controls the driver, and per-app routing. See the [roadmap](Docs/Roadmap.md) for the full order and how to help.
 
 ## Known limitations
 
