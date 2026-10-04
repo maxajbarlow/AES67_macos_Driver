@@ -35,6 +35,7 @@ Progress is tracked in the [step 2 plan](Docs/Step2-Clocking-Plan.md).
 | PTP | Planned |
 | Transmit on the media clock | Mostly done; needs PTP for Dante/RAVENNA |
 | Resampling for streams on other clocks | Optional |
+| Implementing Manager app | Parked |
 
 ## Known limitations
 
