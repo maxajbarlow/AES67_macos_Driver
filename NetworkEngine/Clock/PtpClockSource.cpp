@@ -6,12 +6,13 @@
 namespace AES67 {
 
 PtpClockSource::PtpClockSource(Config config, const MediaClock& clock, const std::atomic<double>& sampleRate,
-                               RateWriter writer, ChangeListener listener)
+                               RateWriter writer, ChangeListener listener, OffsetWriter offsetWriter)
     : config_(std::move(config)),
       clock_(clock),
       sampleRate_(sampleRate),
       writer_(std::move(writer)),
       listener_(std::move(listener)),
+      offsetWriter_(std::move(offsetWriter)),
       receiver_(config_.receiver),
       control_(config_.control) {}
 
@@ -89,6 +90,9 @@ void PtpClockSource::step() {
 
     const MediaClock::Snapshot clock = clock_.snapshot();
     const auto update = control_.update(clock, sampleRate_.load(), hostTimeNow(), reference);
+    if (update.offsetChanged && offsetWriter_) {
+        offsetWriter_(clock.generation, *control_.offset());
+    }
     if (update.samplesPerTick) {
         writer_(clock.generation, *update.samplesPerTick);
     }

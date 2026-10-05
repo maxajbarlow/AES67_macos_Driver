@@ -189,8 +189,9 @@ private:
 struct TxHarness {
     MediaClock clock;
     TxRouting routing;
+    NetworkTimeMapping networkTime;  // fixed at PTP's offset while PTP has the clock
     TxHarness() { clock.reset(hostTimeNow(), 0, MediaClock::samplesPerTick(kRate, 1.0, HostTimebase::current())); }
-    TxContext context() { return TxContext{clock, routing}; }
+    TxContext context() { return TxContext{clock, routing, &networkTime}; }
 };
 
 // Packets after the first `skip`, which may predate the writer's first write
@@ -377,6 +378,106 @@ void testLoopbackThroughOurReceiverIsSampleExact() {
     CHECK(receiver.getPlacementStatistics().reanchors == 0, "the receiver should never need to re-anchor");
 }
 
+// With PTP, RTP timestamps are PTP time plus the SDP's mediaclk offset; the
+// device's fixed mapping (media position minus PTP time) converts
+void testPtpTimestamps() {
+    std::cout << "PTP: RTP = media position - PTP offset + mediaclk; continuous again after PTP" << std::endl;
+    TxHarness h;
+    PositionWriter writer(h.clock, h.routing);
+    PacketCapture capture("239.69.99.47", 55084);
+    SDPSession sdp = txSdp("239.69.99.47", 55084);
+    const uint32_t mediaclk = 4000000000u;
+    sdp.mediaClockType = "direct=" + std::to_string(mediaclk);
+    RTPTransmitter tx(sdp, txMapping(0), h.context());
+    CHECK(tx.start(), "transmitter should start");
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    const int64_t k = 7777777;
+    h.networkTime.fix(k);  // PTP takes the clock
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    h.networkTime.reset();  // PTP lets go (a timeline restart without it)
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    tx.stop();
+    writer.stop();
+    const auto packets = settled(capture.stop());
+
+    // Before PTP: an RTP timeline of the transmitter's own. From PTP taking
+    // over: PTP-stamped, with one jump onto it. When PTP lets go the
+    // timestamps carry on unbroken, which leaves them on the same line.
+    size_t firstStamped = packets.size();
+    size_t stamped = 0;
+    size_t jumps = 0;
+    size_t sequenceBreaks = 0;
+    for (size_t i = 0; i < packets.size(); ++i) {
+        const auto& p = packets[i];
+        if (p.timestamp == static_cast<uint32_t>(p.channel0.front() - k) + mediaclk) {
+            ++stamped;
+            firstStamped = std::min(firstStamped, i);
+        }
+        if (i == 0) continue;
+        if (static_cast<uint16_t>(p.sequence - packets[i - 1].sequence) != 1) ++sequenceBreaks;
+        if (p.timestamp - packets[i - 1].timestamp != static_cast<uint32_t>(kFramesPerPacket)) ++jumps;
+    }
+    std::cout << "  " << stamped << " of " << packets.size() << " packets on PTP time from packet " << firstStamped
+              << ", " << jumps << " timestamp jump(s)" << std::endl;
+    CHECK(firstStamped > 300 && firstStamped < 420, "PTP stamping starts when PTP takes the clock (" << firstStamped << ")");
+    CHECK(stamped == packets.size() - firstStamped, "every packet from then on is on that line");
+    CHECK(jumps == 1, "one jump, onto PTP time; none on leaving it (" << jumps << ")");
+    CHECK(sequenceBreaks == 0, "sequence numbers never break");
+}
+
+// Our TX into our RX, both on PTP's fixed mapping: the receiver places each
+// packet by its timestamp at exactly the media position it was sent from
+void testPtpLoopbackIsSampleExact() {
+    std::cout << "PTP: TX to RX loopback through the fixed mapping lands each sample where it was sent from" << std::endl;
+    RxHarness rx;
+    const int64_t k = -31415926;
+    // Before PTP: another stream anchored the shared mapping somewhere this
+    // one does not fit, so it anchors on its own
+    rx.networkTime.anchorIfUnset(123456);
+    TxRouting txRouting;
+    PositionWriter writer(rx.clock, txRouting);
+    SDPSession sdp = txSdp("239.69.99.48", 55086);
+    sdp.mediaClockType = "direct=2718281828";
+    RTPTransmitter tx(sdp, txMapping(0), TxContext{rx.clock, txRouting, &rx.networkTime});
+    SDPSession rxSdp = sdp;
+    rxSdp.direction = "recvonly";
+    ChannelMapping rxMapping = txMapping(0);
+    RTPReceiver receiver(rxSdp, rxMapping, rx.context());
+    CHECK(receiver.start(), "receiver should start");
+    CHECK(tx.start(), "transmitter should start");
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    rx.networkTime.fix(k);  // PTP takes the clock: both sides move onto PTP time
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+
+    // Read back recent positions straight from the receive buffer: each must
+    // hold the sample written at that position on the TX side
+    const int64_t end = rx.readPositionNow();
+    std::vector<float> frame(128);
+    size_t checked = 0;
+    size_t wrong = 0;
+    size_t missing = 0;  // not (yet) received: a slow machine can deliver a packet late
+    for (int64_t position = end - 2000; position < end; ++position) {
+        std::fill(frame.begin(), frame.end(), 0.0f);
+        rx.routing.read([&](const RxRouting::Route& route) {
+            route.buffer->read(position, 1, frame.data(), 128, route.deviceChannelStart);
+        });
+        ++checked;
+        if (frame[0] == 0.0f) {
+            ++missing;
+        } else if (std::fabs(static_cast<double>(frame[0]) * 8388608.0 - static_cast<double>(position)) > 1.5) {
+            ++wrong;
+        }
+    }
+    std::cout << "  " << checked << " positions read back: " << wrong << " wrong, " << missing << " missing" << std::endl;
+    tx.stop();
+    receiver.stop();
+    writer.stop();
+    CHECK(checked == 2000 && wrong == 0, wrong << " of " << checked << " positions hold another position's sample");
+    CHECK(missing <= 2 * kFramesPerPacket, "and at most a couple of packets not yet arrived (" << missing << ")");
+    CHECK(receiver.getPlacementStatistics().reanchors == 0, "no re-anchors: it starts over on PTP's mapping");
+    CHECK(rx.networkTime.offset() == k, "PTP's mapping was never moved");
+}
+
 // A stream's TTL comes from its SDP: tests use 0 so nothing leaves the host
 void testMulticastTtlFollowsTheSdp() {
     std::cout << "TX multicast TTL follows the stream's SDP" << std::endl;
@@ -452,6 +553,8 @@ void testFramesPerPacketFollowsPtime() {
 } // namespace
 
 int main() {
+    testPtpTimestamps();
+    testPtpLoopbackIsSampleExact();
     testPacketsCarryTheirMediaPositions();
     testSilenceFlowsWithoutTheIOThread();
     testFollowsTheMediaClockRate();

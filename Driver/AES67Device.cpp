@@ -49,9 +49,6 @@ void AES67Device::Initialize() {
     // Valid clock from the start; restarted again whenever IO starts
     RestartTimeline(currentSampleRate_.load());
 
-    // PTP, only if ptp.json turns it on: it sends Delay_Req onto the network
-    StartPtp();
-
     // Initialize streams
     AES67_LOG("AES67Device: Calling InitializeStreams()");
     InitializeStreams();
@@ -78,7 +75,7 @@ void AES67Device::Initialize() {
     AES67_LOG("AES67Device: Creating StreamManager");
     streamManager_ = std::make_unique<StreamManager>(
         RxContext{mediaClock_, networkTime_, rxRouting_, linkOffsetFrames_, &clockRecovery_},
-        TxContext{mediaClock_, txRouting_});
+        TxContext{mediaClock_, txRouting_, &networkTime_});
     AES67_LOG("AES67Device: StreamManager created successfully");
 
     // Set device sample rate in StreamManager
@@ -120,6 +117,10 @@ void AES67Device::Initialize() {
         // No built-in TX stream: a configured TX stream transmits
         // continuously, so one must never appear unasked
     }
+
+    // PTP, only if ptp.json turns it on: it sends Delay_Req onto the network.
+    // Last, so its thread finds the stream manager in place.
+    StartPtp();
 
     AES67_LOG("AES67Device::Initialize() complete");
 }
@@ -315,10 +316,8 @@ void AES67Device::StartPtp() {
     ptpClock_ = std::make_unique<PtpClockSource>(
         config, mediaClock_, currentSampleRate_,
         [this](uint32_t generation, double samplesPerTick) { ApplyPtpRate(generation, samplesPerTick); },
-        [this] {
-            NotifyPropertyChanged(kAudioDevicePropertyClockIsStable);
-            NotifyPropertyChanged(kAudioDevicePropertyClockDomain);
-        });
+        [this] { OnPtpChanged(); },
+        [this](uint32_t generation, int64_t offset) { ApplyPtpOffset(generation, offset); });
     ptpClock_->start();
     AES67_LOGF("PTP: on (%s): interface '%s', domain %u, %s Delay_Req", path.c_str(),
                settings.networkInterface.empty() ? "primary" : settings.networkInterface.c_str(),
@@ -331,6 +330,31 @@ void AES67Device::ApplyPtpRate(uint32_t clockGeneration, double samplesPerTick) 
         return;  // computed for a timeline that has since restarted
     }
     mediaClock_.setRate(hostTimeNow(), samplesPerTick);
+}
+
+void AES67Device::ApplyPtpOffset(uint32_t clockGeneration, int64_t offset) {
+    std::lock_guard<std::mutex> lock(clockWriteMutex_);
+    if (mediaClock_.snapshot().generation != clockGeneration) {
+        return;  // for a timeline that has since restarted
+    }
+    // Network time is now PTP time: receivers place by it, transmitters stamp by it
+    networkTime_.fix(offset);
+}
+
+void AES67Device::OnPtpChanged() {
+    NotifyPropertyChanged(kAudioDevicePropertyClockIsStable);
+    NotifyPropertyChanged(kAudioDevicePropertyClockDomain);
+
+    // TX timestamps are now the followed grandmaster's time: announce it. On
+    // losing lock the last one stays announced until another is followed.
+    if (!ptpClock_->locked()) {
+        return;
+    }
+    const auto status = ptpClock_->status();
+    if (status.receiver.master && streamManager_) {
+        streamManager_->setPtpGrandmaster(StreamManager::PtpGrandmaster{
+            status.receiver.master->announce.grandmasterIdentity.toString(), ptpClock_->domain()});
+    }
 }
 
 bool AES67Device::GetClockIsStable() const {

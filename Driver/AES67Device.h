@@ -235,6 +235,8 @@ private:
     // stops first.
     void StartPtp();
     void ApplyPtpRate(uint32_t clockGeneration, double samplesPerTick);
+    void ApplyPtpOffset(uint32_t clockGeneration, int64_t offset);
+    void OnPtpChanged();
 
     static int64_t LinkOffsetFramesFor(Float64 sampleRate);
 

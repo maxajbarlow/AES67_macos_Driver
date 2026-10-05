@@ -53,12 +53,17 @@ RtpPlacement::Result RtpPlacement::place(uint32_t rtpTimestamp, uint32_t ssrc, u
         followsShared_ = true;
         mapping_.anchorIfUnset(arrivalAnchor - static_cast<int64_t>(networkTimestamp));
         int64_t position = positionOf(networkTimestamp, localArrival);
-        if (!inWindow(marginOf(position, frames, localArrival))) {
+        if (inWindow(marginOf(position, frames, localArrival))) {
+            return {Verdict::Accepted, position, false};
+        }
+        if (!mapping_.fixed()) {
             privateAdjust_ = arrivalAnchor - position;
             followsShared_ = false;
-            position = arrivalAnchor;
+            return {Verdict::Accepted, arrivalAnchor, false};
         }
-        return {Verdict::Accepted, position, false};
+        // PTP's mapping is right by definition: one packet that does not fit
+        // (a straggler stamped before the sender moved onto PTP time) earns
+        // no anchor of its own. Only a sustained run does, below.
     }
 
     int64_t position = positionOf(networkTimestamp, localArrival);
@@ -112,9 +117,10 @@ RtpPlacement::Result RtpPlacement::place(uint32_t rtpTimestamp, uint32_t ssrc, u
     }
 
     ++reanchors_;
-    if (sameSource && followsShared_) {
+    if (sameSource && followsShared_ && !mapping_.fixed()) {
         // Drift between the local clock and network time: move the shared
-        // mapping so every stream on it stays aligned
+        // mapping so every stream on it stays aligned (never PTP's: it is
+        // right by definition, and this stream has left PTP time)
         mapping_.reanchor(mapping_.offset() + (arrivalAnchor - position));
     } else {
         // This stream's timeline changed on its own (new session offset or an

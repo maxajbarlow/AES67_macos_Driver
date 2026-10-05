@@ -26,10 +26,11 @@ namespace AES67 {
 /// Positions nothing wrote (no Core Audio client running) are sent as silence,
 /// so the stream flows continuously whenever the transmitter runs.
 ///
-/// RTP timestamps are M plus an offset. A timeline restart (new clock
-/// generation) moves media positions; the offset is adjusted so the RTP
-/// timestamps continue without a jump. With PTP (step 2 phase 4) the offset
-/// becomes the SDP mediaclk offset and timelines no longer restart.
+/// RTP timestamps: while PTP has the clock (the device's network time
+/// mapping is fixed at PTP's offset K), PTP time plus the SDP's mediaclk
+/// offset, M - K + mediaclk, as AES67 receivers expect. Otherwise M plus an
+/// offset, adjusted at each timeline restart (new clock generation) and on
+/// leaving PTP so the timestamps continue without a jump.
 class RTPTransmitter {
 public:
     struct TransmitStatistics {

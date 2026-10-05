@@ -487,9 +487,11 @@ std::vector<std::string> SDPParser::generateAttributes(const SDPSession& session
     // PTP reference clock
     if (session.ptpDomain >= 0 && !session.ptpMasterMAC.empty()) {
         std::ostringstream ptpRefclk;
+        // AES67's form (as Dante and RAVENNA write it): the domain number
+        // after the grandmaster, not RFC 7273's domain-nmbr=
         ptpRefclk << "a=ts-refclk:ptp=IEEE1588-2008:"
                   << session.ptpMasterMAC
-                  << ":domain-nmbr=" << session.ptpDomain;
+                  << ":" << session.ptpDomain;
         attributes.push_back(ptpRefclk.str());
     }
 

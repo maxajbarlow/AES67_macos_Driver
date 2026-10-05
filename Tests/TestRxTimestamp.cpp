@@ -431,7 +431,96 @@ void testStallWithSteadyLateRunDoesNotReanchor() {
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// PTP: the mapping is PTP's offset (media position minus PTP time), fixed
+// ---------------------------------------------------------------------------
+void testPtpMappingPlacesByTimestamp() {
+    std::cout << "PTP mapping: packets land at PTP time plus the offset, whenever they arrive" << std::endl;
+    NetworkTimeMapping mapping;
+    const int64_t k = 123456789;
+    mapping.fix(k);
+    CHECK(mapping.fixed() && mapping.anchored() && mapping.offset() == k, "fixed at PTP's offset");
+
+    const uint32_t mediaclk = 3000000000u;  // the sender's SDP a=mediaclk:direct=
+    RtpPlacement stream(config(mediaclk), mapping);
+    const int64_t ptp = 4000000;  // PTP time in samples of the first packet
+    for (int i = 0; i < 20; ++i) {
+        const int64_t p = ptp + i * kFrames;
+        const int64_t arrival = p + kFrames + k + 37 + (i % 5) * 11;  // network delay and jitter
+        const auto r = stream.place(static_cast<uint32_t>(p) + mediaclk, kSsrcA, kFrames, arrival);
+        CHECK(r.verdict == RtpPlacement::Verdict::Accepted && r.position == p + k,
+              "packet " << i << " at PTP time + offset (" << r.position - (p + k) << " off)");
+    }
+    CHECK(mapping.offset() == k, "the first packet did not re-anchor it");
+}
+
+void testPtpMappingIsNeverMoved() {
+    std::cout << "PTP mapping: a stream off PTP time anchors on its own; the mapping stays" << std::endl;
+    NetworkTimeMapping mapping;
+    const int64_t k = 5000000;
+    mapping.fix(k);
+    RtpPlacement onPtp(config(), mapping);
+    RtpPlacement offPtp(config(), mapping);
+    int64_t p = 800000;
+    // The second sender's timestamps are 1 s away from PTP time (another clock)
+    RtpPlacement::Result off{};
+    for (int i = 0; i < 20 + kSwitchPackets; ++i, p += kFrames) {
+        const int64_t arrival = p + kFrames + k + 50;
+        const auto r = onPtp.place(static_cast<uint32_t>(p), kSsrcA, kFrames, arrival);
+        CHECK(r.position == p + k, "the PTP stream stays at PTP time");
+        off = offPtp.place(static_cast<uint32_t>(p + 48000), kSsrcB, kFrames, arrival + 3);
+    }
+    CHECK(off.verdict == RtpPlacement::Verdict::Accepted, "the other stream plays, on its own anchor");
+    CHECK(mapping.offset() == k && mapping.fixed(), "and never moves PTP's mapping");
+
+    // Same for a PTP stream that drifts out of the window (the sender left PTP)
+    RtpPlacement drifting(config(), mapping);
+    drifting.place(static_cast<uint32_t>(p), kSsrcA, kFrames, p + kFrames + k + 50);
+    RtpPlacement::Result r{};
+    for (int i = 0; i < kSwitchPackets + 2; ++i) {
+        p += kFrames;
+        r = drifting.place(static_cast<uint32_t>(p), kSsrcA, kFrames, p + kFrames + k + 50 + 3 * kLinkOffset);
+    }
+    CHECK(r.verdict == RtpPlacement::Verdict::Accepted && drifting.reanchors() == 1, "it re-anchors, on its own");
+    CHECK(mapping.offset() == k, "PTP's mapping is not moved (" << mapping.offset() - k << ")");
+}
+
+void testPtpMappingIgnoresStragglers() {
+    std::cout << "PTP mapping: a first packet off PTP time is not trusted; a sustained run is" << std::endl;
+    NetworkTimeMapping mapping;
+    const int64_t k = 2000000;
+    mapping.fix(k);
+    RtpPlacement stream(config(), mapping);
+    int64_t p = 600000;
+    // Two stragglers stamped before the sender moved onto PTP time
+    const auto first = stream.place(static_cast<uint32_t>(p + 9999999), kSsrcA, kFrames, p + kFrames + k + 50);
+    CHECK(first.verdict != RtpPlacement::Verdict::Accepted, "a first packet that does not fit is dropped");
+    p += kFrames;
+    stream.place(static_cast<uint32_t>(p + 9999999), kSsrcA, kFrames, p + kFrames + k + 50);
+    p += kFrames;
+    // Then the sender on PTP time
+    const auto onPtp = stream.place(static_cast<uint32_t>(p), kSsrcA, kFrames, p + kFrames + k + 50);
+    CHECK(onPtp.verdict == RtpPlacement::Verdict::Accepted && onPtp.position == p + k,
+          "the next packet on PTP time plays at PTP time");
+    CHECK(stream.reanchors() == 0, "no anchor of its own was taken");
+}
+
+void testFixReplacesAnArrivalAnchor() {
+    std::cout << "PTP fixing the mapping replaces an arrival anchor; a timeline restart clears it" << std::endl;
+    NetworkTimeMapping mapping;
+    CHECK(mapping.anchorIfUnset(777) == 777 && !mapping.fixed(), "anchored by a packet's arrival");
+    mapping.fix(999);
+    CHECK(mapping.offset() == 999 && mapping.fixed(), "PTP's offset replaces it");
+    CHECK(mapping.anchorIfUnset(1) == 999, "a first packet does not move it");
+    mapping.reset();
+    CHECK(!mapping.anchored() && !mapping.fixed(), "a restart clears it until PTP fixes it again");
+}
+
 int main() {
+    testPtpMappingPlacesByTimestamp();
+    testPtpMappingIsNeverMoved();
+    testPtpMappingIgnoresStragglers();
+    testFixReplacesAnArrivalAnchor();
     testFirstPacketAnchors();
     testContiguousStreamAndWraparound();
     testMediaClockOffsetIsRemoved();

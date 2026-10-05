@@ -14,6 +14,7 @@
 #include "NetworkMonitor.h"
 #include "RTP/RTPTransmitter.h"
 #include <map>
+#include <optional>
 #include <random>
 #include <memory>
 #include <mutex>
@@ -42,6 +43,21 @@ public:
         std::string networkInterface;  // name ("en0") or IP; empty = default route
         uint8_t ttl{32};               // multicast TTL; 0 keeps the stream on this host
     };
+
+    /// The PTP grandmaster the device clock follows.
+    struct PtpGrandmaster {
+        std::string identity;  // EUI-64, "00-1D-C1-FF-FE-D1-7B-F3"
+        uint8_t domain{0};
+
+        bool operator==(const PtpGrandmaster& o) const { return identity == o.identity && domain == o.domain; }
+        bool operator!=(const PtpGrandmaster& o) const { return !(*this == o); }
+    };
+
+    /// The device clock follows this grandmaster (and TX timestamps are its
+    /// time): TX streams announce it (ts-refclk:ptp) instead of this Mac's own
+    /// clock. A change re-announces them with a new session version.
+    void setPtpGrandmaster(const PtpGrandmaster& grandmaster);
+    std::optional<PtpGrandmaster> ptpGrandmaster() const;
 
     /// @param rxContext Device state receivers place audio against (clock, routing, link offset).
     /// @param txContext Device state transmitters send from (clock, routing the IO thread writes).
@@ -294,6 +310,7 @@ private:
 
     // Device state
     std::atomic<double> currentDeviceSampleRate_{48000.0};
+    std::optional<PtpGrandmaster> ptpGrandmaster_;  // guarded by streamsMutex_
 
     // Callbacks
     StreamCallback streamAddedCallback_;

@@ -703,17 +703,48 @@ void StreamManager::announceTx(const StreamID& id, const ManagedStream& managed)
     sdp.originAddress = address;
     sdp.framecount = managed.transmitter->framesPerPacket();
 
-    // Until PTP (step 2 phase 4) the media clock is this Mac's own: say so
-    // (RFC 7273 localmac) rather than claim a PTP reference
-    sdp.ptpDomain = -1;
-    sdp.ptpMasterMAC.clear();
-    const std::string mac = NetworkInterfaceDetection::getInterfaceMACAddress(
-        NetworkInterfaceDetection::getInterfaceForIPAddress(address));
-    if (!mac.empty()) {
-        sdp.customAttributes["ts-refclk"] = "localmac=" + mac;
+    if (ptpGrandmaster_) {
+        // RTP timestamps are the grandmaster's time plus the mediaclk offset
+        sdp.ptpMasterMAC = ptpGrandmaster_->identity;
+        sdp.ptpDomain = ptpGrandmaster_->domain;
+        sdp.customAttributes.erase("ts-refclk");
+        if (sdp.mediaClockType.empty()) {
+            sdp.mediaClockType = "direct=0";
+        }
+    } else {
+        // No PTP: the media clock is this Mac's own. Say so (RFC 7273
+        // localmac) rather than claim a PTP reference
+        sdp.ptpDomain = -1;
+        sdp.ptpMasterMAC.clear();
+        const std::string mac = NetworkInterfaceDetection::getInterfaceMACAddress(
+            NetworkInterfaceDetection::getInterfaceForIPAddress(address));
+        if (!mac.empty()) {
+            sdp.customAttributes["ts-refclk"] = "localmac=" + mac;
+        }
     }
 
     announcer_.announce(id, SDPParser::generate(sdp), address, sdp.ttl);
+}
+
+void StreamManager::setPtpGrandmaster(const PtpGrandmaster& grandmaster) {
+    std::lock_guard<std::mutex> lock(streamsMutex_);
+    if (ptpGrandmaster_ == grandmaster) {
+        return;
+    }
+    ptpGrandmaster_ = grandmaster;
+    AES67_LOGF("StreamManager: PTP grandmaster %s, domain %u: re-announcing TX streams", grandmaster.identity.c_str(),
+               static_cast<unsigned>(grandmaster.domain));
+    for (auto& [id, managed] : streams_) {
+        if (managed.transmitter) {
+            ++managed.sdp.sessionVersion;  // RFC 4566: a changed description gets a new version
+            announceTx(id, managed);
+        }
+    }
+}
+
+std::optional<StreamManager::PtpGrandmaster> StreamManager::ptpGrandmaster() const {
+    std::lock_guard<std::mutex> lock(streamsMutex_);
+    return ptpGrandmaster_;
 }
 
 void StreamManager::onInterfaceChanged(const std::string& networkInterface) {

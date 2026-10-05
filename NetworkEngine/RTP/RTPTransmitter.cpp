@@ -158,7 +158,9 @@ void RTPTransmitter::transmitLoop() {
     uint32_t generation = 0;
     bool haveTimeline = false;
     int64_t position = 0;     // media position of the next packet's first frame
-    uint32_t rtpOffset = 0;   // RTP timestamp = position + rtpOffset (mod 2^32)
+    uint32_t rtpOffset = 0;   // RTP timestamp = position + rtpOffset (mod 2^32), without PTP
+    bool onPtp = false;
+    const uint32_t mediaClockOffset = parseMediaClockOffset(sdp_.mediaClockType);
 
     while (running_) {
         const MediaClock::Snapshot clock = context_.clock.snapshot();
@@ -197,7 +199,23 @@ void RTPTransmitter::transmitLoop() {
             continue;
         }
 
-        sendPosition(position, static_cast<uint32_t>(position) + rtpOffset);
+        // With PTP: PTP time plus the SDP's mediaclk offset. Without: carry on
+        // from the last timestamp sent, so leaving PTP does not jump
+        const int64_t ptpOffset = context_.networkTime && context_.networkTime->fixed()
+            ? context_.networkTime->offset()
+            : NetworkTimeMapping::kUnset;
+        uint32_t timestamp = 0;
+        if (ptpOffset != NetworkTimeMapping::kUnset) {
+            timestamp = static_cast<uint32_t>(position - ptpOffset) + mediaClockOffset;
+            onPtp = true;
+        } else {
+            if (onPtp) {
+                rtpOffset = nextTimestamp_ - static_cast<uint32_t>(position);
+                onPtp = false;
+            }
+            timestamp = static_cast<uint32_t>(position) + rtpOffset;
+        }
+        sendPosition(position, timestamp);
         position += frames;
     }
 }

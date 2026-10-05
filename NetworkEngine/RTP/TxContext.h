@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "RtpPlacement.h"
 #include "RxRouting.h"
 #include "../Clock/MediaClock.h"
 
@@ -13,6 +14,9 @@ namespace AES67 {
 struct TxContext {
     const MediaClock& clock;  // media position of each packet and when it is due
     TxRouting& routing;       // where the IO thread writes the output mix
+    // Fixed at PTP's offset while PTP has the clock: RTP timestamps are then
+    // PTP time (plus the SDP's mediaclk offset). Null: never PTP.
+    const NetworkTimeMapping* networkTime{nullptr};
 };
 
 } // namespace AES67

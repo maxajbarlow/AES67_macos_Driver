@@ -314,6 +314,15 @@ void testTsRefclkForms() {
                                                      "a=ts-refclk:localmac=00-1D-C1-D1-7B-F3\n"));
     assert(both.has_value() && both->ptpDomain == 0 && both->ptpMasterMAC == "00-1D-C1-FF-FE-D1-7B-F3");
 
+    // We write AES67's form (as Dante and RAVENNA do), which reads back the same
+    SDPSession ours = *wing;
+    ours.ptpDomain = 3;
+    const std::string generated = SDPParser::generate(ours);
+    assert(generated.find("a=ts-refclk:ptp=IEEE1588-2008:00-1D-C1-FF-FE-D1-7B-F3:3\n") != std::string::npos);
+    assert(generated.find("domain-nmbr") == std::string::npos);
+    auto reread = SDPParser::parseString(generated);
+    assert(reread.has_value() && reread->ptpDomain == 3 && reread->ptpMasterMAC == "00-1D-C1-FF-FE-D1-7B-F3");
+
     std::cout << "PASSED\n";
 }
 
