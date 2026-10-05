@@ -186,6 +186,14 @@ void testSDPGeneration() {
     assert(reparsed->connectionAddress == session.connectionAddress);
     assert(reparsed->port == session.port);
 
+    // RFC 4566 5: every line ends in CRLF (receivers such as Dante may be strict)
+    size_t lines = 0;
+    for (size_t at = generated.find('\n'); at != std::string::npos; at = generated.find('\n', at + 1)) {
+        assert(at > 0 && generated[at - 1] == '\r');
+        ++lines;
+    }
+    assert(lines >= 7 && generated.size() >= 2 && generated.compare(generated.size() - 2, 2, "\r\n") == 0);
+
     std::cout << "✓ PASSED\n";
 }
 
@@ -251,7 +259,7 @@ void testOriginLineFromDefaults() {
     const std::string generated = SDPParser::generate(session);
     const size_t origin = generated.find("o=");
     assert(origin != std::string::npos);
-    const std::string line = generated.substr(origin, generated.find('\n', origin) - origin);
+    const std::string line = generated.substr(origin, generated.find("\r\n", origin) - origin);
     const std::string expectedEnd = " IN IP4 10.0.0.5";
     assert(line.size() > expectedEnd.size() &&
            line.compare(line.size() - expectedEnd.size(), expectedEnd.size(), expectedEnd) == 0);
@@ -318,7 +326,7 @@ void testTsRefclkForms() {
     SDPSession ours = *wing;
     ours.ptpDomain = 3;
     const std::string generated = SDPParser::generate(ours);
-    assert(generated.find("a=ts-refclk:ptp=IEEE1588-2008:00-1D-C1-FF-FE-D1-7B-F3:3\n") != std::string::npos);
+    assert(generated.find("a=ts-refclk:ptp=IEEE1588-2008:00-1D-C1-FF-FE-D1-7B-F3:3\r\n") != std::string::npos);
     assert(generated.find("domain-nmbr") == std::string::npos);
     auto reread = SDPParser::parseString(generated);
     assert(reread.has_value() && reread->ptpDomain == 3 && reread->ptpMasterMAC == "00-1D-C1-FF-FE-D1-7B-F3");
@@ -340,7 +348,7 @@ void testFractionalPtime() {
 
         // And it survives generating and parsing again
         const std::string generated = SDPParser::generate(*session);
-        assert(generated.find("a=ptime:" + text.str() + "\n") != std::string::npos);
+        assert(generated.find("a=ptime:" + text.str() + "\r\n") != std::string::npos);
         auto reparsed = SDPParser::parseString(generated);
         assert(reparsed.has_value() && std::abs(reparsed->ptime - ptime) < 1e-9);
     }
