@@ -1,11 +1,5 @@
 # Step 2: Clocking Redesign Plan
 
-Status: draft for review (October 2026)
-
-## Why
-
-AES67 works because every device shares one media clock derived from PTP. Today the driver runs four independent clocks:
-
 | Clock | Drives | Source today |
 |---|---|---|
 | Core Audio device clock | When Core Audio reads and writes the device | libASPL default `GetZeroTimeStampImpl`: the Mac's host clock at the nominal rate |
