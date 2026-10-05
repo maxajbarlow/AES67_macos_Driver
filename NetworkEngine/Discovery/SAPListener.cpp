@@ -118,9 +118,10 @@ private:
             if (bytesRead > 0) {
                 buffer[bytesRead] = '\0';
                 
-                // Parse the SAP announcement
-                SAPAnnouncement announcement = parseSAPAnnouncement(buffer, bytesRead, 
-                                                                   inet_ntoa(srcAddr.sin_addr));
+                // Parse the SAP announcement (inet_ntop: inet_ntoa's buffer is shared across threads)
+                char source[INET_ADDRSTRLEN] = {};
+                inet_ntop(AF_INET, &srcAddr.sin_addr, source, sizeof(source));
+                SAPAnnouncement announcement = parseSAPAnnouncement(buffer, bytesRead, source);
                 
                 if (!announcement.sessionDescription.empty()) {
                     // Store the announcement

@@ -2,6 +2,7 @@
 
 #include "PtpClockSource.h"
 #include "HostTime.h"
+#include "../../Driver/DebugLog.h"
 
 namespace AES67 {
 
@@ -38,10 +39,19 @@ void PtpClockSource::start() {
         std::lock_guard<std::mutex> lock(wakeMutex_);
         stopping_ = false;
     }
+    monitor_ = std::make_unique<NetworkMonitor>(config_.monitor, [this](const std::string&) {
+        {
+            std::lock_guard<std::mutex> lock(wakeMutex_);
+            interfaceChanged_ = true;
+        }
+        wake_.notify_all();
+    });
+    monitor_->watch(config_.receiver.networkInterface);
     thread_ = std::thread([this] { run(); });
 }
 
 void PtpClockSource::stop() {
+    monitor_.reset();  // no more changes reported
     {
         std::lock_guard<std::mutex> lock(wakeMutex_);
         stopping_ = true;
@@ -66,15 +76,49 @@ void PtpClockSource::run() {
     std::unique_lock<std::mutex> lock(wakeMutex_);
     while (!stopping_) {
         lock.unlock();
-        if (!receiving_.load(std::memory_order_relaxed) && receiver_.start()) {
+        if (interfaceChanged_.exchange(false)) {
+            restartReceiver();
+        }
+        if (!receiving_.load(std::memory_order_relaxed) && interfaceExists() && receiver_.start()) {
             receiving_.store(true, std::memory_order_release);
+            AES67_LOGF("PTP: receiving on '%s', domain %u, as %s", interfaceName().c_str(),
+                       static_cast<unsigned>(config_.receiver.domain), receiver_.identity().clock.toString().c_str());
         }
         const bool receiving = receiving_.load(std::memory_order_relaxed);
         if (receiving) {
             step();
         }
         lock.lock();
-        wake_.wait_for(lock, receiving ? config_.period : config_.retryPeriod, [this] { return stopping_; });
+        wake_.wait_for(lock, receiving ? config_.period : config_.retryPeriod,
+                       [this] { return stopping_ || interfaceChanged_.load(); });
+    }
+}
+
+bool PtpClockSource::interfaceExists() const {
+    const std::string& setting = config_.receiver.networkInterface;
+    return config_.monitor.provider ? config_.monitor.provider(setting).has_value()
+                                    : NetworkInterfaceDetection::currentState(setting).has_value();
+}
+
+void PtpClockSource::restartReceiver() {
+    if (!receiving_.load(std::memory_order_relaxed)) {
+        return;  // not started yet: the next attempt uses the interface as it is
+    }
+    // Its sockets joined the interface as it was. Until it locks again the
+    // clock keeps its rate, and Core Audio is told it is not locked.
+    AES67_LOGF("PTP: interface '%s' changed: starting the receiver again", interfaceName().c_str());
+    receiver_.stop();
+    receiving_.store(false, std::memory_order_release);
+    receiverRestarts_.fetch_add(1, std::memory_order_acq_rel);
+    publishLock(false, 0);
+}
+
+void PtpClockSource::publishLock(bool locked, uint32_t domain) {
+    // Both exchanged unconditionally: either may have changed
+    const bool lockChanged = locked_.exchange(locked, std::memory_order_acq_rel) != locked;
+    const bool domainChanged = clockDomain_.exchange(domain, std::memory_order_acq_rel) != domain;
+    if ((lockChanged || domainChanged) && listener_) {
+        listener_();
     }
 }
 
@@ -90,8 +134,13 @@ void PtpClockSource::step() {
 
     const MediaClock::Snapshot clock = clock_.snapshot();
     const auto update = control_.update(clock, sampleRate_.load(), hostTimeNow(), reference);
-    if (update.offsetChanged && offsetWriter_) {
-        offsetWriter_(clock.generation, *control_.offset());
+    if (update.offsetChanged) {
+        AES67_LOGF("PTP: media position = PTP time %+lld samples (timeline %u, PTP timeline %u, %.2f samples to slew)",
+                   static_cast<long long>(*control_.offset()), clock.generation, received.generation,
+                   control_.phaseErrorSamples());
+        if (offsetWriter_) {
+            offsetWriter_(clock.generation, *control_.offset());
+        }
     }
     if (update.samplesPerTick) {
         writer_(clock.generation, *update.samplesPerTick);
@@ -102,11 +151,6 @@ void PtpClockSource::step() {
         ? clockDomainFor(received.master->announce.grandmasterIdentity, config_.receiver.domain)
         : 0;
     active_.store(control_.active(), std::memory_order_release);
-    // Both exchanged unconditionally: either may have changed
-    const bool lockChanged = locked_.exchange(locked, std::memory_order_acq_rel) != locked;
-    const bool domainChanged = clockDomain_.exchange(domain, std::memory_order_acq_rel) != domain;
-    const bool changed = lockChanged || domainChanged;
-
     {
         std::lock_guard<std::mutex> lock(statusMutex_);
         status_.receiver = received;
@@ -114,9 +158,21 @@ void PtpClockSource::step() {
         status_.offset = control_.offset();
         status_.phaseErrorSamples = control_.phaseErrorSamples();
     }
-    if (changed && listener_) {
-        listener_();
+    if (locked != locked_.load(std::memory_order_acquire)) {
+        if (locked && received.master) {
+            AES67_LOGF("PTP: locked to grandmaster %s via %s, path delay %.1f us, rate %+.2f ppm",
+                       received.master->announce.grandmasterIdentity.toString().c_str(),
+                       received.master->sender.clock.toString().c_str(), received.pathDelayNs / 1000.0,
+                       received.estimate ? (received.estimate->rate - 1.0) * 1e6 : 0.0);
+        } else if (!locked) {
+            AES67_LOGF("PTP: not locked (%s); the clock keeps its rate", received.master ? "acquiring" : "no master");
+        }
     }
+    publishLock(locked, domain);
+}
+
+std::string PtpClockSource::interfaceName() const {
+    return config_.receiver.networkInterface.empty() ? "primary" : config_.receiver.networkInterface;
 }
 
 } // namespace AES67

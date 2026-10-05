@@ -829,7 +829,7 @@ void testTxAnnouncesThePtpGrandmaster() {
     const std::vector<Received> afterFirst(packets.begin() + static_cast<ptrdiff_t>(beforePtp), packets.end());
     const auto texts = announcedTexts(afterFirst, "SAP PTP");
     const auto sessions = announcedSessions(afterFirst, "SAP PTP");
-    CHECK(!texts.empty() && texts.back().find("a=ts-refclk:ptp=IEEE1588-2008:00-1D-C1-FF-FE-12-34-56:0\n") !=
+    CHECK(!texts.empty() && texts.back().find("a=ts-refclk:ptp=IEEE1588-2008:00-1D-C1-FF-FE-12-34-56:0\r\n") !=
                                 std::string::npos,
           "names the grandmaster and domain, AES67 form");
     CHECK(!texts.empty() && texts.back().find("localmac") == std::string::npos, "and no longer localmac");

@@ -367,6 +367,7 @@ target_compile_features(TestPtpSettings PRIVATE cxx_std_17)
 add_executable(TestPtpClockSource
     TestPtpClockSource.cpp
     ../NetworkEngine/Clock/PtpClockSource.cpp
+    ../NetworkEngine/NetworkMonitor.cpp
     ../NetworkEngine/Clock/PtpClockControl.cpp
     ../NetworkEngine/PTP/PtpTimeReceiver.cpp
     ../NetworkEngine/PTP/PtpSocket.cpp

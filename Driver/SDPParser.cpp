@@ -377,33 +377,35 @@ bool SDPParser::parseMediaClockAttribute(const std::string& value, SDPSession& s
 // ============================================================================
 
 std::string SDPParser::generate(const SDPSession& session) {
+    // RFC 4566 5: lines end in CRLF (parsers should accept LF; not all do)
+    static constexpr const char* kLineEnd = "\r\n";
     std::ostringstream sdp;
 
     // Version
-    sdp << "v=0\n";
+    sdp << "v=0" << kLineEnd;
 
     // Origin
-    sdp << generateOriginLine(session) << "\n";
+    sdp << generateOriginLine(session) << kLineEnd;
 
     // Session name and info
-    sdp << "s=" << session.sessionName << "\n";
+    sdp << "s=" << session.sessionName << kLineEnd;
     if (!session.sessionInfo.empty()) {
-        sdp << "i=" << session.sessionInfo << "\n";
+        sdp << "i=" << session.sessionInfo << kLineEnd;
     }
 
     // Connection
-    sdp << generateConnectionLine(session) << "\n";
+    sdp << generateConnectionLine(session) << kLineEnd;
 
     // Timing
-    sdp << "t=" << session.timeStart << " " << session.timeStop << "\n";
+    sdp << "t=" << session.timeStart << " " << session.timeStop << kLineEnd;
 
     // Media
-    sdp << generateMediaLine(session) << "\n";
+    sdp << generateMediaLine(session) << kLineEnd;
 
     // Attributes
     auto attributes = generateAttributes(session);
     for (const auto& attr : attributes) {
-        sdp << attr << "\n";
+        sdp << attr << kLineEnd;
     }
 
     return sdp.str();

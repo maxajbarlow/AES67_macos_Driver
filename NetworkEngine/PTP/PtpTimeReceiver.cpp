@@ -72,6 +72,9 @@ bool TimeReceiver::start() {
     bestMaster.domain = config_.domain;
     bestMaster.self = self_.clock;
     bestMaster_.emplace(bestMaster);
+    if (servo_) {
+        generationBase_ += servo_->generation();
+    }
     servo_.emplace(config_.servo);
     master_.reset();
     servoMaster_.reset();
@@ -106,7 +109,7 @@ void TimeReceiver::publish() {
     Status s = counters_;
     if (servo_) {
         s.state = servo_->state();
-        s.generation = servo_->generation();
+        s.generation = generationBase_ + servo_->generation();
         s.estimate = servo_->estimate();
         s.pathDelayNs = servo_->pathDelayNs();
     }
