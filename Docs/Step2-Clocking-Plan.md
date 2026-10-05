@@ -73,7 +73,7 @@ host(M)  = anchorHost  + (M - anchorMedia) / samplesPerTick
 samplesPerTick = fs * rateRatio * timebase.numer / (timebase.denom * 1e9)
 ```
 
-- With PTP, media position is PTP time in samples since the PTP epoch (`ptpNs * fs / 1e9`), so every device on the grandmaster agrees on it.
+- With PTP, media position maps to PTP time in samples (`ptpNs * fs / 1e9`) through a whole-sample offset, `M - ptpSamples`, chosen when PTP takes the clock. Every device on the grandmaster agrees on PTP time, so RX and TX use the offset to convert. (Revised 2026-10-05: an earlier draft made media position equal PTP time. That would jump the device clock when PTP locks, and move it backwards when a grandmaster with an earlier epoch takes over, where stale buffer slots could read as current. With the offset, media positions only move forward and taking over needs no jump.)
 - Updated by the active clock source a few times per second; readers extrapolate between updates. Rate changes are smooth (servo-filtered); a phase step bumps the generation, which becomes the HAL seed.
 - Publication via a seqlock or double-buffered snapshot; readers never block.
 
@@ -272,6 +272,17 @@ Each phase is a separate PR, test-first, and leaves the driver working.
   - Loopback against a scripted PTP master.
   - Hardware run against the Riedel or a Dante device as grandmaster.
 - Exit: frequency lock within about 30 s and phase settled within about 2 minutes at a 1 Hz Sync rate (faster on faster networks); hybrid-mode unicast Delay_Req verified against the target network; criterion 2.
+- Implemented so far (2026-10-05):
+  - Messages, best master, servo and time receiver (#30 to #33), tested in simulation and against scripted masters on loopback.
+  - **PTP as the device clock source** (`PtpClockSource`, `PtpClockControl`):
+    - The media clock runs at the servo's rate, and phase error is removed by a rate correction of at most 100 ppm over about 2 s.
+    - Taking over picks the whole-sample offset nearest the clock as it is, so there is no jump and no new seed.
+    - A new PTP timeline (another master, a step) or a phase error over 1 ms picks a new offset instead.
+    - Before lock, and while a new master is acquired, the rate is held.
+    - While PTP has the clock, the recovered source does not steer it.
+    - Clock stability is reported from lock, and the clock domain from the grandmaster identity and domain.
+  - **Off by default.** `ptp.json` (next to `streams.json`) turns it on: `{"enabled": true, "interface": "en0", "domain": 0, "hybrid": false}`. Anything malformed leaves it off. The receiver retries every 2 s until its interface exists.
+  - Pending: RX and TX on the PTP offset, with `ts-refclk:ptp` (5b); a hardware run.
 
 ### Phase 5: TX on the media clock (in progress)
 

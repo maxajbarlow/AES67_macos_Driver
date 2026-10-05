@@ -130,6 +130,14 @@ set(NETWORK_SOURCES
     NetworkEngine/RTP/BufferStatusMonitor.cpp
     NetworkEngine/Clock/TimestampedAudioBuffer.cpp
     NetworkEngine/Clock/RecoveredClockSource.cpp
+    NetworkEngine/Clock/PtpClockControl.cpp
+    NetworkEngine/Clock/PtpClockSource.cpp
+    NetworkEngine/PTP/PtpMessages.cpp
+    NetworkEngine/PTP/PtpBestMaster.cpp
+    NetworkEngine/PTP/PtpServo.cpp
+    NetworkEngine/PTP/PtpSocket.cpp
+    NetworkEngine/PTP/PtpTimeReceiver.cpp
+    NetworkEngine/PTP/PtpSettings.cpp
     NetworkEngine/NetworkUtils.cpp
     NetworkEngine/NetworkErrorHandler.cpp
     NetworkEngine/NetworkInterfaceDetection.cpp

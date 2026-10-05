@@ -341,6 +341,47 @@ target_include_directories(TestPtpTimeReceiver PRIVATE
 
 target_compile_features(TestPtpTimeReceiver PRIVATE cxx_std_17)
 
+add_executable(TestPtpClockControl
+    TestPtpClockControl.cpp
+    ../NetworkEngine/Clock/PtpClockControl.cpp
+    ../NetworkEngine/PTP/PtpServo.cpp
+)
+
+target_include_directories(TestPtpClockControl PRIVATE
+    ${CMAKE_SOURCE_DIR}
+)
+
+target_compile_features(TestPtpClockControl PRIVATE cxx_std_17)
+
+add_executable(TestPtpSettings
+    TestPtpSettings.cpp
+    ../NetworkEngine/PTP/PtpSettings.cpp
+)
+
+target_include_directories(TestPtpSettings PRIVATE
+    ${CMAKE_SOURCE_DIR}
+)
+
+target_compile_features(TestPtpSettings PRIVATE cxx_std_17)
+
+add_executable(TestPtpClockSource
+    TestPtpClockSource.cpp
+    ../NetworkEngine/Clock/PtpClockSource.cpp
+    ../NetworkEngine/Clock/PtpClockControl.cpp
+    ../NetworkEngine/PTP/PtpTimeReceiver.cpp
+    ../NetworkEngine/PTP/PtpSocket.cpp
+    ../NetworkEngine/PTP/PtpServo.cpp
+    ../NetworkEngine/PTP/PtpBestMaster.cpp
+    ../NetworkEngine/PTP/PtpMessages.cpp
+    ../NetworkEngine/NetworkInterfaceDetection.cpp
+)
+
+target_include_directories(TestPtpClockSource PRIVATE
+    ${CMAKE_SOURCE_DIR}
+)
+
+target_compile_features(TestPtpClockSource PRIVATE cxx_std_17)
+
 # Add tests to CTest
 enable_testing()
 add_test(NAME ClockRecovery COMMAND TestClockRecovery)
@@ -362,6 +403,9 @@ add_test(NAME PtpMessages COMMAND TestPtpMessages)
 add_test(NAME PtpBestMaster COMMAND TestPtpBestMaster)
 add_test(NAME PtpServo COMMAND TestPtpServo)
 add_test(NAME PtpTimeReceiver COMMAND TestPtpTimeReceiver)
+add_test(NAME PtpClockControl COMMAND TestPtpClockControl)
+add_test(NAME PtpSettings COMMAND TestPtpSettings)
+add_test(NAME PtpClockSource COMMAND TestPtpClockSource)
 add_test(NAME TxMediaClock COMMAND TestTxMediaClock)
 
 # The driver bundle must carry a valid signature over its resources: Core
