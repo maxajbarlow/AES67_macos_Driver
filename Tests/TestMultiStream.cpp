@@ -7,7 +7,6 @@
 #include "../NetworkEngine/StreamManager.h"
 #include "../NetworkEngine/StreamChannelMapper.h"
 #include "../Driver/SDPParser.h"
-#include "../NetworkEngine/PTP/PTPClock.h"
 #include <iostream>
 #include <cassert>
 #include <vector>

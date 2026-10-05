@@ -22,7 +22,7 @@ struct PendingStreamInfo {
 // MARK: - PTP Diagnostics
 
 /// Swift representation of PTP diagnostic information
-/// Mirrors the C++ PTPDiagnostics struct in NetworkEngine/PTP/PTPDiagnostics.h
+/// Not yet connected to the driver (the view shows sample values)
 struct PTPDiagnostics {
     // Connection status
     var isConnected: Bool = false
