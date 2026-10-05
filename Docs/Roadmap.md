@@ -12,7 +12,7 @@ The driver shows up in Core Audio as one device with 128 inputs and 128 outputs.
 |---|---|---|
 | Receive | Working | Tested in Core Audio with test streams. Fixed 8 ms latency. The device clock locks to the incoming stream and rides out short network stalls. |
 | Transmit | Needs PTP | Sends continuously on the device clock and announces streams over SAP. Dante and RAVENNA devices can see the streams but won't play them until PTP lands. |
-| PTP | Next | Not implemented yet. Tracked in [#21](https://github.com/maxajbarlow/AES67_macos_Driver/issues/21). |
+| PTP | In progress | Message parsing done. Master selection, the servo, the slave and hooking it up to the device clock come next. Tracked in [#21](https://github.com/soundsofthesir/AES67_macos_Driver/issues/21). |
 | Manager app | Planned | Builds and runs, but doesn't control the driver yet. Streams are set in `streams.json`. |
 | Install | Planned | Build from source only, with Homebrew and CMake. No downloadable installer yet. |
 
