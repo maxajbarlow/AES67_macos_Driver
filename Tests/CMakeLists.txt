@@ -324,6 +324,19 @@ target_include_directories(TestPtpMessages PRIVATE
 
 target_compile_features(TestPtpMessages PRIVATE cxx_std_17)
 
+# Test: choosing the PTP master (best master algorithm)
+add_executable(TestPtpBestMaster
+    TestPtpBestMaster.cpp
+    ../NetworkEngine/PTP/PtpBestMaster.cpp
+    ../NetworkEngine/PTP/PtpMessages.cpp
+)
+
+target_include_directories(TestPtpBestMaster PRIVATE
+    ${CMAKE_SOURCE_DIR}
+)
+
+target_compile_features(TestPtpBestMaster PRIVATE cxx_std_17)
+
 # Add tests to CTest
 enable_testing()
 add_test(NAME ClockRecovery COMMAND TestClockRecovery)
@@ -343,6 +356,7 @@ add_test(NAME SAPListener COMMAND TestSAPListener)
 add_test(NAME SAPAnnouncer COMMAND TestSAPAnnouncer)
 add_test(NAME NetworkMonitor COMMAND TestNetworkMonitor)
 add_test(NAME PtpMessages COMMAND TestPtpMessages)
+add_test(NAME PtpBestMaster COMMAND TestPtpBestMaster)
 add_test(NAME TxMediaClock COMMAND TestTxMediaClock)
 
 # The driver bundle must carry a valid signature over its resources: Core
