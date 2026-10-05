@@ -53,6 +53,40 @@ void testCurrentStateOfRealInterfaces() {
           "\"\" and \"auto\" both mean the primary interface");
 }
 
+// Monitors on several threads resolve interfaces at once. inet_ntoa's single
+// static buffer let one lookup read another's address: a change that never
+// happened, so streams and PTP restarted for nothing.
+void testCurrentStateIsThreadSafe() {
+    std::cout << "Interface state is resolved correctly from several threads at once" << std::endl;
+    const auto other = NetworkInterfaceDetection::currentState("auto");
+    if (!other || other->ipv4.empty() || other->ipv4 == "127.0.0.1") {
+        std::cout << "  (skipped: no other interface with an IPv4 address)" << std::endl;
+        return;
+    }
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> contenders;
+    for (int i = 0; i < 3; ++i) {
+        contenders.emplace_back([&stop] {
+            while (!stop.load()) {
+                NetworkInterfaceDetection::currentState("auto");
+            }
+        });
+    }
+    int wrong = 0;
+    for (int i = 0; i < 20000; ++i) {
+        const auto loopback = NetworkInterfaceDetection::currentState("lo0");
+        if (!loopback || loopback->ipv4 != "127.0.0.1") {
+            ++wrong;
+        }
+    }
+    stop = true;
+    for (auto& contender : contenders) {
+        contender.join();
+    }
+    CHECK(wrong == 0, "lo0 always reads 127.0.0.1 while " << other->name << " is resolved concurrently (" << wrong
+                                                           << " wrong in 20000)");
+}
+
 // Scripted interface states, changed by the test
 class FakeNetwork {
 public:
@@ -162,6 +196,7 @@ void testMonitorStopsPromptly() {
 
 int main() {
     testCurrentStateOfRealInterfaces();
+    testCurrentStateIsThreadSafe();
     testMonitorReportsChanges();
     testMonitorFollowsAuto();
     testMonitorStopsPromptly();

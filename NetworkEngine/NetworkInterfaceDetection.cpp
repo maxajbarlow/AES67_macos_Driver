@@ -10,6 +10,18 @@
 
 namespace AES67 {
 
+namespace {
+
+// inet_ntoa writes one static buffer, so monitors resolving interfaces on
+// several threads could read each other's addresses
+std::string ipv4String(const struct sockaddr* address) {
+    char text[INET_ADDRSTRLEN] = {};
+    const auto* ipv4 = reinterpret_cast<const struct sockaddr_in*>(address);
+    return inet_ntop(AF_INET, &ipv4->sin_addr, text, sizeof(text)) ? std::string(text) : std::string();
+}
+
+} // namespace
+
 std::string NetworkInterfaceDetection::getPrimaryEthernetInterface() {
     struct ifaddrs *ifaddrs_ptr, *ifa;
     std::string primaryInterface;
@@ -34,8 +46,7 @@ std::string NetworkInterfaceDetection::getPrimaryEthernetInterface() {
                         name.substr(0, 3) == "usb") { // USB Ethernet
                     
                         // Prefer interfaces with actual IP addresses (not link-local)
-                        struct sockaddr_in* addr = (struct sockaddr_in*)ifa->ifa_addr;
-                        std::string ip = inet_ntoa(addr->sin_addr);
+                        std::string ip = ipv4String(ifa->ifa_addr);
                         
                         // Skip link-local addresses (169.254.x.x)
                         if (ip.substr(0, 7) != "169.254") {
@@ -130,8 +141,7 @@ std::string NetworkInterfaceDetection::getInterfaceIPAddress(const std::string& 
         for (ifa = ifaddrs_ptr; ifa != nullptr; ifa = ifa->ifa_next) {
             if (ifa->ifa_name != nullptr && interfaceName == ifa->ifa_name) {
                 if (ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_INET) {
-                    struct sockaddr_in* addr = (struct sockaddr_in*)ifa->ifa_addr;
-                    ipAddress = inet_ntoa(addr->sin_addr);
+                    ipAddress = ipv4String(ifa->ifa_addr);
                     break;
                 }
             }
@@ -149,7 +159,7 @@ std::string NetworkInterfaceDetection::getInterfaceForIPAddress(const std::strin
     if (getifaddrs(&ifaddrs_ptr) == 0) {
         for (ifa = ifaddrs_ptr; ifa != nullptr; ifa = ifa->ifa_next) {
             if (ifa->ifa_name && ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_INET &&
-                ipAddress == inet_ntoa(reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr)->sin_addr)) {
+                ipAddress == ipv4String(ifa->ifa_addr)) {
                 name = ifa->ifa_name;
                 break;
             }
@@ -217,7 +227,7 @@ std::optional<NetworkInterfaceDetection::InterfaceState> NetworkInterfaceDetecti
             }
             state.running = state.running || ((ifa->ifa_flags & IFF_UP) && (ifa->ifa_flags & IFF_RUNNING));
             if (state.ipv4.empty() && ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_INET) {
-                state.ipv4 = inet_ntoa(reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr)->sin_addr);
+                state.ipv4 = ipv4String(ifa->ifa_addr);
             }
         }
         freeifaddrs(ifaddrs_ptr);
@@ -286,8 +296,7 @@ std::vector<std::string> NetworkInterfaceDetection::getMulticastCapableInterface
                 std::string name(ifa->ifa_name);
 
                 // Skip link-local addresses (169.254.x.x)
-                struct sockaddr_in* addr = (struct sockaddr_in*)ifa->ifa_addr;
-                std::string ip = inet_ntoa(addr->sin_addr);
+                std::string ip = ipv4String(ifa->ifa_addr);
                 if (ip.substr(0, 7) == "169.254") {
                     continue;
                 }
