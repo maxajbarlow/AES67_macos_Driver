@@ -47,11 +47,7 @@ RTPReceiver::~RTPReceiver() {
 }
 
 uint32_t RTPReceiver::parseMediaClockOffset(const std::string& mediaClockType) {
-    const auto at = mediaClockType.find("direct=");
-    if (at == std::string::npos) {
-        return 0;
-    }
-    return static_cast<uint32_t>(std::strtoul(mediaClockType.c_str() + at + 7, nullptr, 10));
+    return AES67::parseMediaClockOffset(mediaClockType);
 }
 
 bool RTPReceiver::start() {
@@ -296,7 +292,14 @@ void RTPReceiver::processPacket(const RTP::RTPPacket& packet, uint64_t arrivalHo
     // placing: a re-anchor in between is then seen (one packet late) rather
     // than missed.
     const int64_t networkOffset = context_.networkTime.offset();
-    marginsJumped = marginsJumped || networkOffset != lastNetworkOffset_;
+    if (networkOffset != lastNetworkOffset_) {
+        marginsJumped = true;
+        if (context_.networkTime.fixed()) {
+            // PTP set a new offset: network time's true place. Start over
+            // against it, dropping any anchor of this stream's own
+            placement_->reset();
+        }
+    }
     lastNetworkOffset_ = networkOffset;
 
     const MediaPosition arrival = clock.positionAt(arrivalHostTime);

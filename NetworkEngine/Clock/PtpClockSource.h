@@ -26,6 +26,9 @@ public:
     using RateWriter = std::function<void(uint32_t clockGeneration, double samplesPerTick)>;
     /// Lock or clock domain changed (the device tells Core Audio).
     using ChangeListener = std::function<void()>;
+    /// A new offset (media position minus PTP time, samples) for timeline
+    /// `clockGeneration`: the device fixes its network time mapping at it.
+    using OffsetWriter = std::function<void(uint32_t clockGeneration, int64_t offset)>;
 
     struct Config {
         Ptp::TimeReceiver::Config receiver;
@@ -42,7 +45,7 @@ public:
     };
 
     PtpClockSource(Config config, const MediaClock& clock, const std::atomic<double>& sampleRate, RateWriter writer,
-                   ChangeListener listener = {});
+                   ChangeListener listener = {}, OffsetWriter offsetWriter = {});
     ~PtpClockSource();
     PtpClockSource(const PtpClockSource&) = delete;
     PtpClockSource& operator=(const PtpClockSource&) = delete;
@@ -60,6 +63,8 @@ public:
     bool locked() const { return locked_.load(std::memory_order_acquire); }
     /// Non-zero while locked: devices on the same grandmaster and domain share it.
     uint32_t clockDomain() const { return clockDomain_.load(std::memory_order_acquire); }
+    /// The PTP domain it runs on.
+    uint8_t domain() const { return config_.receiver.domain; }
 
     Status status() const;
 
@@ -75,6 +80,7 @@ private:
     const std::atomic<double>& sampleRate_;
     const RateWriter writer_;
     const ChangeListener listener_;
+    const OffsetWriter offsetWriter_;
     Ptp::TimeReceiver receiver_;
     PtpClockControl control_;  // run thread only
 

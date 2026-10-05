@@ -12,11 +12,25 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include <string>
 
 namespace AES67 {
 
+/// The offset in an SDP's a=mediaclk:direct=<offset> (0 if none): RTP
+/// timestamp minus network media time (PTP time in samples, with PTP).
+inline uint32_t parseMediaClockOffset(const std::string& mediaClockType) {
+    const auto at = mediaClockType.find("direct=");
+    if (at == std::string::npos) {
+        return 0;
+    }
+    return static_cast<uint32_t>(std::strtoul(mediaClockType.c_str() + at + 7, nullptr, 10));
+}
+
 /// Device-wide offset from network media time to local media position.
 /// Read by every stream's receive thread; written rarely (anchor, re-anchor).
+/// With PTP the device fixes it at PTP's offset: network time (RTP minus the
+/// stream's mediaclk offset) is then PTP time, and placement never moves it.
 class NetworkTimeMapping {
 public:
     static constexpr int64_t kUnset = INT64_MIN;
@@ -33,11 +47,25 @@ public:
 
     void reanchor(int64_t offset) noexcept { offset_.store(offset, std::memory_order_release); }
 
+    /// PTP's offset (media position minus PTP time in samples): network
+    /// time's true place, which placement never moves.
+    void fix(int64_t offset) noexcept {
+        offset_.store(offset, std::memory_order_release);
+        fixed_.store(true, std::memory_order_release);
+    }
+
+    /// The mapping is PTP's (until the next reset()).
+    bool fixed() const noexcept { return fixed_.load(std::memory_order_acquire) && anchored(); }
+
     /// Forget the anchor (the local timeline restarted).
-    void reset() noexcept { offset_.store(kUnset, std::memory_order_release); }
+    void reset() noexcept {
+        fixed_.store(false, std::memory_order_release);
+        offset_.store(kUnset, std::memory_order_release);
+    }
 
 private:
     std::atomic<int64_t> offset_{kUnset};
+    std::atomic<bool> fixed_{false};
 };
 
 /// Places one stream's packets. Receive thread only (not thread-safe).

@@ -282,7 +282,13 @@ Each phase is a separate PR, test-first, and leaves the driver working.
     - While PTP has the clock, the recovered source does not steer it.
     - Clock stability is reported from lock, and the clock domain from the grandmaster identity and domain.
   - **Off by default.** `ptp.json` (next to `streams.json`) turns it on: `{"enabled": true, "interface": "en0", "domain": 0, "hybrid": false}`. Anything malformed leaves it off. The receiver retries every 2 s until its interface exists.
-  - Pending: RX and TX on the PTP offset, with `ts-refclk:ptp` (5b); a hardware run.
+  - **RX and TX on PTP time** (5b):
+    - While PTP has the clock, the device fixes the shared network time mapping at PTP's offset. Receivers place each packet by its timestamp (minus the stream's mediaclk offset) at PTP time plus the offset, whenever it arrives.
+    - Placement never moves a fixed mapping. A stream off PTP time gets an anchor of its own, but only after a sustained run: one straggler stamped before its sender moved onto PTP earns nothing. A new PTP offset makes every receiver start over against it.
+    - Transmitters stamp `M - K + mediaclk`, and carry on unbroken from the last timestamp if PTP lets go.
+    - Once a grandmaster is followed, TX streams announce `ts-refclk:ptp=IEEE1588-2008:<grandmaster>:<domain>` (AES67's form, as Dante and RAVENNA write it) and `mediaclk:direct=<offset>`. A new grandmaster re-announces them with a new session version.
+    - Result: TX into our own RX through the fixed mapping lands every sample at the position it was sent from. On loopback with a scripted master, the device's TX packets arrive 3 to 22 samples after the master's time reaches their end (send latency only).
+  - Pending: a hardware run (needs sign-off: the slave sends Delay_Req), and criterion 4 with a Dante or RAVENNA receiver.
 
 ### Phase 5: TX on the media clock (in progress)
 

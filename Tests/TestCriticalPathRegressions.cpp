@@ -19,6 +19,8 @@
 #include "RxTestSupport.h"
 #include "SapTestSupport.h"
 #include "PtpTestMaster.h"
+#include "../NetworkEngine/RTP/SimpleRTP.h"
+#include "../NetworkEngine/Clock/PtpClockControl.h"
 #include "../NetworkEngine/Discovery/SAPListener.h"
 #include "../NetworkEngine/NetworkInterfaceDetection.h"
 #include "../NetworkEngine/NetworkMonitor.h"
@@ -429,7 +431,7 @@ void testDeviceClockFollowsReceivedStream() {
 // ---------------------------------------------------------------------------
 void usePtpSettings(const std::string& json) {
     const char* tmp = std::getenv("TMPDIR");
-    const std::string path = std::string(tmp ? tmp : "/tmp/") + "aes67_regression_ptp.json";
+    const std::string path = std::string(tmp ? tmp : "/tmp/") + "aes67_regression_ptp_settings.json";
     std::ofstream(path) << json;
     setenv("AES67_PTP_CONFIG_PATH", path.c_str(), 1);
 }
@@ -497,6 +499,39 @@ void testPtpTakesTheDeviceClock() {
     AudioThreadPriority::restoreNormalPriority();
     CHECK(worst < 50, "still at the master's rate with a fast stream arriving (worst " << worst << " ppm off)");
     CHECK(device->GetMediaClock().snapshot().generation == generation, "and never a new timeline");
+
+    // TX on PTP time: each packet's RTP timestamp (mediaclk offset 0) is the
+    // master's time in samples at its first frame, so when it arrives the
+    // master's time is about one packet on
+    const auto grandmaster = device->GetStreamManager()->ptpGrandmaster();
+    CHECK(grandmaster && grandmaster->identity == master.identity().clock.toString() && grandmaster->domain == 0,
+          "TX streams are told the grandmaster to announce");
+    RTP::RTPSocket capture;
+    CHECK(capture.openReceiver("239.69.99.49", 55088), "capture socket should open");
+    const StreamID tx =
+        device->GetStreamManager()->createTxStream("PTP TX", "239.69.99.49", 55088, 2, makeMapping(2, 0), kHostOnly);
+    CHECK(!tx.isNull(), "a TX stream");
+    std::vector<int64_t> lag;  // master's time at arrival minus the packet's end, samples
+    std::vector<uint8_t> buffer(2048);
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (std::chrono::steady_clock::now() < until) {
+        RTP::RTPPacket packet;
+        uint64_t arrival = 0;
+        if (capture.receive(packet, buffer.data(), buffer.size(), &arrival) <= 0 || arrival == 0) continue;
+        const MediaPosition ptp =
+            ptpSamples(master.clockAt(HostTimebase::current().ticksToNanos(arrival)), 48000.0);
+        lag.push_back(static_cast<int32_t>(static_cast<uint32_t>(ptp.sample) - (packet.header.timestamp + kFramesPerPacket)));
+    }
+    device->GetStreamManager()->removeStream(tx);
+    capture.close();
+    std::sort(lag.begin(), lag.end());
+    const int64_t median = lag.empty() ? 1 << 30 : lag[lag.size() / 2];
+    std::cout << "  " << lag.size() << " TX packets; master's time at arrival minus packet end: median " << median
+              << " samples, range " << (lag.empty() ? 0 : lag.front()) << " to " << (lag.empty() ? 0 : lag.back())
+              << std::endl;
+    CHECK(lag.size() > 800, "TX packets arrive (" << lag.size() << ")");
+    CHECK(!lag.empty() && lag.front() > -5 && median < 48,
+          "stamped with the master's time: none early, most within a millisecond (median " << median << ")");
     device->StopIO(device->GetID(), 0);
     noPtpSettings();
 }
@@ -731,7 +766,7 @@ void testTxStreamIsAnnounced() {
         CHECK(sdp.originNetworkType == "IN" && sdp.originAddressType == "IP4" && sdp.originAddress == address,
               "o= names this Mac's address (got " << sdp.originAddress << ")");
         CHECK(sdp.framecount == 48 && sdp.ptime == 1, "1 ms packets of 48 frames at 48 kHz");
-        CHECK(sdp.ptpDomain == -1, "no PTP reference is claimed before phase 4");
+        CHECK(sdp.ptpDomain == -1, "no PTP reference is claimed without PTP");
         const auto refclk = sdp.customAttributes.find("ts-refclk");
         CHECK(refclk != sdp.customAttributes.end() && refclk->second.rfind("localmac=", 0) == 0,
               "the reference clock is signalled as this Mac's own (ts-refclk:localmac=)");
@@ -752,6 +787,82 @@ void testTxStreamIsAnnounced() {
                                              "SAP TX A");
     CHECK(!reloadedA.empty() && !a.empty() && reloadedA.front().sessionID == a.front().sessionID,
           "a reloaded stream keeps its session ID");
+}
+
+// With PTP followed, TX streams name the grandmaster (ts-refclk:ptp, in the
+// AES67 form Dante and RAVENNA use) and re-announce with a new version when
+// it changes. Until then they keep ts-refclk:localmac.
+std::vector<std::string> announcedTexts(const std::vector<Received>& packets, const std::string& name) {
+    std::vector<std::string> texts;
+    for (const auto& p : packets) {
+        if (isDeletion(p)) continue;
+        const auto sap = SAPListener::parseAnnouncement(reinterpret_cast<const char*>(p.bytes.data()), p.bytes.size(), "");
+        auto sdp = SDPParser::parseString(sap.sessionDescription);
+        if (sdp && sdp->sessionName == name) texts.push_back(sap.sessionDescription);
+    }
+    return texts;
+}
+
+void testTxAnnouncesThePtpGrandmaster() {
+    std::cout << "TX streams announce the PTP grandmaster once it is followed, re-announcing when it changes" << std::endl;
+    useEmptyConfig("sapptp");
+    const std::string address = NetworkInterfaceDetection::resolveIPv4Address("");
+    if (address.empty()) {
+        std::cout << "  skipped: no network interface" << std::endl;
+        return;
+    }
+    SapCapture capture("239.255.255.255", kTestSapPort, address);
+    RxHarness harness;
+    TxRouting txRouting;
+    const TxContext txContext{harness.clock, txRouting};
+    StreamManager manager(harness.context(), txContext, testSap());
+    CHECK(!manager.createTxStream("SAP PTP", "239.69.99.9", 55032, 2, makeMapping(2, 0), kHostOnly).isNull(),
+          "TX stream should be created");
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    const size_t beforePtp = capture.packets().size();
+    const auto local = announcedSessions(capture.packets(), "SAP PTP");
+    CHECK(!local.empty() && local.back().ptpDomain == -1, "before PTP: no PTP reference");
+
+    manager.setPtpGrandmaster(StreamManager::PtpGrandmaster{"00-1D-C1-FF-FE-12-34-56", 0});
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    auto packets = capture.packets();
+    const std::vector<Received> afterFirst(packets.begin() + static_cast<ptrdiff_t>(beforePtp), packets.end());
+    const auto texts = announcedTexts(afterFirst, "SAP PTP");
+    const auto sessions = announcedSessions(afterFirst, "SAP PTP");
+    CHECK(!texts.empty() && texts.back().find("a=ts-refclk:ptp=IEEE1588-2008:00-1D-C1-FF-FE-12-34-56:0\n") !=
+                                std::string::npos,
+          "names the grandmaster and domain, AES67 form");
+    CHECK(!texts.empty() && texts.back().find("localmac") == std::string::npos, "and no longer localmac");
+    CHECK(!texts.empty() && texts.back().find("a=mediaclk:direct=0") != std::string::npos,
+          "with the mediaclk offset its RTP timestamps use");
+    CHECK(!sessions.empty() && !local.empty() && sessions.back().sessionVersion > local.back().sessionVersion &&
+              sessions.back().sessionID == local.back().sessionID,
+          "same session, new version");
+    size_t deletions = 0;
+    for (const auto& p : afterFirst) deletions += isDeletion(p) ? 1 : 0;
+    CHECK(deletions == 1, "the old description is withdrawn (" << deletions << ")");
+
+    // The same grandmaster again (lock regained): nothing to re-announce
+    const size_t beforeSame = capture.packets().size();
+    manager.setPtpGrandmaster(StreamManager::PtpGrandmaster{"00-1D-C1-FF-FE-12-34-56", 0});
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    packets = capture.packets();
+    size_t sameDeletions = 0;
+    for (size_t i = beforeSame; i < packets.size(); ++i) sameDeletions += isDeletion(packets[i]) ? 1 : 0;
+    CHECK(sameDeletions == 0, "the same grandmaster changes nothing");
+
+    // Another grandmaster: another version
+    const size_t beforeNew = capture.packets().size();
+    manager.setPtpGrandmaster(StreamManager::PtpGrandmaster{"AC-DE-48-FF-FE-00-11-22", 0});
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    packets = capture.packets();
+    const std::vector<Received> afterNew(packets.begin() + static_cast<ptrdiff_t>(beforeNew), packets.end());
+    const auto newTexts = announcedTexts(afterNew, "SAP PTP");
+    const auto newSessions = announcedSessions(afterNew, "SAP PTP");
+    CHECK(!newTexts.empty() && newTexts.back().find("IEEE1588-2008:AC-DE-48-FF-FE-00-11-22:0") != std::string::npos,
+          "names the new grandmaster");
+    CHECK(!newSessions.empty() && !sessions.empty() && newSessions.back().sessionVersion > sessions.back().sessionVersion,
+          "with a newer version");
 }
 
 // ---------------------------------------------------------------------------
@@ -1043,6 +1154,7 @@ int main() {
     testInputAndOutputChannelsAreSeparate();
     testSenderSdpDirectionDoesNotMakeATransmitter();
     testTxStreamIsAnnounced();
+    testTxAnnouncesThePtpGrandmaster();
     testTimelineRestartNeverReusesPositions();
     testNoDefaultTxStream();
     testTxStreamSurvivesReload();

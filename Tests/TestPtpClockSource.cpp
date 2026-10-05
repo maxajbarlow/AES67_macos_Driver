@@ -44,6 +44,8 @@ struct Device {
     std::atomic<int> rateWrites{0};
     std::atomic<int> staleWrites{0};
     std::atomic<int> changes{0};
+    std::atomic<int64_t> fixedOffset{0};
+    std::atomic<uint32_t> fixedGeneration{0};
 
     Device() { restart(7000000); }
 
@@ -66,7 +68,11 @@ struct Device {
                 clock.setRate(hostTimeNow(), samplesPerTick);
                 ++rateWrites;
             },
-            [this] { ++changes; });
+            [this] { ++changes; },
+            [this](uint32_t generation, int64_t offset) {
+                fixedGeneration = generation;
+                fixedOffset = offset;
+            });
     }
 };
 
@@ -133,12 +139,16 @@ void testFollowsAMaster() {
     std::cout << "  phase " << phase << " samples, rate " << rate << " ppm" << std::endl;
     CHECK(source->active(), "PTP has the clock");
     CHECK(std::fabs(phase) < 5, "within 5 samples (~100 us) of the master's time (" << phase << ")");
-    CHECK(std::fabs(rate) < 20, "at its rate within 20 ppm (" << rate << ")");
+    // Seconds after lock PTP may still be pulling in a few samples of phase,
+    // which moves the rate by tens of ppm (100 ppm at most, by design)
+    CHECK(std::fabs(rate) < 50, "at its rate within 50 ppm (" << rate << ")");
     CHECK(device.clock.snapshot().generation == generation, "the device timeline never restarted");
     CHECK(source->clockDomain() == PtpClockSource::clockDomainFor(master.identity().clock, 0) &&
               source->clockDomain() != 0,
           "the clock domain is the grandmaster's");
     CHECK(device.changes >= 1, "the device was told lock and domain changed");
+    CHECK(device.fixedOffset == *source->status().offset && device.fixedGeneration == generation,
+          "and given the offset, for its timeline");
     source->stop();
     CHECK(!source->locked() && source->clockDomain() == 0, "stopped: neither locked nor in a domain");
 }
@@ -155,6 +165,9 @@ void testADeviceTimelineRestart() {
     device.restart(device.clock.snapshot().sampleAt(hostTimeNow()) + (1 << 20));
     CHECK(waitFor([&] { return source->status().offset && *source->status().offset != before; }, 2),
           "a new offset for the new timeline");
+    CHECK(waitFor([&] { return device.fixedGeneration == device.clock.snapshot().generation; }, 1) &&
+              device.fixedOffset == *source->status().offset,
+          "given to the device for the new timeline");
     std::this_thread::sleep_for(std::chrono::seconds(3));
     const double phase = phaseErrorSamples(device, *source, master);
     CHECK(source->active() && std::fabs(phase) < 5, "in phase on it (" << phase << ")");
