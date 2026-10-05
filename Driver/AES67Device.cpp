@@ -10,6 +10,7 @@
 #include "DebugLog.h"
 #include "../NetworkEngine/Clock/DeviceTimeline.h"
 #include "../NetworkEngine/Clock/HostTime.h"
+#include "../NetworkEngine/PTP/PtpSettings.h"
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <cmath>
 #include <utility>
@@ -47,6 +48,9 @@ void AES67Device::Initialize() {
 
     // Valid clock from the start; restarted again whenever IO starts
     RestartTimeline(currentSampleRate_.load());
+
+    // PTP, only if ptp.json turns it on: it sends Delay_Req onto the network
+    StartPtp();
 
     // Initialize streams
     AES67_LOG("AES67Device: Calling InitializeStreams()");
@@ -121,6 +125,9 @@ void AES67Device::Initialize() {
 }
 
 AES67Device::~AES67Device() {
+    // First: its thread writes the media clock and notifies the HAL
+    ptpClock_.reset();
+
     // Receivers reference mediaClock_, networkTime_ and rxRouting_, which are
     // declared after streamManager_ and so would be destroyed first
     streamManager_.reset();
@@ -281,8 +288,57 @@ void AES67Device::ApplyRecoveredRate(double ratio) {
     // From now on: rebasing at the packet's (earlier) arrival would move
     // positions the HAL has already been given
     std::lock_guard<std::mutex> lock(clockWriteMutex_);
+    if (ptpClock_ && ptpClock_->active()) {
+        return;  // PTP has the clock
+    }
     mediaClock_.setRate(hostTimeNow(),
                         MediaClock::samplesPerTick(currentSampleRate_.load(), ratio, HostTimebase::current()));
+}
+
+void AES67Device::StartPtp() {
+    std::string path;
+    std::string error;
+    const Ptp::Settings settings = Ptp::Settings::load(&path, &error);
+    if (!error.empty()) {
+        AES67_LOGF("PTP: off: %s is not valid (%s)", path.c_str(), error.c_str());
+        return;
+    }
+    if (!settings.enabled) {
+        AES67_LOGF("PTP: off (%s)", path.empty() ? "no ptp.json" : path.c_str());
+        return;
+    }
+
+    PtpClockSource::Config config;
+    config.receiver.networkInterface = settings.networkInterface;
+    config.receiver.domain = settings.domain;
+    config.receiver.unicastDelayRequests = settings.unicastDelayRequests;
+    ptpClock_ = std::make_unique<PtpClockSource>(
+        config, mediaClock_, currentSampleRate_,
+        [this](uint32_t generation, double samplesPerTick) { ApplyPtpRate(generation, samplesPerTick); },
+        [this] {
+            NotifyPropertyChanged(kAudioDevicePropertyClockIsStable);
+            NotifyPropertyChanged(kAudioDevicePropertyClockDomain);
+        });
+    ptpClock_->start();
+    AES67_LOGF("PTP: on (%s): interface '%s', domain %u, %s Delay_Req", path.c_str(),
+               settings.networkInterface.empty() ? "primary" : settings.networkInterface.c_str(),
+               static_cast<unsigned>(settings.domain), settings.unicastDelayRequests ? "unicast" : "multicast");
+}
+
+void AES67Device::ApplyPtpRate(uint32_t clockGeneration, double samplesPerTick) {
+    std::lock_guard<std::mutex> lock(clockWriteMutex_);
+    if (mediaClock_.snapshot().generation != clockGeneration) {
+        return;  // computed for a timeline that has since restarted
+    }
+    mediaClock_.setRate(hostTimeNow(), samplesPerTick);
+}
+
+bool AES67Device::GetClockIsStable() const {
+    return ptpClock_ ? ptpClock_->locked() : aspl::Device::GetClockIsStable();
+}
+
+UInt32 AES67Device::GetClockDomain() const {
+    return ptpClock_ ? ptpClock_->clockDomain() : aspl::Device::GetClockDomain();
 }
 
 int64_t AES67Device::LinkOffsetFramesFor(Float64 sampleRate) {

@@ -18,6 +18,7 @@
 
 #include "RxTestSupport.h"
 #include "SapTestSupport.h"
+#include "PtpTestMaster.h"
 #include "../NetworkEngine/Discovery/SAPListener.h"
 #include "../NetworkEngine/NetworkInterfaceDetection.h"
 #include "../NetworkEngine/NetworkMonitor.h"
@@ -420,6 +421,84 @@ void testDeviceClockFollowsReceivedStream() {
     CHECK(restarted.generation != generation && restarted.samplesPerTick == nominal,
           "a timeline restart should return the device clock to nominal");
     device->StopIO(device->GetID(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// PTP: off unless ptp.json turns it on; when on and a master is followed, it
+// has the device clock and a received stream no longer steers it.
+// ---------------------------------------------------------------------------
+void usePtpSettings(const std::string& json) {
+    const char* tmp = std::getenv("TMPDIR");
+    const std::string path = std::string(tmp ? tmp : "/tmp/") + "aes67_regression_ptp.json";
+    std::ofstream(path) << json;
+    setenv("AES67_PTP_CONFIG_PATH", path.c_str(), 1);
+}
+
+void noPtpSettings() { setenv("AES67_PTP_CONFIG_PATH", "/nonexistent/aes67-ptp.json", 1); }
+
+void testPtpIsOffByDefault() {
+    std::cout << "PTP is off without ptp.json" << std::endl;
+    useEmptyConfig("ptpoff");
+    noPtpSettings();
+    auto context = std::make_shared<aspl::Context>();
+    auto device = std::make_shared<AES67Device>(context);
+    device->Initialize();
+    CHECK(device->GetPtpClockSource() == nullptr, "no PTP clock source: nothing is sent");
+    CHECK(device->GetClockIsStable() && device->GetClockDomain() == 0, "a stable clock in no domain, as before");
+    usePtpSettings(R"({"enabled": false, "interface": "lo0"})");
+    auto disabled = std::make_shared<AES67Device>(context);
+    disabled->Initialize();
+    CHECK(disabled->GetPtpClockSource() == nullptr, "nor with enabled false");
+    noPtpSettings();
+}
+
+void testPtpTakesTheDeviceClock() {
+    std::cout << "PTP on lo0: takes the device clock; a received stream no longer steers it" << std::endl;
+    useEmptyConfig("ptp");  // the built-in RX stream on 239.1.1.1:5004
+    usePtpSettings(R"({"enabled": true, "interface": "lo0"})");
+    auto context = std::make_shared<aspl::Context>();
+    auto device = std::make_shared<AES67Device>(context);
+    device->Initialize();
+    CHECK(device->StartIO(device->GetID(), 0) == kAudioHardwareNoError, "IO should start");
+    CHECK(device->GetPtpClockSource() != nullptr, "a PTP clock source");
+    CHECK(!device->GetClockIsStable() && device->GetClockDomain() == 0, "not stable, no domain, before a master");
+
+    // A master on the real PTP ports, on lo0 only (TTL 0)
+    PtpTest::ScriptedMaster::Settings settings;
+    settings.eventPort = 319;
+    settings.generalPort = 320;
+    PtpTest::ScriptedMaster master(settings);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(25);
+    while (!device->GetClockIsStable() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    CHECK(device->GetClockIsStable(), "stable once the master is followed");
+    CHECK(device->GetClockDomain() == PtpClockSource::clockDomainFor(master.identity().clock, 0),
+          "in the grandmaster's clock domain");
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    const uint32_t generation = device->GetMediaClock().snapshot().generation;
+    const double nominal = MediaClock::samplesPerTick(48000.0, 1.0, HostTimebase::current());
+    auto rateNow = [&] { return (device->GetMediaClock().snapshot().samplesPerTick / nominal - 1.0) * 1e6; };
+    // Just after lock PTP is still pulling in a sample or two of phase, which
+    // moves the rate by tens of ppm; the received stream would move it by hundreds
+    CHECK(std::fabs(rateNow() - 100.0) < 50, "at the master's +100 ppm (" << rateNow() << ")");
+
+    // A sender 1500 ppm fast: the recovered clock would chase it; PTP must not let it
+    LoopbackSender sender("239.1.1.1", 5004);
+    AudioThreadPriority::configureForRealTime();
+    const auto period = std::chrono::nanoseconds(static_cast<int64_t>(1e6 / 1.0015));
+    auto next = std::chrono::steady_clock::now();
+    double worst = 0;
+    for (uint32_t i = 0; i < 2000; ++i) {
+        sender.sendL24(static_cast<uint16_t>(i), i * kFramesPerPacket, 8, 0.5f);
+        if (i % 100 == 0) worst = std::max(worst, std::fabs(rateNow() - 100.0));
+        std::this_thread::sleep_until(next += period);
+    }
+    AudioThreadPriority::restoreNormalPriority();
+    CHECK(worst < 50, "still at the master's rate with a fast stream arriving (worst " << worst << " ppm off)");
+    CHECK(device->GetMediaClock().snapshot().generation == generation, "and never a new timeline");
+    device->StopIO(device->GetID(), 0);
+    noPtpSettings();
 }
 
 // ---------------------------------------------------------------------------
@@ -946,6 +1025,8 @@ void testRealTimePriorityReportsSuccess() {
 }
 
 int main() {
+    // No test may pick up a real ptp.json: PTP only where a test asks for it
+    noPtpSettings();
     testMixedOutputReachesTxBuffers();
     testInputReadsByDeviceTime();
     testDeviceSampleRate();
@@ -953,6 +1034,8 @@ int main() {
     testRealTimePriorityReportsSuccess();
     testIOStartStopLeavesStreamActivityToHAL();
     testDeviceClockFollowsReceivedStream();
+    testPtpIsOffByDefault();
+    testPtpTakesTheDeviceClock();
     testTxOptionsAreSaved();
     testInterfaceSettingSurvivesReloadAndSave();
     testFractionalPtimeSurvivesReload();

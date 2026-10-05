@@ -12,6 +12,7 @@
 #include "../NetworkEngine/RTSafeStreamInterface.h"
 #include "../NetworkEngine/Clock/MediaClock.h"
 #include "../NetworkEngine/Clock/RecoveredClockSource.h"
+#include "../NetworkEngine/Clock/PtpClockSource.h"
 #include "../NetworkEngine/RTP/RtpPlacement.h"
 #include "../NetworkEngine/RTP/RxRouting.h"
 #include <aspl/Device.hpp>
@@ -127,8 +128,17 @@ public:
     //
 
     // The device's media clock: Core Audio's zero timestamps are computed from
-    // it. Snapshots are real-time safe. Currently driven by the host clock.
+    // it. Snapshots are real-time safe. Driven by PTP when ptp.json enables it
+    // and a master is followed, otherwise by a received stream or the host.
     const MediaClock& GetMediaClock() const { return mediaClock_; }
+
+    // PTP, if enabled (null otherwise)
+    const PtpClockSource* GetPtpClockSource() const { return ptpClock_.get(); }
+
+    // Stable unless PTP is enabled and not yet followed (it will steer the rate);
+    // the clock domain is the grandmaster's while it is followed
+    bool GetClockIsStable() const override;
+    UInt32 GetClockDomain() const override;
 
     //
     // Control
@@ -220,11 +230,19 @@ private:
     RecoveredClockSource clockRecovery_;
     void ApplyRecoveredRate(double ratio);
 
+    // PTP clock source (step 2 phase 5a), when ptp.json enables it. Takes
+    // precedence over the recovered clock while active. Declared last so it
+    // stops first.
+    void StartPtp();
+    void ApplyPtpRate(uint32_t clockGeneration, double samplesPerTick);
+
     static int64_t LinkOffsetFramesFor(Float64 sampleRate);
 
     // Statistics
     std::atomic<uint64_t> inputUnderruns_{0};
     std::atomic<uint64_t> outputUnderruns_{0};
+
+    std::unique_ptr<PtpClockSource> ptpClock_;
 };
 
 } // namespace AES67
