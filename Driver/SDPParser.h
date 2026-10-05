@@ -55,7 +55,7 @@ struct SDPSession {
     uint16_t numChannels{2};
 
     // Packet timing (a=ptime, a=framecount)
-    uint32_t ptime{1};              // Packet time in milliseconds
+    double ptime{1.0};              // Packet time in ms (AES67: 0.125, 0.25, 0.333, 1, 4)
     uint32_t framecount{48};        // Samples per packet
 
     // Source filter (a=source-filter)
@@ -74,6 +74,16 @@ struct SDPSession {
     bool isValid() const;
     std::vector<std::string> getValidationErrors() const;
 };
+
+/// Frames in one packet: sample rate x packet time, rounded (333 us at 48 kHz
+/// is 16 frames). Falls back to a=framecount if the packet time is unusable.
+inline uint32_t framesPerPacket(const SDPSession& session) {
+    const double frames = static_cast<double>(session.sampleRate) * session.ptime / 1000.0;
+    if (frames >= 1.0) {
+        return static_cast<uint32_t>(frames + 0.5);
+    }
+    return session.framecount > 0 ? session.framecount : 1;
+}
 
 //
 // SDP Parser

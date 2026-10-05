@@ -9,6 +9,7 @@
 #include "NetworkInterfaceDetection.h"
 #include "../Driver/DebugLog.h"
 #include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <sstream>
 #include <ctime>
@@ -146,7 +147,7 @@ StreamID StreamManager::addStream(const SDPSession& announced, const ChannelMapp
     managed.info.payloadType = sdp.payloadType;
 
     // Timing
-    managed.info.ptime = sdp.ptime;
+    managed.info.ptime = static_cast<uint32_t>(std::llround(sdp.ptime * 1000.0));  // microseconds
     managed.info.framecount = sdp.framecount;
 
     // PTP
@@ -287,7 +288,7 @@ StreamID StreamManager::createTxStream(
     sdp.sessionID = std::uniform_int_distribution<uint32_t>(1, UINT32_MAX)(sessionIdRandom_);
     sdp.sessionVersion = 1;
     sdp.ttl = options.ttl;
-    sdp.framecount = static_cast<uint32_t>(sdp.sampleRate * sdp.ptime / 1000);
+    sdp.framecount = framesPerPacket(sdp);
 
     // Dante receivers only subscribe to AES67 multicast inside the prefix in
     // their AES67 settings (default 239.69.0.0/16). Outside it a stream is
@@ -910,7 +911,7 @@ bool StreamManager::loadSavedStreams() {
         managed.info.sampleRate = config.sdp.sampleRate;
         managed.info.numChannels = config.sdp.numChannels;
         managed.info.payloadType = config.sdp.payloadType;
-        managed.info.ptime = config.sdp.ptime;
+        managed.info.ptime = static_cast<uint32_t>(std::llround(config.sdp.ptime * 1000.0));  // microseconds
         managed.info.framecount = config.sdp.framecount;
         managed.info.ptp.domain = config.sdp.ptpDomain;
         managed.info.isActive = true;

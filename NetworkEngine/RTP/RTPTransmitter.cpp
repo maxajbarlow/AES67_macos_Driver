@@ -21,9 +21,7 @@ namespace AES67 {
 namespace {
 
 uint32_t framesPerPacketFor(const SDPSession& sdp) {
-    // ptime is whole milliseconds (SDPSession); framecount is the fallback
-    const uint64_t frames = static_cast<uint64_t>(sdp.sampleRate) * sdp.ptime / 1000;
-    return frames > 0 ? static_cast<uint32_t>(frames) : std::max<uint32_t>(sdp.framecount, 1);
+    return framesPerPacket(sdp);
 }
 
 size_t nextPowerOfTwo(size_t value) {

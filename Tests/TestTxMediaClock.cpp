@@ -431,6 +431,24 @@ void testStreamsBindByInterfaceName() {
     writer.stop();
 }
 
+// Frames per packet follow the packet time and rate, including AES67's
+// fractional packet times (#22): 333 us at 48 kHz is 16 frames
+void testFramesPerPacketFollowsPtime() {
+    std::cout << "TX frames per packet follow ptime and the sample rate" << std::endl;
+    TxHarness h;
+    struct Case { double ptime; uint32_t rate; uint32_t frames; };
+    const Case cases[] = {{0.125, 48000, 6}, {0.25, 48000, 12}, {0.333, 48000, 16}, {1.0, 48000, 48},
+                          {4.0, 48000, 192}, {0.25, 96000, 24}, {1.0, 44100, 44}};
+    for (const auto& c : cases) {
+        SDPSession sdp = txSdp("239.69.99.47", 55084);
+        sdp.ptime = c.ptime;
+        sdp.sampleRate = c.rate;
+        RTPTransmitter tx(sdp, txMapping(0), h.context());
+        CHECK(tx.framesPerPacket() == c.frames,
+              c.ptime << " ms at " << c.rate << " Hz should be " << c.frames << " frames (got " << tx.framesPerPacket() << ")");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -441,6 +459,7 @@ int main() {
     testLoopbackThroughOurReceiverIsSampleExact();
     testMulticastTtlFollowsTheSdp();
     testStreamsBindByInterfaceName();
+    testFramesPerPacketFollowsPtime();
 
     std::cout << "\nTX media clock: " << checksPassed << " passed, " << checksFailed << " failed" << std::endl;
     return checksFailed == 0 ? 0 : 1;

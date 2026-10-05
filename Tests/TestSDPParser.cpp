@@ -15,6 +15,7 @@
 #error "TestSDPParser needs assert(): build tests without NDEBUG (see Tests/CMakeLists.txt)"
 #endif
 #include <sstream>
+#include <cmath>
 
 namespace AES67 {
 namespace Tests {
@@ -316,6 +317,50 @@ void testTsRefclkForms() {
     std::cout << "PASSED\n";
 }
 
+// AES67 packet times include 125, 250 and 333 microseconds (#22)
+void testFractionalPtime() {
+    std::cout << "Test: fractional a=ptime... ";
+
+    const double values[] = {0.125, 0.25, 0.333, 1.0, 4.0};
+    for (double ptime : values) {
+        std::ostringstream text;
+        text << ptime;
+        auto session = SDPParser::parseString(sdpWithRefclk("a=ptime:" + text.str() + "\n"));
+        assert(session.has_value());
+        assert(std::abs(session->ptime - ptime) < 1e-9);
+
+        // And it survives generating and parsing again
+        const std::string generated = SDPParser::generate(*session);
+        assert(generated.find("a=ptime:" + text.str() + "\n") != std::string::npos);
+        auto reparsed = SDPParser::parseString(generated);
+        assert(reparsed.has_value() && std::abs(reparsed->ptime - ptime) < 1e-9);
+    }
+
+    // Nonsense is rejected rather than read as 0
+    assert(!SDPParser::parseString(sdpWithRefclk("a=ptime:fast\n")).has_value());
+    assert(!SDPParser::parseString(sdpWithRefclk("a=ptime:0\n")).has_value());
+
+    std::cout << "PASSED\n";
+}
+
+// RFC 3551: an rtpmap without a channel count means one channel (#24)
+void testRtpmapWithoutChannelCount() {
+    std::cout << "Test: rtpmap without a channel count... ";
+
+    auto mono = SDPParser::parseString(R"(v=0
+o=- 1 1 IN IP4 10.0.0.5
+s=Mono
+c=IN IP4 239.69.1.1/32
+t=0 0
+m=audio 5004 RTP/AVP 96
+a=rtpmap:96 L24/48000
+)");
+    assert(mono.has_value());
+    assert(mono->numChannels == 1);
+
+    std::cout << "PASSED\n";
+}
+
 void runAllTests() {
     std::cout << "\n=== AES67 SDP Parser Test Suite ===\n\n";
 
@@ -327,6 +372,8 @@ void runAllTests() {
     testSDPGeneration();
     testOriginLineFromDefaults();
     testTsRefclkForms();
+    testFractionalPtime();
+    testRtpmapWithoutChannelCount();
     testInvalidSDP();
     testFileOperations();
 
