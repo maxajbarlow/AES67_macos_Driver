@@ -152,7 +152,7 @@ The card also has an NMOS tab, so streams there may be managed through NMOS (IS-
   - Announce timeout from the received interval.
   - No lock held across calls.
 - Servo: (host ticks, PTP ns) pairs into a windowed least-squares fit or a PI loop with a frequency integrator, with minimum-delay outlier rejection (software timestamps are positively skewed). It outputs the MediaClock model directly.
-- t3 (Delay_Req send time) is taken in userspace just after `sendto`; this asymmetry biases phase slightly, and a calibration offset can absorb it.
+- t3 (Delay_Req send time) is taken in userspace just before `sendto`. An early t3 only makes a delay look longer, which the servo's minimum filter discards; a late one would make it look shorter, which the filter would keep. Any remaining bias can be absorbed by a calibration offset.
 - Holdover on master loss keeps the last rate; re-acquisition slews if the error is small, otherwise steps (new seed).
 - Diagnostics snapshot (state, master, offset, rate, path delay, counters) for the Manager app once the control path exists.
 
