@@ -10,6 +10,9 @@
 #include <algorithm>
 #include <regex>
 #include <ctime>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 namespace AES67 {
 
@@ -287,9 +290,8 @@ bool SDPParser::parseRTPMapAttribute(const std::string& value, SDPSession& sessi
 
     try {
         session.sampleRate = std::stoul(formatParts[1]);
-        if (formatParts.size() >= 3) {
-            session.numChannels = std::stoi(formatParts[2]);
-        }
+        // RFC 3551: no channel count means one channel
+        session.numChannels = formatParts.size() >= 3 ? std::stoi(formatParts[2]) : 1;
     } catch (...) {
         return false;
     }
@@ -299,7 +301,14 @@ bool SDPParser::parseRTPMapAttribute(const std::string& value, SDPSession& sessi
 
 bool SDPParser::parsePTimeAttribute(const std::string& value, SDPSession& session) {
     try {
-        session.ptime = std::stoul(value);
+        // Milliseconds, fractional allowed; anything else is an error, not 0
+        char* end = nullptr;
+        const double ms = std::strtod(value.c_str(), &end);
+        while (end && (*end == ' ' || *end == '\t' || *end == '\r')) ++end;
+        if (end == value.c_str() || (end && *end != '\0') || !std::isfinite(ms) || ms <= 0.0) {
+            return false;
+        }
+        session.ptime = ms;
         return true;
     } catch (...) {
         return false;
@@ -452,7 +461,13 @@ std::vector<std::string> SDPParser::generateAttributes(const SDPSession& session
     attributes.push_back(rtpmap.str());
 
     // ptime
-    attributes.push_back("a=ptime:" + std::to_string(session.ptime));
+    // Shortest exact form: 1, 0.25, 0.125, 0.333
+    char ptime[32];
+    std::snprintf(ptime, sizeof(ptime), "%.3f", session.ptime);
+    std::string text(ptime);
+    text.erase(text.find_last_not_of('0') + 1);
+    if (!text.empty() && text.back() == '.') text.pop_back();
+    attributes.push_back("a=ptime:" + text);
 
     // framecount
     attributes.push_back("a=framecount:" + std::to_string(session.framecount));
@@ -603,7 +618,7 @@ StreamInfo SDPParser::toStreamInfo(const SDPSession& session) {
     info.payloadType = session.payloadType;
 
     // Timing
-    info.ptime = session.ptime;
+    info.ptime = static_cast<uint32_t>(std::llround(session.ptime * 1000.0));  // microseconds
     info.framecount = session.framecount;
 
     // PTP
@@ -641,7 +656,7 @@ SDPSession SDPParser::fromStreamInfo(const StreamInfo& info) {
     session.numChannels = info.numChannels;
     session.payloadType = info.payloadType;
 
-    session.ptime = info.ptime;
+    session.ptime = info.ptime / 1000.0;  // StreamInfo holds microseconds
     session.framecount = info.framecount;
 
     session.sourceAddress = info.source.ip;

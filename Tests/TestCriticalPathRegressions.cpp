@@ -558,6 +558,37 @@ void testStreamsRestartWhenTheirInterfaceChanges() {
 }
 
 // ---------------------------------------------------------------------------
+// A fractional packet time (#22) is kept through save and reload, and
+// StreamInfo reports it in microseconds as documented.
+// ---------------------------------------------------------------------------
+void testFractionalPtimeSurvivesReload() {
+    std::cout << "Fractional packet times survive save and reload" << std::endl;
+    const std::string path = useEmptyConfig("ptime");
+    RxHarness harness;
+    TxRouting txRouting;
+    const TxContext txContext{harness.clock, txRouting};
+    SDPSession sdp = makeRxSDP("239.69.99.20", 55052, 2);
+    sdp.ptime = 0.125;
+    sdp.framecount = 6;
+    StreamID id;
+    {
+        StreamManager manager(harness.context(), txContext, testSap());
+        id = manager.addStream(sdp, makeMapping(2, 0));
+        CHECK(!id.isNull(), "a 125 us stream should be added");
+        const auto info = manager.getStreamInfo(id);
+        CHECK(info && info->ptime == 125, "StreamInfo::ptime is in microseconds (got " << (info ? info->ptime : 0) << ")");
+    }
+    std::ifstream file(path);
+    const std::string json((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    CHECK(json.find("\"ptime\": 0.125") != std::string::npos, "the saved config should keep 0.125 ms");
+
+    StreamManager reloaded(harness.context(), txContext, testSap());
+    CHECK(reloaded.loadSavedStreams(), "the stream should reload");
+    const auto reloadedInfo = reloaded.getStreamInfo(id);
+    CHECK(reloadedInfo && reloadedInfo->ptime == 125, "the reloaded stream should still be 125 us");
+}
+
+// ---------------------------------------------------------------------------
 // SAP: a TX stream is announced while it is configured, with an SDP a
 // receiver can subscribe from, and deleted when it goes. Its session ID is
 // unique and survives a reload, so receivers do not list it twice.
@@ -924,6 +955,7 @@ int main() {
     testDeviceClockFollowsReceivedStream();
     testTxOptionsAreSaved();
     testInterfaceSettingSurvivesReloadAndSave();
+    testFractionalPtimeSurvivesReload();
     testStreamsRestartWhenTheirInterfaceChanges();
     testInputAndOutputChannelsAreSeparate();
     testSenderSdpDirectionDoesNotMakeATransmitter();

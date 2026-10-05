@@ -37,7 +37,6 @@ Next up is PTP, then a signed installer, a Manager app that controls the driver,
 - The driver can't save settings from inside Core Audio; edit `streams.json` instead (see below).
 - Dante only subscribes to multicast in its configured range (default 239.69.x.x). The driver warns about streams outside it.
 - If you set a stream's interface as an IP address, it breaks when the address changes. Use the interface name (e.g. `en0`).
-- Fractional packet times (e.g. 0.125 ms) aren't supported yet.
 
 ## Building
 

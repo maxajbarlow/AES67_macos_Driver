@@ -450,7 +450,7 @@ std::optional<SDPSession> StreamConfigManager::sdpFromJSON(const std::string& js
     if (auto val = extractStringField(json, "encoding")) sdp.encoding = *val;
     if (auto val = extractUInt32Field(json, "sampleRate")) sdp.sampleRate = static_cast<double>(*val);
     if (auto val = extractUInt16Field(json, "numChannels")) sdp.numChannels = *val;
-    if (auto val = extractUInt32Field(json, "ptime")) sdp.ptime = *val;
+    if (auto val = extractDoubleField(json, "ptime")) sdp.ptime = *val;  // fractional ms allowed
     if (auto val = extractUInt32Field(json, "framecount")) sdp.framecount = *val;
     if (auto val = extractStringField(json, "sourceAddress")) sdp.sourceAddress = *val;
     if (auto val = extractIntField(json, "ptpDomain")) sdp.ptpDomain = *val;
