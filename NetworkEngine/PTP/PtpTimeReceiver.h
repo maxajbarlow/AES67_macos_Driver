@@ -106,6 +106,7 @@ private:
     // Thread-owned state
     std::optional<BestMaster> bestMaster_;
     std::optional<Servo> servo_;
+    uint32_t generationBase_{0};  // timelines of earlier runs, so numbers keep rising across restarts
     std::optional<PortIdentity> master_;       // the selected master
     std::optional<PortIdentity> servoMaster_;  // whose Syncs the servo holds
     std::map<PortIdentity, uint32_t> addresses_;  // each master's IPv4 address

@@ -14,6 +14,7 @@
 #include <cmath>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <thread>
 
 using namespace AES67;
@@ -174,6 +175,64 @@ void testADeviceTimelineRestart() {
     source->stop();
 }
 
+// The interface changes under it (cable replugged, new address, link down
+// and up): the receiver starts again on the interface as it is now, its
+// timeline numbers keep rising, and it locks again
+void testRejoinsWhenItsInterfaceChanges() {
+    std::cout << "Its interface changes or goes: the receiver starts again, and locks again" << std::endl;
+    std::mutex stateMutex;
+    std::optional<NetworkInterfaceDetection::InterfaceState> state = NetworkInterfaceDetection::currentState("lo0");
+    CHECK(state.has_value(), "lo0 has a state");
+
+    Device device;
+    ScriptedMaster master(ScriptedMaster::Settings{});
+    PtpClockSource::Config config;
+    config.receiver = receiverConfig();
+    config.retryPeriod = std::chrono::milliseconds(100);
+    config.monitor.interval = std::chrono::milliseconds(100);
+    config.monitor.provider = [&](const std::string&) {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        return state;
+    };
+    std::atomic<int> changes{0};
+    PtpClockSource source(
+        config, device.clock, device.sampleRate,
+        [&](uint32_t generation, double samplesPerTick) {
+            std::lock_guard<std::mutex> lock(device.writeMutex);
+            if (device.clock.snapshot().generation == generation) device.clock.setRate(hostTimeNow(), samplesPerTick);
+        },
+        [&] { ++changes; });
+    source.start();
+    CHECK(waitFor([&] { return source.locked(); }, 20), "locks");
+    const uint32_t generation = source.status().receiver.generation;
+
+    {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        state->ipv4 = "127.0.0.99";  // a new address, as after DHCP or a replug
+    }
+    CHECK(waitFor([&] { return source.receiverRestarts() == 1; }, 2), "the receiver starts again");
+    CHECK(waitFor([&] { return !source.locked(); }, 1), "not locked meanwhile (Core Audio is told)");
+    CHECK(waitFor([&] { return source.locked(); }, 20), "locks again");
+    CHECK(source.status().receiver.generation > generation,
+          "on a new timeline number (" << source.status().receiver.generation << " after " << generation << ")");
+    CHECK(source.active(), "PTP kept the clock throughout");
+
+    std::optional<NetworkInterfaceDetection::InterfaceState> saved;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        saved = state;
+        state.reset();  // the interface is gone
+    }
+    CHECK(waitFor([&] { return !source.receiving(); }, 2), "gone: not receiving");
+    CHECK(!source.locked() && source.clockDomain() == 0, "and not reported locked while it cannot hear the master");
+    {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        state = saved;
+    }
+    CHECK(waitFor([&] { return source.receiving(); }, 2), "back: receiving again");
+    source.stop();
+}
+
 } // namespace
 
 int main() {
@@ -181,6 +240,7 @@ int main() {
     testKeepsTryingWithoutItsInterface();
     testFollowsAMaster();
     testADeviceTimelineRestart();
+    testRejoinsWhenItsInterfaceChanges();
 
     std::cout << "\nPTP clock source: " << checksPassed << " passed, " << checksFailed << " failed" << std::endl;
     return checksFailed == 0 ? 0 : 1;

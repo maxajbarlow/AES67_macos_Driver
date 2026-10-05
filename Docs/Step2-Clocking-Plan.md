@@ -288,6 +288,10 @@ Each phase is a separate PR, test-first, and leaves the driver working.
     - Transmitters stamp `M - K + mediaclk`, and carry on unbroken from the last timestamp if PTP lets go.
     - Once a grandmaster is followed, TX streams announce `ts-refclk:ptp=IEEE1588-2008:<grandmaster>:<domain>` (AES67's form, as Dante and RAVENNA write it) and `mediaclk:direct=<offset>`. A new grandmaster re-announces them with a new session version.
     - Result: TX into our own RX through the fixed mapping lands every sample at the position it was sent from. On loopback with a scripted master, the device's TX packets arrive 3 to 22 samples after the master's time reaches their end (send latency only).
+  - **Ready for hardware** (2026-10-05):
+    - When the PTP interface changes (new address, link down and up, adapter replugged), the receiver starts again on it, as streams do. Its timeline numbers keep rising, so a different master behind the new link is never mistaken for the old one. Meanwhile the clock keeps its rate and is reported unlocked.
+    - Transitions are logged (`log stream --info --predicate 'subsystem == "com.aes67driver"'`): receiving, locked to which grandmaster with path delay and rate, not locked, each new offset, interface changes.
+    - SDP lines end in CRLF (RFC 4566).
   - Pending: a hardware run (needs sign-off: the slave sends Delay_Req), and criterion 4 with a Dante or RAVENNA receiver.
 
 ### Phase 5: TX on the media clock (in progress)

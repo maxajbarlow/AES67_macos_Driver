@@ -6,10 +6,13 @@
 #include "MediaClock.h"
 #include "PtpClockControl.h"
 #include "../PTP/PtpTimeReceiver.h"
+#include "../NetworkMonitor.h"
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
+#include <memory>
+#include <string>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -17,7 +20,9 @@
 namespace AES67 {
 
 /// Runs a PTP time receiver and, a few times a second, steers the media
-/// clock to it (PtpClockControl). The device applies each rate through
+/// clock to it (PtpClockControl). When the receiver's interface changes (a
+/// new address, link down and up, an adapter replugged) the receiver starts
+/// again on it as it is now, as streams do; meanwhile the clock keeps its rate. The device applies each rate through
 /// RateWriter, which must ignore a rate meant for a timeline that has since
 /// restarted. While active() the device must not let other sources steer.
 class PtpClockSource {
@@ -35,6 +40,7 @@ public:
         PtpClockControl::Config control;
         std::chrono::milliseconds period{125};
         std::chrono::milliseconds retryPeriod{2000};  // receiver start attempts
+        NetworkMonitor::Config monitor;               // watches the receiver's interface
     };
 
     struct Status {
@@ -55,6 +61,8 @@ public:
     void start();
     /// The receiver is running (its interface existed and its sockets opened).
     bool receiving() const { return receiving_.load(std::memory_order_acquire); }
+    /// Times the receiver was started again because its interface changed.
+    uint64_t receiverRestarts() const { return receiverRestarts_.load(std::memory_order_acquire); }
     void stop();
 
     /// PTP has the clock (until the device timeline restarts without it).
@@ -74,6 +82,10 @@ public:
 private:
     void run();
     void step();
+    bool interfaceExists() const;
+    std::string interfaceName() const;  // for logs
+    void restartReceiver();
+    void publishLock(bool locked, uint32_t domain);
 
     const Config config_;
     const MediaClock& clock_;
@@ -85,6 +97,9 @@ private:
     PtpClockControl control_;  // run thread only
 
     std::atomic<bool> receiving_{false};
+    std::atomic<uint64_t> receiverRestarts_{0};
+    std::atomic<bool> interfaceChanged_{false};
+    std::unique_ptr<NetworkMonitor> monitor_;
     std::atomic<bool> active_{false};
     std::atomic<bool> locked_{false};
     std::atomic<uint32_t> clockDomain_{0};
