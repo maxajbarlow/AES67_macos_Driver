@@ -13,7 +13,6 @@
 #include "Discovery/SAPAnnouncer.h"
 #include "NetworkMonitor.h"
 #include "RTP/RTPTransmitter.h"
-#include "PTP/PTPClock.h"
 #include <map>
 #include <random>
 #include <memory>
@@ -295,9 +294,6 @@ private:
 
     // Device state
     std::atomic<double> currentDeviceSampleRate_{48000.0};
-
-    // PTP clock manager reference
-    std::shared_ptr<PTPClockManager> ptpManager_;
 
     // Callbacks
     StreamCallback streamAddedCallback_;

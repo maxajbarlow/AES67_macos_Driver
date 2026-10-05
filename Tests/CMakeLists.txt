@@ -86,25 +86,6 @@ target_include_directories(TestRTPTransmitter PRIVATE
 
 target_compile_features(TestRTPTransmitter PRIVATE cxx_std_17)
 
-# Test: PTP Clock
-add_executable(TestPTPClock
-    TestPTPClock.cpp
-    ../NetworkEngine/PTP/PTPClock.cpp
-    ../NetworkEngine/PTP/PTPDInterface.cpp
-    ../NetworkEngine/PTP/PTPSlave.cpp
-    ../NetworkEngine/PTP/PhaseLockedLoop.cpp
-    ../NetworkEngine/PTP/CustomSys.cpp
-    ../NetworkEngine/NetworkInterfaceDetection.cpp
-    ../Driver/SDPParser.cpp
-    ../Shared/Types.cpp
-)
-
-target_include_directories(TestPTPClock PRIVATE
-    ${CMAKE_SOURCE_DIR}
-)
-
-target_compile_features(TestPTPClock PRIVATE cxx_std_17)
-
 # Test: Stream Manager
 add_executable(TestStreamManager
     TestStreamManager.cpp
@@ -124,11 +105,6 @@ add_executable(TestMultiStream
     TestMultiStream.cpp
     ../Driver/SDPParser.cpp
     ../NetworkEngine/StreamChannelMapper.cpp
-    ../NetworkEngine/PTP/PTPClock.cpp
-    ../NetworkEngine/PTP/PTPDInterface.cpp
-    ../NetworkEngine/PTP/PTPSlave.cpp
-    ../NetworkEngine/PTP/PhaseLockedLoop.cpp
-    ../NetworkEngine/PTP/CustomSys.cpp
     ../NetworkEngine/NetworkInterfaceDetection.cpp
     ../Shared/Types.cpp
 )
@@ -376,7 +352,6 @@ add_test(NAME ChannelMapper COMMAND TestChannelMapper)
 add_test(NAME RingBuffer COMMAND TestRingBuffer)
 add_test(NAME RTPReceiver COMMAND TestRTPReceiver)
 add_test(NAME RTPTransmitter COMMAND TestRTPTransmitter)
-add_test(NAME PTPClock COMMAND TestPTPClock)
 add_test(NAME StreamManager COMMAND TestStreamManager)
 add_test(NAME MultiStream COMMAND TestMultiStream)
 add_test(NAME IntegrationAudioPath COMMAND TestIntegrationAudioPath)
@@ -403,7 +378,6 @@ message(STATUS "  - TestChannelMapper")
 message(STATUS "  - TestRingBuffer")
 message(STATUS "  - TestRTPReceiver")
 message(STATUS "  - TestRTPTransmitter")
-message(STATUS "  - TestPTPClock")
 message(STATUS "  - TestStreamManager")
 message(STATUS "  - TestMultiStream (Integration)")
 message(STATUS "  - TestIntegrationAudioPath (Integration)")

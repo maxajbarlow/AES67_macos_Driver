@@ -4,7 +4,6 @@
 /// Covers what an ordinary slave clock using the end-to-end delay mechanism
 /// needs: Sync, Follow_Up, Delay_Req, Delay_Resp and Announce. Other message
 /// types parse their header only, so a slave can ignore them by type.
-/// Replaces the parsing in the old PTPSlave (step 2 phase 4).
 
 #pragma once
 

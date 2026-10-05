@@ -97,10 +97,6 @@ else()
     message(STATUS "Found libASPL: ${ASPL_INCLUDE_DIR}")
 endif()
 
-# NOTE: The vendored ptpd C code is NOT used. PTP synchronization is implemented
-# natively in C++17 via PTPSlave.cpp (IEEE 1588 slave-only mode). The vendored
-# ptpd source in NetworkEngine/PTP/vendor/ptpd/ is kept for reference only.
-
 # ============================================================================
 # Shared Library
 # ============================================================================
@@ -134,11 +130,6 @@ set(NETWORK_SOURCES
     NetworkEngine/RTP/BufferStatusMonitor.cpp
     NetworkEngine/Clock/TimestampedAudioBuffer.cpp
     NetworkEngine/Clock/RecoveredClockSource.cpp
-    NetworkEngine/PTP/PTPClock.cpp
-    NetworkEngine/PTP/PTPDInterface.cpp
-    NetworkEngine/PTP/PTPSlave.cpp
-    NetworkEngine/PTP/CustomSys.cpp
-    NetworkEngine/PTP/PhaseLockedLoop.cpp
     NetworkEngine/NetworkUtils.cpp
     NetworkEngine/NetworkErrorHandler.cpp
     NetworkEngine/NetworkInterfaceDetection.cpp
@@ -174,7 +165,6 @@ if(APPLE)
 
     target_link_libraries(AES67Driver PRIVATE
         ${ASPL_LIBRARY}
-        # ptpd_obj disabled - using stub PTP implementation
         "-framework CoreAudio"
         "-framework CoreFoundation"
         "-framework AudioToolbox"
@@ -342,7 +332,6 @@ if(APPLE)
 endif()
 message(STATUS "  RTP: SimpleRTP (minimal implementation)")
 message(STATUS "  libASPL: ${ASPL_INCLUDE_DIR}")
-message(STATUS "  PTP: IEEE 1588 slave-only (PTPSlave.cpp, stub fallback available)")
 message(STATUS "  Manager App: ManagerApp target (SwiftUI)")
 message(STATUS "  Installer: make installer")
 message(STATUS "  Tests: ${BUILD_TESTS}")
