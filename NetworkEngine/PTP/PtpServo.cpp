@@ -78,7 +78,9 @@ void Servo::onSync(uint64_t hostReceiveNs, uint64_t masterSendNs, double correct
         }
         stepCandidates_.clear();
         predictionErrors_.push_back(error);
-        if (predictionErrors_.size() > config_.lockHistory) predictionErrors_.pop_front();
+        if (predictionErrors_.size() > std::max(config_.lockHistory, config_.holdHistory)) {
+            predictionErrors_.pop_front();
+        }
     }
     rejected_.push_back(false);
     if (rejected_.size() > config_.lockHistory) rejected_.pop_front();
@@ -136,14 +138,37 @@ void Servo::refit() {
         return;
     }
     slope_ = (hull[edge + 1].y - hull[edge].y) / (hull[edge + 1].x - hull[edge].x);
-    intercept_ = hull[edge].y - slope_ * hull[edge].x;
 
+    // A longer baseline where the hull allows: the chord between the
+    // vertices nearest a quarter and three quarters of the way across (the
+    // ends of the hull are the oldest and newest Syncs, queued or not)
+    const double span = hull.back().x;
+    auto nearest = [&hull](double x) {
+        size_t best = 0;
+        for (size_t i = 1; i < hull.size(); ++i) {
+            if (std::fabs(hull[i].x - x) < std::fabs(hull[best].x - x)) best = i;
+        }
+        return best;
+    };
+    const size_t a = nearest(span / 4), b = nearest(3 * span / 4);
+    if (a + 1 < b && a > 0 && b + 1 < hull.size()) {
+        slope_ = (hull[b].y - hull[a].y) / (hull[b].x - hull[a].x);
+    }
+
+    // At that slope, the line resting on the hull
+    intercept_ = hull.front().y - slope_ * hull.front().x;
+    for (const auto& p : hull) intercept_ = std::max(intercept_, p.y - slope_ * p.x);
 }
 
 void Servo::onDelay(uint64_t hostSendNs, uint64_t masterReceiveNs, double correctionNs) {
-    delays_.push_back(DelayPair{hostSendNs, masterReceiveNs - static_cast<uint64_t>(std::llround(correctionNs))});
+    delays_.push_back(DelayPair{hostSendNs, masterReceiveNs - static_cast<uint64_t>(std::llround(correctionNs)), {}});
     if (delays_.size() > config_.delaySamples) delays_.pop_front();
     updatePathDelay();
+}
+
+bool Servo::settled() const {
+    return samples_.size() >= config_.minSamples &&
+           nanosBetween(samples_.back().host, samples_.front().host) >= config_.minSpanSeconds * 1e9;
 }
 
 void Servo::updatePathDelay() {
@@ -151,10 +176,13 @@ void Servo::updatePathDelay() {
         return;
     }
     // t4 = E(t3) + 2 x delay + queueing: the least-queued exchange gives the delay
+    const bool fix = settled();
     double best = 0.0;
     bool first = true;
-    for (const auto& d : delays_) {
-        const double twice = nanosBetween(d.masterReceive, p0_) - envelopeOffsetAt(d.hostSend);
+    for (auto& d : delays_) {
+        const double twice = d.twiceDelay ? *d.twiceDelay
+                                          : nanosBetween(d.masterReceive, p0_) - envelopeOffsetAt(d.hostSend);
+        if (fix && !d.twiceDelay) d.twiceDelay = twice;
         if (first || twice < best) {
             best = twice;
             first = false;
@@ -167,18 +195,20 @@ void Servo::judgeLock() {
     const size_t rejected = static_cast<size_t>(std::count(rejected_.begin(), rejected_.end(), true));
     const bool consistent = !rejected_.empty() &&
         static_cast<double>(rejected) <= config_.maxRejectedFraction * static_cast<double>(rejected_.size());
-    const bool enough = samples_.size() >= config_.minSamples &&
-        nanosBetween(samples_.back().host, samples_.front().host) >= config_.minSpanSeconds * 1e9 &&
-        predictionErrors_.size() >= config_.lockHistory;
+    const bool enough = settled() && predictionErrors_.size() >= config_.lockHistory;
 
     bool predicts = false;
     if (enough) {
         // Enough recent Syncs land on the line: unqueued ones on a real
         // network do; scrambled timestamps only touch it now and then
-        const double threshold = state_ == State::Locked ? 2.0 * config_.lockThresholdNs : config_.lockThresholdNs;
-        const auto good = std::count_if(predictionErrors_.begin(), predictionErrors_.end(),
+        const bool holding = state_ == State::Locked;
+        const double threshold = holding ? 2.0 * config_.lockThresholdNs : config_.lockThresholdNs;
+        const size_t history = std::min(predictionErrors_.size(), holding ? config_.holdHistory : config_.lockHistory);
+        const auto recent = predictionErrors_.end() - static_cast<std::ptrdiff_t>(history);
+        const auto good = std::count_if(recent, predictionErrors_.end(),
                                         [threshold](double error) { return std::fabs(error) <= threshold; });
-        predicts = static_cast<double>(good) >= config_.lockGoodFraction * static_cast<double>(predictionErrors_.size());
+        const double fraction = holding ? config_.holdGoodFraction : config_.lockGoodFraction;
+        predicts = static_cast<double>(good) >= fraction * static_cast<double>(history);
     }
     state_ = (enough && predicts && consistent) ? State::Locked : State::Acquiring;
 }

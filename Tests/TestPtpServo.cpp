@@ -56,6 +56,10 @@ struct Network {
     double cleanFraction{0.2};   // packets that see no queueing
     double outlierFraction{0.0}; // packets held up 50 ms
     double timestampNoiseNs{5000.0};  // kernel timestamp noise, either way, on every packet
+    // Bursts in which every packet is held up (macOS: the CPU waking up)
+    double burstEverySeconds{0.0};
+    double burstSeconds{0.0};
+    double burstMinNs{150000.0};  // held at least this long, up to jitterNs
 };
 
 struct Run {
@@ -85,13 +89,13 @@ public:
             if (next == nextSync) {
                 // t1 when the master sends, t2 when it arrives
                 const uint64_t t1 = master_.at(nextSync);
-                const uint64_t t2 = nextSync + static_cast<uint64_t>(network_.delayNs + queueing() + noise());
+                const uint64_t t2 = nextSync + static_cast<uint64_t>(network_.delayNs + queueing(nextSync) + noise());
                 servo.onSync(t2, t1, 0.0);
                 nextSyncNs_ += syncInterval;
             } else {
                 // t3 when we send, t4 when the master receives
                 const uint64_t t3 = nextDelay;
-                const uint64_t t4 = master_.at(t3 + static_cast<uint64_t>(network_.delayNs + queueing() + noise()));
+                const uint64_t t4 = master_.at(t3 + static_cast<uint64_t>(network_.delayNs + queueing(t3) + noise()));
                 servo.onDelay(t3, t4, 0.0);
                 nextDelayNs_ += 1000000000ULL;
             }
@@ -125,8 +129,12 @@ private:
         return either(rng_);
     }
 
-    double queueing() {
+    double queueing(uint64_t atNs) {
         std::uniform_real_distribution<double> unit(0.0, 1.0);
+        if (network_.burstSeconds > 0 &&
+            std::fmod(static_cast<double>(atNs) / 1e9, network_.burstEverySeconds) < network_.burstSeconds) {
+            return network_.burstMinNs + unit(rng_) * (network_.jitterNs - network_.burstMinNs);
+        }
         const double u = unit(rng_);
         if (u < network_.outlierFraction) return 50e6;
         if (u < network_.outlierFraction + network_.cleanFraction) return 0.0;
@@ -290,6 +298,36 @@ void testStaysLockedAndAccurate() {
     CHECK(worstLocked < 50000, "phase within 50 us whenever locked (" << worstLocked << " ns)");
 }
 
+// Delays on macOS come in bursts: whole seconds in which every packet is
+// late. Lock must ride through them, as the estimate does
+void testStaysLockedThroughBursts() {
+    std::cout << "16 Sync/s, every packet late for 1 s in 4: stays locked, within 50 us" << std::endl;
+    Network bursty;
+    bursty.burstEverySeconds = 4.0;
+    bursty.burstSeconds = 1.0;
+    double leastLocked = 100;
+    double worstLocked = 0;
+    for (uint32_t seed = 31; seed <= 40; ++seed) {
+        Simulation sim(Master{}, bursty, 16.0, seed);
+        int locked = 0;
+        int total = 0;
+        for (double t = 30; t <= 300; t += 0.25) {
+            sim.runUntil(t);
+            const Run r = sim.measure();
+            ++total;
+            if (r.state == Servo::State::Locked) {
+                ++locked;
+                worstLocked = std::max(worstLocked, std::fabs(r.phaseErrorNs));
+            }
+        }
+        leastLocked = std::min(leastLocked, 100.0 * locked / total);
+    }
+    std::cout << "  least locked run " << leastLocked << "%, worst phase while locked " << worstLocked / 1000 << " us"
+              << std::endl;
+    CHECK(leastLocked >= 99.0, "locked at least 99% of the time (" << leastLocked << "%)");
+    CHECK(worstLocked < 50000, "phase within 50 us whenever locked (" << worstLocked << " ns)");
+}
+
 } // namespace
 
 int main() {
@@ -298,6 +336,7 @@ int main() {
     testEpochsAndSkews();
     testOutliersAreIgnored();
     testLockIsJudgedIndependently();
+    testStaysLockedThroughBursts();
     testGrandmasterTimeStep();
     testHoldover();
     testStaysLockedAndAccurate();
